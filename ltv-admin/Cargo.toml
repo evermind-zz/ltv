@@ -1,0 +1,13 @@
+[package]
+name = "ltv-admin"
+version = "0.1.0-dev"
+edition = "2021"
+
+[dependencies]
+ltv-core = { path = "../ltv-core", features = ["write"] }
+rustyline = "14"
+rpassword = "7"
+tokio.workspace = true
+secrecy.workspace = true
+uuid.workspace = true
+russh-keys.workspace = true
