@@ -108,6 +108,7 @@ async fn dispatch(st: &mut State, line: &str) -> Result<bool, String> {
             return Ok(true);
         }
         ["help"] => println!("create <file> | open <file> | save | close | status | ls | show <p> | add | rm <p>\n\
+                              edit <p> [field=value ...] | target add <p> | target rm <p> <uuid>\n\
                               pubkey <p> | hostkey fetch <p> [--os] | probe <p>|--all | unlock <p> | enroll <p> [--target <uuid|mapper>] | passwd | quit"),
         ["create", f] => {
             let p1 = pass("New passphrase: "); let p2 = pass("Repeat: ");
@@ -136,7 +137,10 @@ async fn dispatch(st: &mut State, line: &str) -> Result<bool, String> {
             let v = st.vault.as_ref().ok_or("no vault open")?; let p = resolve(v, n)?;
             println!("name: {}\nhost: {}:{} user {}\nuuid: {}", p.name, p.host, p.port, p.username, uuid::Uuid::from_bytes(p.uuid));
             if let Some(k) = &p.initramfs_host_key { println!("initramfs hostkey: {} {}", k.key_type, fingerprint_sha256(&k.key_bytes)); }
-            for t in &p.targets_meta { println!("  target {} UUID={} slot={:?}", t.mapped_name, t.luks_uuid, t.keyslot); }
+            for t in &p.targets_meta { 
+                let fallback = t.fallback_path.as_deref().unwrap_or("none");
+                println!("  target {} UUID={} fallback={} slot={:?}", t.mapped_name, t.luks_uuid, fallback, t.keyslot); 
+            }
             println!("pubkey: {}", v.export_public_key(p));
         }
         ["add"] => cmd_add(st)?,
@@ -144,6 +148,50 @@ async fn dispatch(st: &mut State, line: &str) -> Result<bool, String> {
             let v = st.vault.as_mut().ok_or("no vault open")?;
             let uuid = resolve(v, n)?.uuid;
             if ask(&format!("Remove '{n}'? type YES: ")) == "YES" { v.remove_profile(&uuid).map_err(|e| e.to_string())?; }
+        }
+        ["edit", n, rest @ ..] => {
+            let v = st.vault.as_mut().ok_or("no vault open")?;
+            let uuid = resolve(v, n)?.uuid;
+            let mut p = v.profile(&uuid).map_err(|e| e.to_string())?.clone();
+            let mut changed = false;
+            for arg in rest {
+                if let Some((k, v)) = arg.split_once('=') {
+                    match k {
+                        "name" => { p.name = v.into(); changed = true; }
+                        "host" => { p.host = v.into(); changed = true; }
+                        "port" => { p.port = v.parse().map_err(|_| "bad port")?; changed = true; }
+                        "user" | "username" => { p.username = v.into(); changed = true; }
+                        "notes" => { p.notes = v.into(); changed = true; }
+                        "connect_timeout" => { p.connect_timeout_s = v.parse().map_err(|_| "bad timeout")?; changed = true; }
+                        "exec_timeout" => { p.exec_timeout_s = v.parse().map_err(|_| "bad timeout")?; changed = true; }
+                        "resume" => {
+                            if v == "poll" { p.resume = ResumePolicy::DeviceMapperPoll; }
+                            else { p.resume = ResumePolicy::Command(v.into()); }
+                            changed = true;
+                        }
+                        _ => return Err(format!("unknown field: {k}")),
+                    }
+                }
+            }
+            if changed { v.update_profile(&uuid, |p2| *p2 = p).map_err(|e| e.to_string())?; println!("profile updated"); } else { println!("no changes"); }
+        }
+        ["target", "add", n] => {
+            let v = st.vault.as_mut().ok_or("no vault open")?;
+            let uuid = resolve(v, n)?.uuid;
+            let luks_uuid = ask("LUKS UUID: "); if luks_uuid.is_empty() { return Err("uuid required".into()); }
+            let fallback = ask("Fallback device path (optional): ");
+            let mapped = ask_or("Mapper name", "cryptroot");
+            let order: u8 = ask_or("Order", "0").parse().unwrap_or(0);
+            let meta = TargetMeta { luks_uuid, fallback_path: if fallback.is_empty() { None } else { Some(fallback) },
+                                mapped_name: mapped, order, keyslot: None, token_id: None };
+            v.add_target(&uuid, meta, None).map_err(|e| e.to_string())?;
+            println!("  target added, 64-byte keyfile generated.");
+        }
+        ["target", "rm", n, uuid_str] => {
+            let v = st.vault.as_mut().ok_or("no vault open")?;
+            let uuid = resolve(v, n)?.uuid;
+            v.remove_target(&uuid, uuid_str).map_err(|e| e.to_string())?;
+            println!("target removed");
         }
         ["pubkey", n] => { let v = st.vault.as_ref().ok_or("no vault open")?; println!("{}", v.authorized_keys_line(resolve(v, n)?)); }
         ["hostkey", "fetch", n, rest @ ..] => {

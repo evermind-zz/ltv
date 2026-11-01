@@ -155,6 +155,21 @@ impl Vault {
         Ok(())
     }
 
+    pub fn remove_target(&mut self, uuid: &[u8; 16], luks_uuid: &str) -> Result<(), VaultError> {
+        let p = self.profile(uuid)?.clone();
+        let mut s = self.open_secrets(&p)?;
+        if !p.targets_meta.iter().any(|t| t.luks_uuid == luks_uuid) {
+            return Err(VaultError::NoTarget);
+        }
+        s.keyfiles.retain(|k| k.luks_uuid != luks_uuid);
+        let mut p2 = p;
+        p2.targets_meta.retain(|t| t.luks_uuid != luks_uuid);
+        self.seal_secrets(&mut p2, &s)?;
+        *self.profile_mut(uuid)? = p2;
+        self.dirty = true;
+        Ok(())
+    }
+
     pub fn set_host_key(&mut self, uuid: &[u8; 16], key: HostKey, os: bool) -> Result<(), VaultError> {
         let p = self.profile_mut(uuid)?;
         if os { p.os_host_key = Some(key) } else { p.initramfs_host_key = Some(key); p.host_key_pinned_at = now(); }
@@ -174,6 +189,13 @@ impl Vault {
         let n = self.inventory.profiles.len();
         self.inventory.profiles.retain(|p| &p.uuid != uuid);
         if n == self.inventory.profiles.len() { return Err(VaultError::NoProfile); }
+        self.dirty = true;
+        Ok(())
+    }
+
+    pub fn update_profile(&mut self, uuid: &[u8; 16], f: impl FnOnce(&mut Profile)) -> Result<(), VaultError> {
+        let p = self.profile_mut(uuid)?;
+        f(p);
         self.dirty = true;
         Ok(())
     }
