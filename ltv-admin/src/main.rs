@@ -1,5 +1,5 @@
 use std::{fs, path::PathBuf};
-use ltv_core::{format::Argon2Params, model::*, net, vault::Vault, enroll::{BootedAccess, BootedAuth, EnrollEvent}};
+use ltv_core::{format::Argon2Params, model::{Profile, TargetMeta, ResumePolicy, BootedAccess, BootedAuth, fingerprint_sha256}, net::{fetch_host_key, fetch_luks_info, FetchedLuksInfo, probe, unlock}, vault::Vault, enroll::EnrollEvent};
 use rustyline::{error::ReadlineError, DefaultEditor};
 use secrecy::{ExposeSecret, SecretString, SecretVec};
 
@@ -64,7 +64,7 @@ async fn cmd_enroll(st: &mut State, name: &str, only: Option<&str>) -> Result<()
     // OS host key must be pinned first (admin-only TOFU)
     if p.os_host_key.is_none() {
         println!("No OS host key pinned. Fetching from {}:{} ...", p.host, p.port);
-        let hk = net::fetch_host_key(&p.host, p.port, p.connect_timeout_s).await.map_err(|e| e.to_string())?;
+        let hk = fetch_host_key(&p.host, p.port, p.connect_timeout_s).await.map_err(|e| e.to_string())?;
         println!("{} {}", hk.key_type, fingerprint_sha256(&hk.key_bytes));
         if ask("Pin as OS host key? [y/N]: ").to_lowercase() != "y" { return Err("aborted".into()); }
         v.set_host_key(&p.uuid, hk, true).map_err(|e| e.to_string())?;
@@ -97,6 +97,71 @@ async fn cmd_enroll(st: &mut State, name: &str, only: Option<&str>) -> Result<()
     Ok(())
 }
 
+async fn cmd_fetch(st: &mut State, name: &str) -> Result<(), String> {
+    let v = st.vault.as_mut().ok_or("no vault open")?;
+    let p = resolve(v, name)?.clone();
+
+    // OS host key must be pinned first
+    if p.os_host_key.is_none() {
+        println!("No OS host key pinned. Fetching from {}:{} ...", p.host, p.port);
+        let hk = fetch_host_key(&p.host, p.port, p.connect_timeout_s).await.map_err(|e| e.to_string())?;
+        println!("{} {}", hk.key_type, fingerprint_sha256(&hk.key_bytes));
+        if ask("Pin as OS host key? [y/N]: ").to_lowercase() != "y" { return Err("aborted".into()); }
+        v.set_host_key(&p.uuid, hk, true).map_err(|e| e.to_string())?;
+    }
+
+    let username = ask_or("OS SSH user", "root");
+    let auth = match ask_or("Auth: (p)assword / (k)ey file", "k").as_str() {
+        "p" => BootedAuth::Password(SecretString::new(rpassword::prompt_password("OS password: ").unwrap_or_default())),
+        _ => {
+            let path = ask_or("Key file", &format!("{}/.ssh/id_ed25519", std::env::var("HOME").unwrap_or_default()));
+            let kp = russh_keys::load_secret_key(&path, None)
+                .or_else(|_| russh_keys::load_secret_key(&path, Some(&rpassword::prompt_password("Key passphrase: ").unwrap_or_default())))
+                .map_err(|e| format!("load key: {e}"))?;
+            match kp {
+                russh_keys::key::KeyPair::Ed25519(sk) => BootedAuth::Ed25519Seed(sk.to_bytes()),
+                _ => return Err("only Ed25519 keys supported".into()),
+            }
+        }
+    };
+    let access = BootedAccess { use_sudo: username != "root", username, auth, connect_timeout_s: p.connect_timeout_s };
+
+    let results = fetch_luks_info(v, &p.uuid, &access, None).await.map_err(|e| e.to_string())?;
+
+    if results.is_empty() {
+        println!("No LUKS volumes found.");
+        return Ok(());
+    }
+
+    println!("\nDiscovered LUKS volumes:");
+    for (i, info) in results.iter().enumerate() {
+        println!("  [{}] UUID: {}", i, info.luks_uuid);
+        println!("       Device: {}", info.device_path);
+        println!("       Cipher: {}", info.cipher);
+        println!("       Key size: {} bits", info.key_size);
+        println!("       Version: {}", info.header_version);
+    }
+
+    let choice = ask("\nAdd all as targets? [y/N]: ").to_lowercase();
+    if choice == "y" {
+        for info in results {
+            let mapped = format!("crypt{}", info.luks_uuid.split('-').next().unwrap_or("vol"));
+            let meta = TargetMeta {
+                luks_uuid: info.luks_uuid.clone(),
+                fallback_path: Some(info.device_path.clone()),
+                mapped_name: mapped,
+                order: 0,
+                keyslot: None,
+                token_id: None,
+            };
+            v.add_target(&p.uuid, meta, None).map_err(|e| e.to_string())?;
+            println!("  added target for {}", info.luks_uuid);
+        }
+        println!("Targets added. Remember to 'save'.");
+    }
+    Ok(())
+}
+
 async fn dispatch(st: &mut State, line: &str) -> Result<bool, String> {
     let parts: Vec<&str> = line.split_whitespace().collect();
     match parts.as_slice() {
@@ -109,7 +174,8 @@ async fn dispatch(st: &mut State, line: &str) -> Result<bool, String> {
         }
         ["help"] => println!("create <file> | open <file> | save | close | status | ls | show <p> | add | rm <p>\n\
                               edit <p> [field=value ...] | target add <p> | target rm <p> <uuid>\n\
-                              pubkey <p> | hostkey fetch <p> [--os] | probe <p>|--all | unlock <p> | enroll <p> [--target <uuid|mapper>] | passwd | quit"),
+                              pubkey <p> | hostkey fetch <p> [--os] | probe <p>|--all | unlock <p> | enroll <p> [--target <uuid|mapper>]\n\
+                              fetch <p> | passwd | quit"),
         ["create", f] => {
             let p1 = pass("New passphrase: "); let p2 = pass("Repeat: ");
             if p1.expose_secret() != p2.expose_secret() { return Err("passphrases differ".into()); }
@@ -197,7 +263,7 @@ async fn dispatch(st: &mut State, line: &str) -> Result<bool, String> {
         ["hostkey", "fetch", n, rest @ ..] => {
             let v = st.vault.as_mut().ok_or("no vault open")?;
             let p = resolve(v, n)?.clone();
-            let hk = net::fetch_host_key(&p.host, p.port, p.connect_timeout_s).await.map_err(|e| e.to_string())?;
+            let hk = fetch_host_key(&p.host, p.port, p.connect_timeout_s).await.map_err(|e| e.to_string())?;
             println!("{} {}", hk.key_type, fingerprint_sha256(&hk.key_bytes));
             if ask("Pin this key? [y/N]: ").to_lowercase() == "y" {
                 v.set_host_key(&p.uuid, hk, rest.contains(&"--os")).map_err(|e| e.to_string())?;
@@ -206,15 +272,16 @@ async fn dispatch(st: &mut State, line: &str) -> Result<bool, String> {
         ["probe", n] => {
             let v = st.vault.as_ref().ok_or("no vault open")?;
             let ps: Vec<Profile> = if *n == "--all" { v.inventory.profiles.clone() } else { vec![resolve(v, n)?.clone()] };
-            for p in ps { println!("{:<16} {:?}", p.name, net::probe(&p).await); }
+            for p in ps { println!("{:<16} {:?}", p.name, probe(&p).await); }
         }
         ["unlock", n] => {
             let v = st.vault.as_ref().ok_or("no vault open")?;
             let uuid = resolve(v, n)?.uuid;
-            net::unlock(v, &uuid, |e| println!(" ✓ {e:?}")).await.map_err(|e| e.to_string())?;
+            unlock(v, &uuid, |e| println!(" ✓ {e:?}")).await.map_err(|e| e.to_string())?;
         }
         ["enroll", n] => cmd_enroll(st, n, None).await?,
         ["enroll", n, "--target", t] => cmd_enroll(st, n, Some(t)).await?,
+        ["fetch", n] => cmd_fetch(st, n).await?,
         ["passwd"] => {
             let v = st.vault.as_mut().ok_or("no vault open")?;
             let p1 = pass("New passphrase: "); let p2 = pass("Repeat: ");

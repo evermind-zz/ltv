@@ -268,6 +268,18 @@ pub mod ltv_core {
 
     pub enum KeySource { Generate, Import(SecretVec<u8>) }
 
+    // ---- booted OS access ----
+    pub struct BootedAccess {
+        pub username: String,
+        pub auth: BootedAuth,
+        pub use_sudo: bool,
+        pub connect_timeout_s: u16,
+    }
+    pub enum BootedAuth {
+        Password(SecretString),
+        Ed25519Seed([u8; 32]),
+    }
+
     // ---- network ----
     pub struct Unlocker;
     impl Unlocker {
@@ -277,6 +289,16 @@ pub mod ltv_core {
             -> Result<UnlockReport, UnlockError>;
         pub async fn enroll(vault: &Vault, uuid: Uuid, booted: &BootedAccess, progress: impl FnMut(UnlockEvent))
             -> Result<(), UnlockError>;     // luksAddKey over normal OS SSH
+        pub async fn fetch_luks_info(vault: &Vault, uuid: &[u8; 16], booted: &BootedAccess, only_mapped: Option<&str>)
+            -> Result<Vec<FetchedLuksInfo>, UnlockError>; // discover LUKS volumes on booted OS
+    }
+
+    pub struct FetchedLuksInfo {
+        pub luks_uuid: String,
+        pub device_path: String,
+        pub cipher: String,
+        pub key_size: u32,
+        pub header_version: String,
     }
 
     pub enum UnlockEvent { Connecting, HostKeyVerified, Authenticated,
@@ -320,6 +342,7 @@ Feature flags: `write` (vault mutation, enroll — enabled for admin, disabled f
 | `probe [<profile>|--all]` | State detection |
 | `unlock <profile>` | Perform full push-unlock with live progress |
 | `enroll <profile> [--target <uuid>]` | Connect to **booted OS** (asks for OS SSH credentials/key + existing LUKS passphrase), runs `luksAddKey` per target, verifies with `luksDump`, optionally detects LUKS UUIDs from `blkid` to fill targets |
+| `fetch <profile>` | Connect to **booted OS** (asks for OS SSH credentials/key), runs `blkid` + `cryptsetup luksDump` to discover LUKS volumes, displays cipher/key size/version, offers to add all as targets with generated keyfiles |
 | `server-setup <profile>` | Generates mkinitfs feature file, `ltv-hook`, `authorized_keys` line, kernel cmdline snippet, step-by-step deployment checklist; writes to `./ltv-server-<name>/` |
 | `export-keyfile <profile> <uuid> <path>` | Emergency plaintext export; requires passphrase re-entry and typed `YES` |
 | `backup <path>` | Copy vault (already encrypted) with timestamp |

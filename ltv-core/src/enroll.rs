@@ -1,20 +1,7 @@
 use std::time::Duration;
 use secrecy::{ExposeSecret, SecretString};
 
-use crate::{error::*, model::*, net::*, vault::Vault};
-
-/// How to reach the *booted* OS (not the initramfs).
-pub struct BootedAccess {
-    pub username: String,
-    pub auth: BootedAuth,
-    pub use_sudo: bool,          // prefix "sudo -n" when username != root
-    pub connect_timeout_s: u16,
-}
-pub enum BootedAuth {
-    Password(SecretString),
-    /// Ed25519 seed loaded by the frontend (e.g. from ~/.ssh/id_ed25519)
-    Ed25519Seed([u8; 32]),
-}
+use crate::{error::*, model::BootedAccess, model::BootedAuth, net::*, vault::Vault};
 
 #[derive(Debug, Clone)]
 pub enum EnrollEvent {

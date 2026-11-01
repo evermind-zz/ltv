@@ -1,11 +1,12 @@
 use std::{sync::{Arc, Mutex}, time::Duration};
+use secrecy::ExposeSecret;
 use async_trait::async_trait;
 use russh::{client, ChannelMsg};
 use russh_keys::key::{KeyPair, PublicKey};
 use russh_keys::PublicKeyBase64;
 use tokio::time::timeout;
 
-use crate::{error::*, model::*, vault::Vault};
+use crate::{error::*, model::{*, BootedAccess, BootedAuth}, vault::Vault};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProbeResult {
@@ -119,6 +120,83 @@ pub(crate) async fn exec(session: &mut client::Handle<Hk>, cmd: &str, stdin: Opt
 
 pub(crate) fn keypair_from_seed(seed: &[u8; 32]) -> Arc<KeyPair> {
     Arc::new(KeyPair::Ed25519(ed25519_dalek::SigningKey::from_bytes(seed)))
+}
+
+/// Result of fetching LUKS details from a booted server
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct FetchedLuksInfo {
+    pub luks_uuid: String,
+    pub device_path: String,
+    pub cipher: String,
+    pub key_size: u32,
+    pub header_version: String,
+}
+
+/// Connect to the booted OS and discover all LUKS volumes.
+/// Uses the profile's os_host_key (must be pinned first).
+/// Auth: either the client's Ed25519 key (from vault) or password via BootedAuth.
+pub async fn fetch_luks_info(
+    vault: &Vault, uuid: &[u8; 16], access: &BootedAccess, only_mapped: Option<&str>,
+) -> Result<Vec<FetchedLuksInfo>, UnlockError> {
+    let p = vault.profile(uuid)?.clone();
+    let os_key = p.os_host_key.clone().ok_or(UnlockError::HostKeyMismatch)?;
+    let (mut s, _) = connect(&p.host, p.port, access.connect_timeout_s, Some(os_key)).await?;
+
+    let ok = match &access.auth {
+        BootedAuth::Password(pw) => s.authenticate_password(&access.username, pw.expose_secret()).await,
+        BootedAuth::Ed25519Seed(seed) => s.authenticate_publickey(&access.username, keypair_from_seed(seed)).await,
+    }.map_err(|e| NetError::Ssh(e.to_string()))?;
+    if !ok { return Err(UnlockError::AuthRejected); }
+
+    let sudo = if access.use_sudo && access.username != "root" { "sudo -n " } else { "" };
+    let t = Duration::from_secs(p.exec_timeout_s.max(30) as u64);
+
+    // Find all LUKS devices via blkid
+    let r = exec(&mut s, &format!("{sudo}blkid -t TYPE=crypto_LUKS -o export"), None, t).await?;
+    if r.code != 0 {
+        return Err(UnlockError::CryptsetupFailed { target: "discovery".into(), code: r.code, stderr: r.stderr });
+    }
+
+    let mut results = Vec::new();
+    let mut current_uuid = String::new();
+    let mut current_dev = String::new();
+
+    for line in r.stdout.lines() {
+        let line = line.trim();
+        if line.starts_with("DEVNAME=") {
+            current_dev = line["DEVNAME=".len()..].to_string();
+        } else if line.starts_with("UUID=") && current_uuid.is_empty() {
+            current_uuid = line["UUID=".len()..].to_string();
+        } else if line.is_empty() && !current_uuid.is_empty() && !current_dev.is_empty() {
+            // Got a complete device entry, now get details
+            let _filter = only_mapped; // reserved for future filtering by mapper name
+            let dump = exec(&mut s, &format!("{sudo}cryptsetup luksDump UUID={}", current_uuid), None, t).await?;
+            if dump.code == 0 {
+                // Parse cipher, key_size, version from luksDump
+                let mut cipher = String::new();
+                let mut key_size = 0;
+                let mut version = String::new();
+                for dl in dump.stdout.lines() {
+                    let dl = dl.trim();
+                    if dl.starts_with("Cipher name:") { cipher = dl["Cipher name:".len()..].trim().to_string(); }
+                    else if dl.starts_with("Key size:") { key_size = dl["Key size:".len()..].trim().parse().unwrap_or(0); }
+                    else if dl.starts_with("Version:") { version = dl["Version:".len()..].trim().to_string(); }
+                }
+                results.push(FetchedLuksInfo {
+                    luks_uuid: current_uuid.clone(),
+                    device_path: current_dev.clone(),
+                    cipher,
+                    key_size,
+                    header_version: version,
+                });
+            }
+            current_uuid.clear();
+            current_dev.clear();
+        }
+    }
+
+    let _ = s.disconnect(russh::Disconnect::ByApplication, "done", "en").await;
+    Ok(results)
 }
 
 pub async fn unlock(vault: &Vault, uuid: &[u8; 16], mut on: impl FnMut(UnlockEvent)) -> Result<(), UnlockError> {

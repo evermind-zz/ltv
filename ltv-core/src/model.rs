@@ -81,3 +81,20 @@ fn base64_nopad(b: &[u8]) -> String {
     }
     out
 }
+
+/// How to reach the *booted* OS (not the initramfs) for enroll/fetch operations.
+#[derive(Debug, Clone)]
+pub struct BootedAccess {
+    pub username: String,
+    pub auth: BootedAuth,
+    pub use_sudo: bool,
+    pub connect_timeout_s: u16,
+}
+
+/// Authentication method for the booted OS.
+#[derive(Debug, Clone)]
+pub enum BootedAuth {
+    Password(secrecy::SecretString),
+    /// Ed25519 seed loaded by the frontend (e.g. from ~/.ssh/id_ed25519)
+    Ed25519Seed([u8; 32]),
+}
