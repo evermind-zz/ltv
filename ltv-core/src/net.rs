@@ -2,6 +2,7 @@ use std::{sync::{Arc, Mutex}, time::Duration};
 use async_trait::async_trait;
 use russh::{client, ChannelMsg};
 use russh_keys::key::{KeyPair, PublicKey};
+use russh_keys::PublicKeyBase64;
 use tokio::time::timeout;
 
 use crate::{error::*, model::*, vault::Vault};
@@ -31,7 +32,7 @@ pub(crate) struct Hk { pub expected: Option<HostKey>, pub seen: Seen }
 impl client::Handler for Hk {
     type Error = russh::Error;
     async fn check_server_key(&mut self, key: &PublicKey) -> Result<bool, Self::Error> {
-        let k = HostKey { key_type: key.name().to_string(), key_bytes: key.public_key().to_vec() };
+        let k = HostKey { key_type: key.name().to_string(), key_bytes: key.public_key_bytes() };
         let ok = match &self.expected { None => true, Some(e) => e == &k };
         *self.seen.lock().unwrap() = Some(k);
         Ok(ok)

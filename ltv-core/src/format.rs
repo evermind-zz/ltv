@@ -82,10 +82,15 @@ impl Header {
         Ok((Header { flags: buf[7], payload_nonce, slots }, total))
     }
 
-    /// AAD for slot i = fixed header bytes || i
+    /// AAD for slot i = static header fields || i
+    /// Static fields: magic(4) || version(1) || suite(1) || flags(1) = 7 bytes
+    /// Excludes slot_count and payload_nonce which can change
     pub fn slot_aad(&self, i: usize) -> Vec<u8> {
-        let enc = self.encode();
-        let mut a = enc[..FIXED_LEN].to_vec();
+        let mut a = Vec::with_capacity(8);
+        a.extend_from_slice(MAGIC);
+        a.push(VERSION);
+        a.push(SUITE);
+        a.push(self.flags);
         a.push(i as u8);
         a
     }
