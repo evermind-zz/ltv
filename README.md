@@ -99,6 +99,86 @@ Interactive shell (sqlite-style) and non-interactive subcommands:
 | `backup <path>` | Timestamped encrypted vault copy |
 | `import-profile` / `export-profile` | Move profiles between vaults |
 
+## Deploying Remote Unlock (server-setup)
+
+The `server-setup` command generates all files needed to deploy LTV remote unlock
+to an Alpine Linux server. It creates an `mkinitfs` feature that installs Dropbear
+and the LTV hook into the initramfs.
+
+### Prerequisites on Target Server
+
+- Alpine Linux with `mkinitfs` (standard on Alpine)
+- Target server must boot with the generated initramfs
+
+### Deployment Workflow
+
+```bash
+# 1. On admin workstation: generate deployment artifacts
+ltv-admin> server-setup web01 --out ./deploy-web01
+
+# This creates ./deploy-web01/ with:
+#   ltv.files, ltv.modules, ltv.packages    - mkinitfs feature definition
+#   usr/share/mkinitfs/features.d/ltv-hook.sh - hook script (starts dropbear, waits for mappers)
+#   sbin/ltv-init-wrapper                   - init wrapper (runs hook before real init)
+#   etc/dropbear/README.txt                 - instruction to generate host key on target
+#   authorized_keys                         - restricted client pubkey for initramfs SSH
+#   cmdline.txt                             - kernel cmdline to add
+#   deploy.sh                               - run this on target server
+#   README.md                               - deployment instructions
+```
+
+```bash
+# 2. Copy to target Alpine server
+scp -r ./deploy-web01 root@target:/root/
+
+# 3. On target server (as root):
+cd /root/deploy-web01
+./deploy.sh
+```
+
+The `deploy.sh` script:
+1. Copies feature files to `/etc/mkinitfs/features.d/`
+2. Copies hook and init wrapper to their locations
+3. Generates Dropbear Ed25519 host key (`dropbearkey -t ed25519`)
+4. Creates authorized_keys overlay for initramfs
+5. Regenerates initramfs: `mkinitfs -F "base ltv cryptsetup network" ...`
+6. Prints next steps for bootloader update
+
+```bash
+# 4. Update bootloader (syslinux example):
+# Edit /etc/syslinux.conf to use the new initramfs and add cmdline:
+#   init=/sbin/ltv-init-wrapper ltv_mappers=cryptroot,cryptdata
+
+# 5. Reboot
+reboot
+```
+
+### What Happens at Boot
+
+1. Kernel loads initramfs with LTV feature
+2. `ltv-init-wrapper` runs (via `init=` cmdline), calls `ltv-hook.sh`
+3. Hook starts Dropbear on port 22 (Ed25519 host key, pubkey-only auth)
+4. Hook polls `/dev/mapper/<name>` for all configured mappers
+5. Admin runs `ltv-admin unlock web01` from workstation
+6. Client pushes keyfiles over SSH to `cryptsetup --key-file=-`
+7. Mappers appear, hook exits, boot continues
+
+### Generated Kernel Cmdline
+
+```
+init=/sbin/ltv-init-wrapper ltv_mappers=cryptroot,cryptdata
+```
+
+- `init=/sbin/ltv-init-wrapper` - runs hook before real init
+- `ltv_mappers=cryptroot,cryptdata` - comma-separated mapper names to wait for
+
+### Security Notes
+
+- Initramfs host key is generated on target during `deploy.sh` (first boot)
+- Fingerprint is shown in `README.md` - verify on first connection
+- Client public key in `authorized_keys` has restrictions: no port forwarding, no agent, no X11, no pty
+- Hook times out after 300 seconds if mappers don't appear
+
 ## Dependencies
 
 Core crates:

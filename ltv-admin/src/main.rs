@@ -173,10 +173,36 @@ async fn dispatch(st: &mut State, line: &str) -> Result<bool, String> {
             }
             return Ok(true);
         }
-        ["help"] => println!("create <file> | open <file> | save | close | status | ls | show <p> | add | rm <p>\n\
-                              edit <p> [field=value ...] | target add <p> | target rm <p> <uuid>\n\
-                              pubkey <p> | hostkey fetch <p> [--os] | probe <p>|--all | unlock <p> | enroll <p> [--target <uuid|mapper>]\n\
-                              fetch <p> | server-setup <p> [--out <dir>] | passwd | quit"),
+        ["help"] => println!(r#"Commands:
+  create <file>                  Create new vault file, prompts passphrase twice
+  open <file>                    Open existing vault file
+  save                           Save changes to vault file (atomic write)
+  close                          Close current vault
+  status                         Show vault status (file, profile count, dirty flag)
+  ls                             List profiles: name, host, target count, hostkey status
+  show <profile>                 Show full profile details (public parts)
+  add                            Add new profile interactively (wizard)
+  rm <profile>                   Remove profile (requires confirmation)
+  edit <profile> [field=val...]  Edit scalar fields: name, host, port, user, notes,
+                                 connect_timeout, exec_timeout, resume
+  target add <profile>           Add target to profile interactively
+  target rm <profile> <uuid>     Remove target from profile
+  pubkey <profile>               Print Ed25519 public key (restricted authorized_keys line)
+  rotate-key <profile>           Generate new Ed25519 keypair for profile
+  hostkey fetch <profile> [--os] TOFU-fetch Dropbear/OS host key, confirm, store
+  probe <profile>|--all          State detection: Unreachable/WaitingInInitramfs/BootedOs/UnknownHostKey
+  unlock <profile>               Full push-unlock with live progress
+  enroll <profile> [--target <uuid|mapper>]
+                                 Enroll keyfiles into LUKS headers over booted OS
+  fetch <profile>                Discover LUKS volumes on booted OS, offer to add as targets
+  server-setup <profile> [--out <dir>]
+                                 Generate mkinitfs deployment artifacts for remote unlock
+  passwd                         Change master passphrase (re-derives, new salt)
+  backup <path>                  Create timestamped encrypted vault copy
+  import-profile                 Import profile from another vault
+  export-profile <profile> <dir> Export profile to directory
+  quit | exit                    Exit (prompts to save if dirty)
+"#),
         ["create", f] => {
             let p1 = pass("New passphrase: "); let p2 = pass("Repeat: ");
             if p1.expose_secret() != p2.expose_secret() { return Err("passphrases differ".into()); }
