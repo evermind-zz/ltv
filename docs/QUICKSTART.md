@@ -55,7 +55,7 @@ cd /root/deploy-myserver
 # Update bootloader (syslinux example)
 # Edit /etc/syslinux.conf:
 #   INITRD /boot/initramfs-ltv-6.18.59-0-virt
-#   APPEND init=/sbin/ltv-init-wrapper ltv_mappers=cryptroot root=UUID=... modules=...
+#   APPEND ltv_mappers=cryptroot root=UUID=... modules=...
 
 reboot
 ```

@@ -21,12 +21,6 @@ Order [0]: 0
   target added, 64-byte keyfile generated.
 
 LUKS UUID (blank = done): 
-
-Client public key (deploy to initramfs authorized_keys):
-ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI... ltv:web01
-Next: 'hostkey fetch web01' once the server is in initramfs, then 'enroll web01'.
-```
-
 ## 2. Server Preparation (Target Server)
 
 **Option A: Automated via deploy.sh**
@@ -45,12 +39,24 @@ cd /root/deploy-web01
 #   Regenerating initramfs for kernel 6.18.59-0-virt...
 #   === NEXT STEPS ===
 #   1. Update bootloader to use: /boot/initramfs-ltv-6.18.59-0-virt
-#   2. Add kernel cmdline: init=/sbin/ltv-init-wrapper ltv_mappers=cryptroot
+#   2. Add kernel cmdline: ltv_mappers=cryptroot
 #   3. Reboot
 
 # Update bootloader (syslinux example)
 # Edit /etc/syslinux.conf, change initramfs line and add:
-#   init=/sbin/ltv-init-wrapper ltv_mappers=cryptroot
+#   ltv_mappers=cryptroot
+reboot
+```
+# Output:
+#   Regenerating initramfs for kernel 6.18.59-0-virt...
+#   === NEXT STEPS ===
+#   1. Update bootloader to use: /boot/initramfs-ltv-6.18.59-0-virt
+#   2. Add kernel cmdline: ltv_mappers=cryptroot
+#   3. Reboot
+
+# Update bootloader (syslinux example)
+# Edit /etc/syslinux.conf, change initramfs line and add:
+#   ltv_mappers=cryptroot
 reboot
 ```
 

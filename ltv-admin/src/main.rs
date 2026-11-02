@@ -446,8 +446,7 @@ async fn cmd_server_setup(st: &mut State, name: &str, args: &[&str]) -> Result<(
     // 1. Generate ltv.files
     let ltv_files = r#"/sbin/dropbear
 /etc/dropbear/dropbear_ed25519_host_key
-/usr/share/mkinitfs/features.d/ltv-hook.sh
-/sbin/ltv-init-wrapper
+/usr/share/mkinitfs/ltv-hook.sh
 "#;
     fs::write(out_path.join("ltv.files"), ltv_files).map_err(|e| format!("write ltv.files: {e}"))?;
 
@@ -462,10 +461,10 @@ async fn cmd_server_setup(st: &mut State, name: &str, args: &[&str]) -> Result<(
 "#;
     fs::write(out_path.join("ltv.packages"), ltv_packages).map_err(|e| format!("write ltv.packages: {e}"))?;
 
-    // 4. Generate ltv-hook.sh
+    // 4. Generate ltv-hook.sh (installed to /usr/share/mkinitfs/)
     let ltv_hook = format!(r#"#!/bin/sh
 # ltv-hook: Start dropbear and wait for LTV mappers
-# Called from initramfs init via ltv-init-wrapper
+# Called from patched initramfs init
 # Kernel cmdline: ltv_mappers={}
 
 set -e
@@ -520,27 +519,52 @@ wait $DROPBEAR_PID 2>/dev/null
 exit 0
 "#, mappers_csv, mappers_csv);
 
-    // Create usr/share/mkinitfs/features.d directory
-    fs::create_dir_all(out_path.join("usr/share/mkinitfs/features.d"))
+    // Create usr/share/mkinitfs directory
+    fs::create_dir_all(out_path.join("usr/share/mkinitfs"))
         .map_err(|e| format!("create dir: {e}"))?;
-    fs::write(out_path.join("usr/share/mkinitfs/features.d/ltv-hook.sh"), ltv_hook)
+    fs::write(out_path.join("usr/share/mkinitfs/ltv-hook.sh"), ltv_hook)
         .map_err(|e| format!("write ltv-hook.sh: {e}"))?;
 
-    // 5. Generate ltv-init-wrapper
-    let ltv_init_wrapper = r#"#!/bin/sh
-# ltv-init-wrapper: Run LTV hook then exec real init
-# Kernel cmdline: init=/sbin/ltv-init-wrapper ltv_mappers=cryptroot,cryptdata
+    // 5. Generate init script patch (sed script to insert hook call)
+    let init_patch = r#"#!/bin/sh
+# initramfs-init.patch - patches /usr/share/mkinitfs/initramfs-init to call ltv-hook
+# This is applied by deploy.sh before running mkinitfs
 
-if [ -n "$KOPT_ltv_mappers" ]; then
-    export LTV_MAPPERS="$KOPT_ltv_mappers"
-    /usr/share/mkinitfs/features.d/ltv-hook.sh
+set -e
+
+INIT_SCRIPT="/usr/share/mkinitfs/initramfs-init"
+BACKUP_SCRIPT="/usr/share/mkinitfs/initramfs-init.ltv-backup"
+
+if [ ! -f "$INIT_SCRIPT" ]; then
+    echo "ERROR: $INIT_SCRIPT not found"
+    exit 1
 fi
 
-exec /init "$@"
+# Backup original
+cp "$INIT_SCRIPT" "$BACKUP_SCRIPT"
+
+# Patch: insert ltv-hook call after the second configure_ip (before nlplug-findfs for cryptroot)
+# The pattern is: configure_ip (second call) followed by nlplug-findfs for cryptroot
+# We use sed to insert our hook call after the line containing "configure_ip" that is
+# followed by the nlplug-findfs for cryptroot (line with "cryptopts")
+
+# Find the line number of the second configure_ip call (the one before cryptroot nlplug-findfs)
+# The pattern: after "configure_ip" there's a comment "run nlplug-findfs before SINGLEMODE"
+# then the nlplug-findfs command with $cryptopts
+
+# Simpler approach: insert after the line containing "run nlplug-findfs before SINGLEMODE"
+sed -i '/run nlplug-findfs before SINGLEMODE/a\
+\
+# LTV hook - start dropbear for remote unlock\
+if [ -n "$KOPT_ltv_mappers" ]; then\
+    export LTV_MAPPERS="$KOPT_ltv_mappers"\
+    /usr/share/mkinitfs/ltv-hook.sh\
+fi' "$INIT_SCRIPT"
+
+echo "Patched $INIT_SCRIPT to call ltv-hook"
 "#;
-    fs::create_dir_all(out_path.join("sbin")).map_err(|e| format!("create dir: {e}"))?;
-    fs::write(out_path.join("sbin/ltv-init-wrapper"), ltv_init_wrapper)
-        .map_err(|e| format!("write ltv-init-wrapper: {e}"))?;
+    fs::write(out_path.join("usr/share/mkinitfs/initramfs-init.patch"), init_patch)
+        .map_err(|e| format!("write initramfs-init.patch: {e}"))?;
 
     // 6. Note: dropbear host key will be generated on target by deploy.sh
     // (generating proper Dropbear key format requires dropbearkey binary)
@@ -554,8 +578,8 @@ exec /init "$@"
     fs::write(out_path.join("authorized_keys"), authorized_keys)
         .map_err(|e| format!("write authorized_keys: {e}"))?;
 
-    // 8. Generate cmdline.txt
-    let cmdline = format!("init=/sbin/ltv-init-wrapper ltv_mappers={}", mappers_csv);
+    // 8. Generate cmdline.txt (no init= wrapper needed - hook is in init script)
+    let cmdline = format!("ltv_mappers={}", mappers_csv);
     fs::write(out_path.join("cmdline.txt"), &cmdline)
         .map_err(|e| format!("write cmdline.txt: {e}"))?;
 
@@ -568,13 +592,12 @@ set -e
 echo "Installing LTV mkinitfs feature..."
 
 # 1. Install feature files
-cp -r etc/mkinitfs/features.d/ltv.* /etc/mkinitfs/features.d/
-cp usr/share/mkinitfs/features.d/ltv-hook.sh /usr/share/mkinitfs/features.d/
-chmod 755 /usr/share/mkinitfs/features.d/ltv-hook.sh
+cp etc/mkinitfs/features.d/ltv.* /etc/mkinitfs/features.d/
+cp usr/share/mkinitfs/ltv-hook.sh /usr/share/mkinitfs/ltv-hook.sh
+chmod 755 /usr/share/mkinitfs/ltv-hook.sh
 
-# 2. Install init wrapper
-cp sbin/ltv-init-wrapper /sbin/ltv-init-wrapper
-chmod 755 /sbin/ltv-init-wrapper
+# 2. Patch initramfs init script to call ltv-hook
+sh usr/share/mkinitfs/initramfs-init.patch
 
 # 3. Generate dropbear host key (run on target)
 dropbearkey -t ed25519 -f /etc/dropbear/dropbear_ed25519_host_key
@@ -609,14 +632,14 @@ echo "4. Reboot to test"
 
 ## Generated Files
 
-- `ltv.files` - mkinitfs feature file list
-- `ltv.modules` - kernel modules needed
-- `ltv.packages` - APK packages to install
-- `ltv-hook.sh` - initramfs hook (starts dropbear, waits for mappers)
-- `ltv-init-wrapper` - init wrapper (runs hook before real init)
-- `etc/dropbear/dropbear_ed25519_host_key` - Dropbear Ed25519 host key
-- `authorized_keys` - Client public key for initramfs SSH
-- `cmdline.txt` - Kernel cmdline to add
+- `ltv.files` - mkinitfs feature file list (installed to `/etc/mkinitfs/features.d/`)
+- `ltv.modules` - kernel modules needed (empty, uses cryptsetup feature)
+- `ltv.packages` - APK packages to install (dropbear)
+- `ltv-hook.sh` - initramfs hook (starts dropbear, waits for mappers, installed to `/usr/share/mkinitfs/`)
+- `initramfs-init.patch` - sed script to patch `/usr/share/mkinitfs/initramfs-init`
+- `etc/dropbear/README.txt` - Instructions to generate Dropbear host key on target
+- `authorized_keys` - Client public key for initramfs SSH (restricted)
+- `cmdline.txt` - Kernel cmdline to add (`ltv_mappers=...`)
 - `deploy.sh` - Run this on the target Alpine server
 
 ## Initramfs Host Key
@@ -624,6 +647,7 @@ echo "4. Reboot to test"
 **Fingerprint (SHA256): {}**
 
 This key is pinned in the vault profile. Verify it matches on first connection.
+**Note**: The actual host key is generated on the target by `deploy.sh` using `dropbearkey`.
 
 ## Target Mappers
 
@@ -644,19 +668,16 @@ reboot
 ```bash
 # 1. Copy feature files
 cp ltv.files ltv.modules ltv.packages /etc/mkinitfs/features.d/
-cp ltv-hook.sh /usr/share/mkinitfs/features.d/
-chmod 755 /usr/share/mkinitfs/features.d/ltv-hook.sh
+cp ltv-hook.sh /usr/share/mkinitfs/ltv-hook.sh
+chmod 755 /usr/share/mkinitfs/ltv-hook.sh
 
-# 2. Copy init wrapper
-cp ltv-init-wrapper /sbin/ltv-init-wrapper
-chmod 755 /sbin/ltv-init-wrapper
+# 2. Patch initramfs init script to call ltv-hook
+sh initramfs-init.patch
 
-# 3. Copy dropbear host key
-mkdir -p /etc/dropbear
-cp etc/dropbear/dropbear_ed25519_host_key /etc/dropbear/
-chmod 600 /etc/dropbear/dropbear_ed25519_host_key
+# 3. Generate dropbear host key (on target)
+dropbearkey -t ed25519 -f /etc/dropbear/dropbear_ed25519_host_key
 
-# 4. Create authorized_keys overlay
+# 4. Create authorized_keys overlay for initramfs
 mkdir -p /etc/mkinitfs/features.d/ltv-ssh.keys/root/.ssh
 cp authorized_keys /etc/mkinitfs/features.d/ltv-ssh.keys/root/.ssh/authorized_keys
 chmod 600 /etc/mkinitfs/features.d/ltv-ssh.keys/root/.ssh/authorized_keys
@@ -664,8 +685,8 @@ chmod 600 /etc/mkinitfs/features.d/ltv-ssh.keys/root/.ssh/authorized_keys
 # 5. Regenerate initramfs
 mkinitfs -F "base ltv cryptsetup network" -k $(uname -r) -o /boot/initramfs-ltv-$(uname -r) $(uname -r)
 
-# 6. Update bootloader with:
-#    init=/sbin/ltv-init-wrapper ltv_mappers={}
+# 6. Update bootloader with kernel cmdline from cmdline.txt:
+#    ltv_mappers={}
 ```
 "#, p.name, hk_fp, mappers.join("\n"), mappers_csv);
 

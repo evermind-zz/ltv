@@ -13,13 +13,11 @@
 
 ```
 deploy-<profile>/
-├── ltv.files                    # Feature file list
+├── ltv.files                    # Feature file list (installed to /etc/mkinitfs/features.d/)
 ├── ltv.modules                  # Kernel modules (empty - uses cryptsetup feature)
 ├── ltv.packages                 # APK packages: dropbear
-├── usr/share/mkinitfs/features.d/
-│   └── ltv-hook.sh              # Initramfs hook script
-├── sbin/
-│   └── ltv-init-wrapper         # Init wrapper (runs hook before real init)
+├── ltv-hook.sh                  # Initramfs hook script (installed to /usr/share/mkinitfs/)
+├── initramfs-init.patch         # Sed script to patch /usr/share/mkinitfs/initramfs-init
 ├── etc/dropbear/
 │   └── README.txt               # "Run: dropbearkey -t ed25519 ..."
 ├── authorized_keys              # Restricted client pubkey
@@ -33,13 +31,12 @@ deploy-<profile>/
 ```bash
 #!/bin/sh
 # 1. Install mkinitfs feature files
-cp -r etc/mkinitfs/features.d/ltv.* /etc/mkinitfs/features.d/
-cp usr/share/mkinitfs/features.d/ltv-hook.sh /usr/share/mkinitfs/features.d/
-chmod 755 /usr/share/mkinitfs/features.d/ltv-hook.sh
+cp ltv.files ltv.modules ltv.packages /etc/mkinitfs/features.d/
+cp ltv-hook.sh /usr/share/mkinitfs/ltv-hook.sh
+chmod 755 /usr/share/mkinitfs/ltv-hook.sh
 
-# 2. Install init wrapper
-cp sbin/ltv-init-wrapper /sbin/ltv-init-wrapper
-chmod 755 /sbin/ltv-init-wrapper
+# 2. Patch initramfs init script to call ltv-hook
+sh initramfs-init.patch
 
 # 3. Generate Dropbear Ed25519 host key
 dropbearkey -t ed25519 -f /etc/dropbear/dropbear_ed25519_host_key
@@ -69,15 +66,17 @@ LABEL ltv
     MENU_LABEL Alpine Linux with LTV
     LINUX /boot/vmlinuz-virt
     INITRD /boot/initramfs-ltv-6.18.59-0-virt
-    APPEND init=/sbin/ltv-init-wrapper ltv_mappers=cryptroot,cryptdata root=UUID=<rootfs-uuid> modules=sd-mod,usb-storage,ext4 quiet
+    APPEND ltv_mappers=cryptroot,cryptdata root=UUID=<rootfs-uuid> modules=sd-mod,usb-storage,ext4 quiet
 ```
+
+**Note**: No `init=` wrapper needed - the hook is called from the patched init script.
 
 ### GRUB
 
 Edit `/etc/default/grub`:
 
 ```bash
-GRUB_CMDLINE_LINUX_DEFAULT="init=/sbin/ltv-init-wrapper ltv_mappers=cryptroot,cryptdata"
+GRUB_CMDLINE_LINUX_DEFAULT="ltv_mappers=cryptroot,cryptdata"
 ```
 
 Then: `grub-mkconfig -o /boot/grub/grub.cfg`
@@ -86,7 +85,6 @@ Then: `grub-mkconfig -o /boot/grub/grub.cfg`
 
 | Parameter | Description | Example |
 |-----------|-------------|---------|
-| `init=/sbin/ltv-init-wrapper` | Runs LTV hook before real init | Required |
 | `ltv_mappers=cryptroot,cryptdata` | Comma-separated mapper names to wait for | Required |
 
 ## Network Configuration
@@ -154,14 +152,28 @@ wait $DROPBEAR_PID
 
 **Timeout**: 300 seconds (5 minutes). After timeout, hook exits with error.
 
+## Init Script Patching
+
+The `initramfs-init.patch` inserts the hook call after the comment `run nlplug-findfs before SINGLEMODE` in `/usr/share/mkinitfs/initramfs-init`:
+
+```bash
+# LTV hook - start dropbear for remote unlock
+if [ -n "$KOPT_ltv_mappers" ]; then
+    export LTV_MAPPERS="$KOPT_ltv_mappers"
+    /usr/share/mkinitfs/ltv-hook.sh
+fi
+```
+
+This runs **after the second `configure_ip` call** (network is up) and **before `nlplug-findfs` for cryptroot**.
+
 ## Verification Checklist
 
 After deployment, verify:
 
 - [ ] `dropbearkey -t ed25519` generated host key in `/etc/dropbear/`
 - [ ] `/etc/mkinitfs/features.d/ltv.*` files present
-- [ ] `/usr/share/mkinitfs/features.d/ltv-hook.sh` executable
-- [ ] `/sbin/ltv-init-wrapper` executable
+- [ ] `/usr/share/mkinitfs/ltv-hook.sh` executable
+- [ ] `/usr/share/mkinitfs/initramfs-init` patched (backup at `.ltv-backup`)
 - [ ] Initramfs regenerated: `/boot/initramfs-ltv-<kernel>`
 - [ ] Bootloader updated with new initramfs + cmdline
 - [ ] `authorized_keys` overlay created in `/etc/mkinitfs/features.d/ltv-ssh.keys/`
