@@ -163,17 +163,30 @@ async fn cmd_fetch(st: &mut State, name: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn require_args(parts: &[&str], min: usize, usage: &str) -> Result<(), String> {
+    if parts.len() < min {
+        return Err(format!("Usage: {}", usage));
+    }
+    Ok(())
+}
+
 async fn dispatch(st: &mut State, line: &str) -> Result<bool, String> {
     let parts: Vec<&str> = line.split_whitespace().collect();
-    match parts.as_slice() {
-        [] => {}
-        ["quit"] | ["exit"] => {
+    if parts.is_empty() {
+        return Ok(false);
+    }
+
+    match parts[0] {
+        "quit" | "exit" => {
+            require_args(&parts, 1, "quit")?;
             if st.vault.as_ref().map(|v| v.is_dirty()).unwrap_or(false) {
                 if ask("Unsaved changes. Save? [Y/n]: ").to_lowercase() != "n" { save_atomic(st)?; }
             }
             return Ok(true);
         }
-        ["help"] => println!(r#"Commands:
+        "help" => {
+            require_args(&parts, 1, "help")?;
+            println!(r#"Commands:
   create <file>                  Create new vault file, prompts passphrase twice
   open <file>                    Open existing vault file
   save                           Save changes to vault file (atomic write)
@@ -202,31 +215,38 @@ async fn dispatch(st: &mut State, line: &str) -> Result<bool, String> {
   import-profile                 Import profile from another vault
   export-profile <profile> <dir> Export profile to directory
   quit | exit                    Exit (prompts to save if dirty)
-"#),
-        ["create", f] => {
+"#);
+        }
+        "create" => {
+            require_args(&parts, 2, "create <file>")?;
+            let f = parts[1];
             let p1 = pass("New passphrase: "); let p2 = pass("Repeat: ");
             if p1.expose_secret() != p2.expose_secret() { return Err("passphrases differ".into()); }
             st.vault = Some(Vault::create(&p1, Argon2Params::default()).map_err(|e| e.to_string())?);
             st.path = Some(PathBuf::from(f));
             save_atomic(st)?;
         }
-        ["open", f] => {
+        "open" => {
+            require_args(&parts, 2, "open <file>")?;
+            let f = parts[1];
             let bytes = fs::read(f).map_err(|e| e.to_string())?;
             let v = Vault::open(&bytes, &pass("Passphrase: ")).map_err(|e| e.to_string())?;
             println!("opened: {} profiles", v.inventory.profiles.len());
             st.vault = Some(v); st.path = Some(PathBuf::from(f));
         }
-        ["save"] => save_atomic(st)?,
-        ["close"] => { st.vault = None; st.path = None; }
-        ["status"] => match (&st.path, &st.vault) {
+        "save" => { require_args(&parts, 1, "save")?; save_atomic(st)?; }
+        "close" => { require_args(&parts, 1, "close")?; st.vault = None; st.path = None; }
+        "status" => { require_args(&parts, 1, "status")?; match (&st.path, &st.vault) {
             (Some(p), Some(v)) => println!("{} — {} profiles, dirty={}", p.display(), v.inventory.profiles.len(), v.is_dirty()),
             _ => println!("no vault open"),
-        },
-        ["ls"] => for p in &st.vault.as_ref().ok_or("no vault open")?.inventory.profiles {
+        }}
+        "ls" => { require_args(&parts, 1, "ls")?; for p in &st.vault.as_ref().ok_or("no vault open")?.inventory.profiles {
             println!("{:<16} {:<24} targets={} hostkey={}", p.name, format!("{}:{}", p.host, p.port),
                      p.targets_meta.len(), if p.initramfs_host_key.is_some() { "pinned" } else { "MISSING" });
-        },
-        ["show", n] => {
+        }}
+        "show" => {
+            require_args(&parts, 2, "show <profile>")?;
+            let n = parts[1];
             let v = st.vault.as_ref().ok_or("no vault open")?; let p = resolve(v, n)?;
             println!("name: {}\nhost: {}:{} user {}\nuuid: {}", p.name, p.host, p.port, p.username, uuid::Uuid::from_bytes(p.uuid));
             if let Some(k) = &p.initramfs_host_key { println!("initramfs hostkey: {} {}", k.key_type, fingerprint_sha256(&k.key_bytes)); }
@@ -236,13 +256,18 @@ async fn dispatch(st: &mut State, line: &str) -> Result<bool, String> {
             }
             println!("pubkey: {}", v.export_public_key(p));
         }
-        ["add"] => cmd_add(st)?,
-        ["rm", n] => {
+        "add" => { require_args(&parts, 1, "add")?; cmd_add(st)?; }
+        "rm" => {
+            require_args(&parts, 2, "rm <profile>")?;
+            let n = parts[1];
             let v = st.vault.as_mut().ok_or("no vault open")?;
             let uuid = resolve(v, n)?.uuid;
             if ask(&format!("Remove '{n}'? type YES: ")) == "YES" { v.remove_profile(&uuid).map_err(|e| e.to_string())?; }
         }
-        ["edit", n, rest @ ..] => {
+        "edit" => {
+            require_args(&parts, 2, "edit <profile> [field=value ...]")?;
+            let n = parts[1];
+            let rest = &parts[2..];
             let v = st.vault.as_mut().ok_or("no vault open")?;
             let uuid = resolve(v, n)?.uuid;
             let mut p = v.profile(&uuid).map_err(|e| e.to_string())?.clone();
@@ -268,26 +293,45 @@ async fn dispatch(st: &mut State, line: &str) -> Result<bool, String> {
             }
             if changed { v.update_profile(&uuid, |p2| *p2 = p).map_err(|e| e.to_string())?; println!("profile updated"); } else { println!("no changes"); }
         }
-        ["target", "add", n] => {
-            let v = st.vault.as_mut().ok_or("no vault open")?;
-            let uuid = resolve(v, n)?.uuid;
-            let luks_uuid = ask("LUKS UUID: "); if luks_uuid.is_empty() { return Err("uuid required".into()); }
-            let fallback = ask("Fallback device path (optional): ");
-            let mapped = ask_or("Mapper name", "cryptroot");
-            let order: u8 = ask_or("Order", "0").parse().unwrap_or(0);
-            let meta = TargetMeta { luks_uuid, fallback_path: if fallback.is_empty() { None } else { Some(fallback) },
-                                mapped_name: mapped, order, keyslot: None, token_id: None };
-            v.add_target(&uuid, meta, None).map_err(|e| e.to_string())?;
-            println!("  target added, 64-byte keyfile generated.");
+        "target" => {
+            if parts.len() < 2 { return Err("Usage: target add|rm <profile> ...".into()); }
+            match parts[1] {
+                "add" => {
+                    require_args(&parts, 3, "target add <profile>")?;
+                    let n = parts[2];
+                    let v = st.vault.as_mut().ok_or("no vault open")?;
+                    let uuid = resolve(v, n)?.uuid;
+                    let luks_uuid = ask("LUKS UUID: "); if luks_uuid.is_empty() { return Err("uuid required".into()); }
+                    let fallback = ask("Fallback device path (optional): ");
+                    let mapped = ask_or("Mapper name", "cryptroot");
+                    let order: u8 = ask_or("Order", "0").parse().unwrap_or(0);
+                    let meta = TargetMeta { luks_uuid, fallback_path: if fallback.is_empty() { None } else { Some(fallback) },
+                                    mapped_name: mapped, order, keyslot: None, token_id: None };
+                    v.add_target(&uuid, meta, None).map_err(|e| e.to_string())?;
+                    println!("  target added, 64-byte keyfile generated.");
+                }
+                "rm" => {
+                    require_args(&parts, 4, "target rm <profile> <uuid>")?;
+                    let n = parts[2];
+                    let uuid_str = parts[3];
+                    let v = st.vault.as_mut().ok_or("no vault open")?;
+                    let uuid = resolve(v, n)?.uuid;
+                    v.remove_target(&uuid, uuid_str).map_err(|e| e.to_string())?;
+                    println!("target removed");
+                }
+                _ => return Err("Usage: target add|rm <profile> ...".into()),
+            }
         }
-        ["target", "rm", n, uuid_str] => {
-            let v = st.vault.as_mut().ok_or("no vault open")?;
-            let uuid = resolve(v, n)?.uuid;
-            v.remove_target(&uuid, uuid_str).map_err(|e| e.to_string())?;
-            println!("target removed");
+        "pubkey" => {
+            require_args(&parts, 2, "pubkey <profile>")?;
+            let n = parts[1];
+            let v = st.vault.as_ref().ok_or("no vault open")?; println!("{}", v.authorized_keys_line(resolve(v, n)?));
         }
-        ["pubkey", n] => { let v = st.vault.as_ref().ok_or("no vault open")?; println!("{}", v.authorized_keys_line(resolve(v, n)?)); }
-        ["hostkey", "fetch", n, rest @ ..] => {
+        "hostkey" => {
+            if parts.len() < 3 || parts[1] != "fetch" { return Err("Usage: hostkey fetch <profile> [--os]".into()); }
+            require_args(&parts, 3, "hostkey fetch <profile> [--os]")?;
+            let n = parts[2];
+            let rest = &parts[3..];
             let v = st.vault.as_mut().ok_or("no vault open")?;
             let p = resolve(v, n)?.clone();
             let hk = fetch_host_key(&p.host, p.port, p.connect_timeout_s).await.map_err(|e| e.to_string())?;
@@ -296,27 +340,70 @@ async fn dispatch(st: &mut State, line: &str) -> Result<bool, String> {
                 v.set_host_key(&p.uuid, hk, rest.contains(&"--os")).map_err(|e| e.to_string())?;
             }
         }
-        ["probe", n] => {
+        "probe" => {
+            require_args(&parts, 2, "probe <profile>|--all")?;
+            let n = parts[1];
             let v = st.vault.as_ref().ok_or("no vault open")?;
-            let ps: Vec<Profile> = if *n == "--all" { v.inventory.profiles.clone() } else { vec![resolve(v, n)?.clone()] };
+            let ps: Vec<Profile> = if n == "--all" { v.inventory.profiles.clone() } else { vec![resolve(v, n)?.clone()] };
             for p in ps { println!("{:<16} {:?}", p.name, probe(&p).await); }
         }
-        ["unlock", n] => {
+        "unlock" => {
+            require_args(&parts, 2, "unlock <profile>")?;
+            let n = parts[1];
             let v = st.vault.as_ref().ok_or("no vault open")?;
             let uuid = resolve(v, n)?.uuid;
             unlock(v, &uuid, |e| println!(" ✓ {e:?}")).await.map_err(|e| e.to_string())?;
         }
-        ["enroll", n] => cmd_enroll(st, n, None).await?,
-        ["enroll", n, "--target", t] => cmd_enroll(st, n, Some(t)).await?,
-        ["fetch", n] => cmd_fetch(st, n).await?,
-        ["server-setup", n, rest @ ..] => cmd_server_setup(st, n, &rest).await?,
-        ["passwd"] => {
+        "enroll" => {
+            require_args(&parts, 2, "enroll <profile> [--target <uuid|mapper>]")?;
+            let n = parts[1];
+            let only = if parts.len() >= 4 && parts[2] == "--target" { Some(parts[3]) } else { None };
+            cmd_enroll(st, n, only).await?
+        }
+        "fetch" => {
+            require_args(&parts, 2, "fetch <profile>")?;
+            let n = parts[1];
+            cmd_fetch(st, n).await?
+        }
+        "server-setup" => {
+            require_args(&parts, 2, "server-setup <profile> [--out <dir>]")?;
+            let n = parts[1];
+            let rest = &parts[2..];
+            cmd_server_setup(st, n, rest).await?
+        }
+        "passwd" => {
+            require_args(&parts, 1, "passwd")?;
             let v = st.vault.as_mut().ok_or("no vault open")?;
             let p1 = pass("New passphrase: "); let p2 = pass("Repeat: ");
             if p1.expose_secret() != p2.expose_secret() { return Err("passphrases differ".into()); }
             v.change_passphrase(0, &p1, Argon2Params::default()).map_err(|e| e.to_string())?;
         }
-        other => return Err(format!("unknown command: {}", other.join(" "))),
+        "backup" => {
+            require_args(&parts, 2, "backup <path>")?;
+            let path = parts[1];
+            let v = st.vault.as_mut().ok_or("no vault open")?;
+            let bytes = v.save().map_err(|e| e.to_string())?;
+            let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+            let backup_path = format!("{}.{}.bak", path, ts);
+            fs::write(&backup_path, bytes).map_err(|e| e.to_string())?;
+            println!("backup saved to {}", backup_path);
+        }
+        "import-profile" => {
+            require_args(&parts, 1, "import-profile")?;
+            // TODO: implement
+            println!("import-profile: not yet implemented");
+        }
+        "export-profile" => {
+            require_args(&parts, 3, "export-profile <profile> <dir>")?;
+            // TODO: implement
+            println!("export-profile: not yet implemented");
+        }
+        "rotate-key" => {
+            require_args(&parts, 2, "rotate-key <profile>")?;
+            // TODO: implement
+            println!("rotate-key: not yet implemented");
+        }
+        _ => return Err(format!("unknown command: {}. Type 'help' for list.", parts[0])),
     }
     Ok(false)
 }
