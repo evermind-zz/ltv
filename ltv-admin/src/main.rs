@@ -444,7 +444,7 @@ async fn cmd_server_setup(st: &mut State, name: &str, args: &[&str]) -> Result<(
     let hk_fp = fingerprint_sha256(&hk.key_bytes);
 
     // 1. Generate ltv.files
-    let ltv_files = r#"/sbin/dropbear
+    let ltv_files = r#"/usr/sbin/dropbear
 /etc/dropbear/dropbear_ed25519_host_key
 /usr/share/mkinitfs/ltv-hook.sh
 "#;
@@ -533,10 +533,12 @@ exit 0
     fs::write(out_path.join("usr/share/mkinitfs/ltv-hook.sh"), ltv_hook)
         .map_err(|e| format!("write ltv-hook.sh: {e}"))?;
 
-    // 5. Generate init script patch (sed script to insert hook call)
+    // 5. Generate init script patch (sed script to insert hook call) - uses markers for idempotent patching
     let init_patch = r#"#!/bin/sh
 # initramfs-init.patch - patches /usr/share/mkinitfs/initramfs-init to call ltv-hook
 # This is applied by deploy.sh before running mkinitfs
+# Uses markers to allow idempotent re-patching
+# Backup is created BEFORE any patching, from clean original
 
 set -e
 
@@ -548,26 +550,26 @@ if [ ! -f "$INIT_SCRIPT" ]; then
     exit 1
 fi
 
-# Backup original
-cp "$INIT_SCRIPT" "$BACKUP_SCRIPT"
+# Create backup BEFORE any patching (only on first run)
+# Must do this BEFORE the sed insert below
+if [ ! -f "$BACKUP_SCRIPT" ]; then
+    cp "$INIT_SCRIPT" "$BACKUP_SCRIPT"
+    echo "Created clean backup: $BACKUP_SCRIPT"
+fi
 
-# Patch: insert ltv-hook call after the second configure_ip (before nlplug-findfs for cryptroot)
-# The pattern is: configure_ip (second call) followed by nlplug-findfs for cryptroot
-# We use sed to insert our hook call after the line containing "configure_ip" that is
-# followed by the nlplug-findfs for cryptroot (line with "cryptopts")
+# ALWAYS restore from clean backup first
+cp "$BACKUP_SCRIPT" "$INIT_SCRIPT"
 
-# Find the line number of the second configure_ip call (the one before cryptroot nlplug-findfs)
-# The pattern: after "configure_ip" there's a comment "run nlplug-findfs before SINGLEMODE"
-# then the nlplug-findfs command with $cryptopts
-
-# Simpler approach: insert after the line containing "run nlplug-findfs before SINGLEMODE"
+# Insert new patch after "run nlplug-findfs before SINGLEMODE" with markers
 sed -i '/run nlplug-findfs before SINGLEMODE/a\
 \
+### LTV PATCH START ###\
 # LTV hook - start dropbear for remote unlock\
 if [ -n "$KOPT_ltv_mappers" ]; then\
     export LTV_MAPPERS="$KOPT_ltv_mappers"\
     /usr/share/mkinitfs/ltv-hook.sh\
-fi' "$INIT_SCRIPT"
+fi\
+### LTV PATCH END ###' "$INIT_SCRIPT"
 
 echo "Patched $INIT_SCRIPT to call ltv-hook"
 "#;
