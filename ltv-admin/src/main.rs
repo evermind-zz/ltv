@@ -4,7 +4,11 @@ use std::path::Path;
 use rustyline::{error::ReadlineError, DefaultEditor};
 use secrecy::{ExposeSecret, SecretString, SecretVec};
 
-struct State { path: Option<PathBuf>, vault: Option<Vault> }
+struct State { 
+    path: Option<PathBuf>, 
+    vault: Option<Vault>,
+    verbose: bool,
+}
 
 fn pass(prompt: &str) -> SecretVec<u8> {
     SecretVec::new(rpassword::prompt_password(prompt).unwrap_or_default().into_bytes())
@@ -58,7 +62,7 @@ fn cmd_add(st: &mut State) -> Result<(), String> {
     Ok(())
 }
 
-async fn cmd_enroll(st: &mut State, name: &str, only: Option<&str>) -> Result<(), String> {
+async fn cmd_enroll(st: &mut State, name: &str, only: Option<&str>, verbose: bool) -> Result<(), String> {
     let v = st.vault.as_mut().ok_or("no vault open")?;
     let p = resolve(v, name)?.clone();
 
@@ -88,9 +92,15 @@ async fn cmd_enroll(st: &mut State, name: &str, only: Option<&str>) -> Result<()
     let access = BootedAccess { use_sudo: username != "root", username, auth, connect_timeout_s: p.connect_timeout_s };
     let luks_pass = SecretString::new(rpassword::prompt_password("Existing LUKS passphrase: ").unwrap_or_default());
 
-    let results = ltv_core::enroll(v, &p.uuid, &access, &luks_pass, only, |e| match e {
-        EnrollEvent::Skipped(t, why) => println!(" ! {t}: skipped ({why})"),
-        other => println!(" ✓ {other:?}"),
+    let results = ltv_core::enroll(v, &p.uuid, &access, &luks_pass, only, |e| {
+        if verbose {
+            println!("  [enroll] {e:?}");
+        } else {
+            match e {
+                EnrollEvent::Skipped(t, why) => println!(" ! {t}: skipped ({why})"),
+                other => println!(" ✓ {other:?}"),
+            }
+        }
     }).await.map_err(|e| e.to_string())?;
 
     for r in &results { v.set_keyslot(&p.uuid, &r.luks_uuid, r.keyslot).map_err(|e| e.to_string())?; }
@@ -98,7 +108,7 @@ async fn cmd_enroll(st: &mut State, name: &str, only: Option<&str>) -> Result<()
     Ok(())
 }
 
-async fn cmd_fetch(st: &mut State, name: &str) -> Result<(), String> {
+async fn cmd_fetch(st: &mut State, name: &str, verbose: bool) -> Result<(), String> {
     let v = st.vault.as_mut().ok_or("no vault open")?;
     let p = resolve(v, name)?.clone();
 
@@ -137,16 +147,22 @@ async fn cmd_fetch(st: &mut State, name: &str) -> Result<(), String> {
     println!("\nDiscovered LUKS volumes:");
     for (i, info) in results.iter().enumerate() {
         println!("  [{}] UUID: {}", i, info.luks_uuid);
-        println!("       Device: {}", info.device_path);
-        println!("       Cipher: {}", info.cipher);
-        println!("       Key size: {} bits", info.key_size);
-        println!("       Version: {}", info.header_version);
+        if verbose {
+            println!("       Device: {}", info.device_path);
+            println!("       Cipher: {}", info.cipher);
+            println!("       Key size: {} bits", info.key_size);
+            println!("       Version: {}", info.header_version);
+        } else {
+            println!("       Device: {} | Cipher: {} | Key size: {} bits | Version: {}", 
+                info.device_path, info.cipher, info.key_size, info.header_version);
+        }
     }
 
     let choice = ask("\nAdd all as targets? [y/N]: ").to_lowercase();
     if choice == "y" {
         for info in results {
             let mapped = format!("crypt{}", info.luks_uuid.split('-').next().unwrap_or("vol"));
+            let mapped_for_log = mapped.clone();
             let meta = TargetMeta {
                 luks_uuid: info.luks_uuid.clone(),
                 fallback_path: Some(info.device_path.clone()),
@@ -156,7 +172,11 @@ async fn cmd_fetch(st: &mut State, name: &str) -> Result<(), String> {
                 token_id: None,
             };
             v.add_target(&p.uuid, meta, None).map_err(|e| e.to_string())?;
-            println!("  added target for {}", info.luks_uuid);
+            if verbose {
+                println!("  [fetch] Added target: {} -> {}", info.luks_uuid, mapped_for_log);
+            } else {
+                println!("  added target for {}", info.luks_uuid);
+            }
         }
         println!("Targets added. Remember to 'save'.");
     }
@@ -205,17 +225,32 @@ async fn dispatch(st: &mut State, line: &str) -> Result<bool, String> {
   hostkey fetch <profile> [--os] TOFU-fetch Dropbear/OS host key, confirm, store
   probe <profile>|--all          State detection: Unreachable/WaitingInInitramfs/BootedOs/UnknownHostKey
   unlock <profile>               Full push-unlock with live progress
-  enroll <profile> [--target <uuid|mapper>]
+  enroll <profile> [--target <uuid|mapper>] [--verbose]
                                  Enroll keyfiles into LUKS headers over booted OS
-  fetch <profile>                Discover LUKS volumes on booted OS, offer to add as targets
+  fetch <profile> [--verbose]    Discover LUKS volumes on booted OS, offer to add as targets
   server-setup <profile> [--out <dir>]
                                  Generate mkinitfs deployment artifacts for remote unlock
   passwd                         Change master passphrase (re-derives, new salt)
   backup <path>                  Create timestamped encrypted vault copy
   import-profile                 Import profile from another vault
   export-profile <profile> <dir> Export profile to directory
+  verbose [on|off|toggle]        Toggle verbose output for enroll/fetch/unlock/probe
   quit | exit                    Exit (prompts to save if dirty)
 "#);
+        }
+        "verbose" => {
+            require_args(&parts, 1, "verbose [on|off|toggle]")?;
+            if parts.len() == 1 {
+                st.verbose = !st.verbose;
+            } else {
+                match parts[1] {
+                    "on" => st.verbose = true,
+                    "off" => st.verbose = false,
+                    "toggle" => st.verbose = !st.verbose,
+                    _ => return Err("Usage: verbose [on|off|toggle]".into()),
+                }
+            }
+            println!("Verbose: {}", if st.verbose { "on" } else { "off" });
         }
         "create" => {
             require_args(&parts, 2, "create <file>")?;
@@ -341,29 +376,74 @@ async fn dispatch(st: &mut State, line: &str) -> Result<bool, String> {
             }
         }
         "probe" => {
-            require_args(&parts, 2, "probe <profile>|--all")?;
+            require_args(&parts, 2, "probe <profile>|--all [--verbose]")?;
             let n = parts[1];
+            let mut verbose = st.verbose;
+            if parts.len() >= 3 && parts[2] == "--verbose" {
+                verbose = true;
+            }
             let v = st.vault.as_ref().ok_or("no vault open")?;
             let ps: Vec<Profile> = if n == "--all" { v.inventory.profiles.clone() } else { vec![resolve(v, n)?.clone()] };
-            for p in ps { println!("{:<16} {:?}", p.name, probe(&p).await); }
+            for p in ps { 
+                let result = probe(&p).await;
+                if verbose {
+                    println!("{:<16} {:?}", p.name, result);
+                    println!("  Host: {}:{} | Initramfs key: {} | OS key: {}", 
+                        p.host, p.port, 
+                        if p.initramfs_host_key.is_some() { "pinned" } else { "not pinned" },
+                        if p.os_host_key.is_some() { "pinned" } else { "not pinned" });
+                } else {
+                    println!("{:<16} {:?}", p.name, result);
+                }
+            }
         }
         "unlock" => {
-            require_args(&parts, 2, "unlock <profile>")?;
+            require_args(&parts, 2, "unlock <profile> [--verbose]")?;
             let n = parts[1];
+            let mut verbose = st.verbose;
+            if parts.len() >= 3 && parts[2] == "--verbose" {
+                verbose = true;
+            }
             let v = st.vault.as_ref().ok_or("no vault open")?;
             let uuid = resolve(v, n)?.uuid;
-            unlock(v, &uuid, |e| println!(" ✓ {e:?}")).await.map_err(|e| e.to_string())?;
+            unlock(v, &uuid, |e| {
+                if verbose {
+                    println!("  [unlock] {e:?}");
+                } else {
+                    println!(" ✓ {e:?}");
+                }
+            }).await.map_err(|e| e.to_string())?;
         }
         "enroll" => {
-            require_args(&parts, 2, "enroll <profile> [--target <uuid|mapper>]")?;
+            require_args(&parts, 2, "enroll <profile> [--target <uuid|mapper>] [--verbose]")?;
             let n = parts[1];
-            let only = if parts.len() >= 4 && parts[2] == "--target" { Some(parts[3]) } else { None };
-            cmd_enroll(st, n, only).await?
+            let mut only = None;
+            let mut verbose = st.verbose;
+            let mut i = 2;
+            while i < parts.len() {
+                match parts[i] {
+                    "--target" => {
+                        if i + 1 >= parts.len() { return Err("--target requires a value".into()); }
+                        only = Some(parts[i + 1]);
+                        i += 2;
+                    }
+                    "--verbose" => {
+                        verbose = true;
+                        i += 1;
+                    }
+                    _ => i += 1,
+                }
+            }
+            cmd_enroll(st, n, only, verbose).await?
         }
         "fetch" => {
-            require_args(&parts, 2, "fetch <profile>")?;
+            require_args(&parts, 2, "fetch <profile> [--verbose]")?;
             let n = parts[1];
-            cmd_fetch(st, n).await?
+            let mut verbose = st.verbose;
+            if parts.len() >= 3 && parts[2] == "--verbose" {
+                verbose = true;
+            }
+            cmd_fetch(st, n, verbose).await?
         }
         "server-setup" => {
             require_args(&parts, 2, "server-setup <profile> [--out <dir>]")?;
@@ -722,7 +802,7 @@ mkinitfs -F "base ltv cryptsetup network" -k $(uname -r) -o /boot/initramfs-ltv-
 #[tokio::main]
 async fn main() {
     let mut rl = DefaultEditor::new().expect("readline");
-    let mut st = State { path: None, vault: None };
+    let mut st = State { path: None, vault: None, verbose: false };
     loop {
         let prompt = match &st.path { Some(p) => format!("ltv-admin({})> ", p.file_stem().unwrap().to_string_lossy()), None => "ltv-admin> ".into() };
         match rl.readline(&prompt) {
