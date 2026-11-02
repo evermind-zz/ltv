@@ -346,7 +346,6 @@ async fn cmd_server_setup(st: &mut State, name: &str, args: &[&str]) -> Result<(
 
     // 3. Generate ltv.packages
     let ltv_packages = r#"dropbear
-cryptsetup
 "#;
     fs::write(out_path.join("ltv.packages"), ltv_packages).map_err(|e| format!("write ltv.packages: {e}"))?;
 
