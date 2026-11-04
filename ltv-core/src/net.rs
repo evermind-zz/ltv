@@ -75,11 +75,14 @@ pub async fn fetch_host_key(host: &str, port: u16, connect_s: u16) -> Result<Hos
 }
 
 /// Steps 1–2 only. No authentication, no secrets.
-pub async fn probe(p: &Profile) -> ProbeResult {
+/// If `verbose` is provided, it will be called with connection details.
+pub async fn probe(p: &Profile, mut verbose: Option<Box<dyn FnMut(&str) + Send>>) -> ProbeResult {
+    if let Some(v) = verbose.as_mut() { v(&format!("Connecting to {}:{} (timeout {}s)", p.host, p.port, p.connect_timeout_s)); }
     match connect(&p.host, p.port, p.connect_timeout_s, None).await {
         Err(UnlockError::Net(NetError::Timeout)) => ProbeResult::Unreachable("timeout".into()),
         Err(e) => ProbeResult::Unreachable(e.to_string()),
         Ok((s, k)) => {
+            if let Some(v) = verbose.as_mut() { v(&format!("SSH host key: {} {}", k.key_type, fingerprint_sha256(&k.key_bytes))); }
             let _ = s.disconnect(russh::Disconnect::ByApplication, "", "en").await;
             if p.initramfs_host_key.as_ref() == Some(&k) { ProbeResult::WaitingInInitramfs }
             else if p.os_host_key.as_ref() == Some(&k) { ProbeResult::BootedOs }
@@ -135,8 +138,10 @@ pub struct FetchedLuksInfo {
 /// Connect to the booted OS and discover all LUKS volumes.
 /// Uses the profile's os_host_key (must be pinned first).
 /// Auth: either the client's Ed25519 key (from vault) or password via BootedAuth.
+/// If `verbose` is provided, it will be called with each command executed on the target.
 pub async fn fetch_luks_info(
     vault: &Vault, uuid: &[u8; 16], access: &BootedAccess, only_mapped: Option<&str>,
+    mut verbose: Option<Box<dyn FnMut(&str) + Send>>,
 ) -> Result<Vec<FetchedLuksInfo>, UnlockError> {
     let p = vault.profile(uuid)?.clone();
     let os_key = p.os_host_key.clone().ok_or(UnlockError::HostKeyMismatch)?;
@@ -152,8 +157,11 @@ pub async fn fetch_luks_info(
     let t = Duration::from_secs(p.exec_timeout_s.max(30) as u64);
 
     // Find all LUKS devices via blkid
-    let r = exec(&mut s, &format!("{sudo}blkid -t TYPE=crypto_LUKS -o export"), None, t).await?;
+    let cmd = format!("{sudo}blkid -t TYPE=crypto_LUKS -o export");
+    if let Some(v) = verbose.as_mut() { v(&cmd); }
+    let r = exec(&mut s, &cmd, None, t).await?;
     if r.code != 0 {
+        if let Some(v) = verbose.as_mut() { v(&format!("  [fetch] ! exit={} stderr: {}", r.code, r.stderr.trim())); }
         return Err(UnlockError::CryptsetupFailed { target: "discovery".into(), code: r.code, stderr: r.stderr });
     }
 
@@ -170,8 +178,12 @@ pub async fn fetch_luks_info(
         } else if line.is_empty() && !current_uuid.is_empty() && !current_dev.is_empty() {
             // Got a complete device entry, now get details
             let _filter = only_mapped; // reserved for future filtering by mapper name
-            let dump = exec(&mut s, &format!("{sudo}cryptsetup luksDump UUID={}", current_uuid), None, t).await?;
-            if dump.code == 0 {
+            let cmd = format!("{sudo}cryptsetup luksDump UUID={}", current_uuid);
+            if let Some(v) = verbose.as_mut() { v(&cmd); }
+            let dump = exec(&mut s, &cmd, None, t).await?;
+            if dump.code != 0 {
+                if let Some(v) = verbose.as_mut() { v(&format!("  [fetch] ! exit={} stderr: {}", dump.code, dump.stderr.trim())); }
+            } else {
                 // Parse cipher, key_size, version from luksDump
                 let mut cipher = String::new();
                 let mut key_size = 0;
@@ -199,15 +211,18 @@ pub async fn fetch_luks_info(
     Ok(results)
 }
 
-pub async fn unlock(vault: &Vault, uuid: &[u8; 16], mut on: impl FnMut(UnlockEvent)) -> Result<(), UnlockError> {
+pub async fn unlock(
+    vault: &Vault, uuid: &[u8; 16], mut on: impl FnMut(UnlockEvent),
+    mut verbose: Option<Box<dyn FnMut(&str) + Send>>,
+) -> Result<(), UnlockError> {
     let p = vault.profile(uuid)?.clone();
     let expected = p.initramfs_host_key.clone().ok_or(UnlockError::HostKeyMismatch)?;
     on(UnlockEvent::Connecting);
 
     let (mut session, _) = match connect(&p.host, p.port, p.connect_timeout_s, Some(expected)).await {
         Err(UnlockError::HostKeyMismatch) => {
-            // distinguish "booted OS" from real mismatch via a probe
-            return Err(match probe(&p).await { ProbeResult::BootedOs => UnlockError::StateBootedOs, _ => UnlockError::HostKeyMismatch });
+            // distinguish "booted OS" from real mismatch via a probe (no verbose needed for this quick check)
+            return Err(match probe(&p, None).await { ProbeResult::BootedOs => UnlockError::StateBootedOs, _ => UnlockError::HostKeyMismatch });
         }
         r => r?,
     };
@@ -226,15 +241,29 @@ pub async fn unlock(vault: &Vault, uuid: &[u8; 16], mut on: impl FnMut(UnlockEve
         on(UnlockEvent::TargetStart(tm.mapped_name.clone()));
         let key = secrets.keyfiles.iter().find(|k| k.luks_uuid == tm.luks_uuid)
             .ok_or(VaultError::Invariant("missing keyfile"))?;
-        let mut r = exec(&mut session,
-            &format!("cryptsetup luksOpen --key-file=- UUID={} {}", tm.luks_uuid, tm.mapped_name),
-            Some(&key.keyfile), t).await?;
+
+        // Stage keyfile in tmpfs (binary safe, avoids stdin newline truncation)
+        let cmd = format!("sudo sh -c 'umask 077 && cat > /run/ltv/key'");
+        if let Some(v) = verbose.as_mut() { v(&cmd); }
+        let r = exec(&mut session, &cmd, Some(&key.keyfile), t).await?;
+        if r.code != 0 {
+            if let Some(v) = verbose.as_mut() { v(&format!("  [unlock] ! exit={} stderr: {}", r.code, r.stderr.trim())); }
+            return Err(UnlockError::CryptsetupFailed { target: tm.mapped_name.clone(), code: r.code, stderr: r.stderr });
+        }
+
+        // Use tmpfs file for unlock
+        let cmd = format!("cryptsetup luksOpen --key-file=/run/ltv/key UUID={} {}", tm.luks_uuid, tm.mapped_name);
+        if let Some(v) = verbose.as_mut() { v(&cmd); }
+        let mut r = exec(&mut session, &cmd, None, t).await?;
         if r.code != 0 && r.stderr.to_lowercase().contains("not exist") {
             if let Some(fp) = &tm.fallback_path {
-                r = exec(&mut session,
-                    &format!("cryptsetup luksOpen --key-file=- {} {}", fp, tm.mapped_name),
-                    Some(&key.keyfile), t).await?;
+                let cmd = format!("cryptsetup luksOpen --key-file=/run/ltv/key {} {}", fp, tm.mapped_name);
+                if let Some(v) = verbose.as_mut() { v(&cmd); }
+                r = exec(&mut session, &cmd, None, t).await?;
             }
+        }
+        if r.code != 0 {
+            if let Some(v) = verbose.as_mut() { v(&format!("  [unlock] ! exit={} stderr: {}", r.code, r.stderr.trim())); }
         }
         match r.code {
             0 => on(UnlockEvent::TargetDone(tm.mapped_name.clone())),
@@ -242,11 +271,20 @@ pub async fn unlock(vault: &Vault, uuid: &[u8; 16], mut on: impl FnMut(UnlockEve
             5 => on(UnlockEvent::TargetAlreadyOpen(tm.mapped_name.clone())),
             c => return Err(UnlockError::CryptsetupFailed { target: tm.mapped_name.clone(), code: c, stderr: r.stderr }),
         }
+
+        // Cleanup keyfile
+        let cmd = format!("sudo rm -f /run/ltv/key");
+        if let Some(v) = verbose.as_mut() { v(&cmd); }
+        let _ = exec(&mut session, &cmd, None, t).await;
     }
 
     if let ResumePolicy::Command(c) = &p.resume {
+        if let Some(v) = &mut verbose { v(c); }
         let r = exec(&mut session, c, None, t).await?;
-        if r.code != 0 { return Err(UnlockError::ResumeFailed(r.stderr)); }
+        if r.code != 0 {
+            if let Some(v) = verbose.as_mut() { v(&format!("  [unlock] ! exit={} stderr: {}", r.code, r.stderr.trim())); }
+            return Err(UnlockError::ResumeFailed(r.stderr));
+        }
         on(UnlockEvent::ResumeSent);
     }
     let _ = session.disconnect(russh::Disconnect::ByApplication, "done", "en").await;

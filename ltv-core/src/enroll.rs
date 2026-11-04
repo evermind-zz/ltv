@@ -41,9 +41,11 @@ fn first_free(used: &[u8]) -> Option<u8> { (0u8..32).find(|s| !used.contains(s))
 /// Enrolls every target keyfile of `uuid` into its LUKS header over the booted OS.
 /// `luks_pass` is the existing passphrase (same for all targets, or ask per target in frontend).
 /// Returns per-target slot numbers; frontend persists them via `Vault::set_keyslot`.
+/// If `verbose` is provided, it will be called with each command executed on the target.
 pub async fn enroll(
     vault: &Vault, uuid: &[u8; 16], access: &BootedAccess, luks_pass: &SecretString,
     only_target: Option<&str>, mut on: impl FnMut(EnrollEvent),
+    mut verbose: Option<Box<dyn FnMut(&str) + Send>>,
 ) -> Result<Vec<EnrollResult>, UnlockError> {
     let p = vault.profile(uuid)?.clone();
     let os_key = p.os_host_key.clone().ok_or(UnlockError::HostKeyMismatch)?;
@@ -61,20 +63,43 @@ pub async fn enroll(
     let t = Duration::from_secs(p.exec_timeout_s.max(60) as u64); // luksAddKey runs PBKDF, be generous
     let secrets = vault.open_secrets(&p)?;
     let mut results = Vec::new();
+    let mut matched = false;
 
     for tm in &p.targets_meta {
-        if let Some(f) = only_target { if f != tm.luks_uuid && f != tm.mapped_name { continue; } }
+        if let Some(f) = only_target {
+            if f != tm.luks_uuid && f != tm.mapped_name { continue; }
+            matched = true;
+        }
         on(EnrollEvent::TargetStart(tm.mapped_name.clone()));
-        let dev = format!("UUID={}", tm.luks_uuid);
+
+        // Try UUID first, then fallback to fallback_path if device not found
+        let mut dev = format!("UUID={}", tm.luks_uuid);
 
         // 0. sanity: device exists & is LUKS
-        let r = exec(&mut s, &format!("{sudo}cryptsetup isLuks {dev}"), None, t).await?;
+        let cmd = format!("{sudo}cryptsetup isLuks {dev}");
+        if let Some(verb) = verbose.as_mut() { verb(&cmd); }
+        let mut r = exec(&mut s, &cmd, None, t).await?;
+        if r.code != 0 && r.stderr.to_lowercase().contains("not exist") {
+            // Try fallback path if available (device not found via UUID)
+            if let Some(fp) = &tm.fallback_path {
+                dev = fp.clone();
+                let cmd = format!("{sudo}cryptsetup isLuks {dev}");
+                if let Some(verb) = verbose.as_mut() { verb(&cmd); }
+                r = exec(&mut s, &cmd, None, t).await?;
+            }
+        }
         if r.code != 0 {
+            if let Some(verb) = verbose.as_mut() { verb(&format!("  [enroll] ! exit={} stderr: {}", r.code, r.stderr.trim())); }
             on(EnrollEvent::Skipped(tm.mapped_name.clone(), format!("not a LUKS device: {}", r.stderr.trim())));
             continue;
         }
         // 1. pick slot
-        let dump = exec(&mut s, &format!("{sudo}cryptsetup luksDump {dev}"), None, t).await?;
+        let cmd = format!("{sudo}cryptsetup luksDump {dev}");
+        if let Some(verb) = verbose.as_mut() { verb(&cmd); }
+        let dump = exec(&mut s, &cmd, None, t).await?;
+        if dump.code != 0 {
+            if let Some(verb) = verbose.as_mut() { verb(&format!("  [enroll] ! exit={} stderr: {}", dump.code, dump.stderr.trim())); }
+        }
         let used = parse_used_slots(&dump.stdout);
         let slot = match tm.keyslot {
             Some(k) if !used.contains(&k) => k,
@@ -83,19 +108,39 @@ pub async fn enroll(
         };
         on(EnrollEvent::SlotChosen(tm.mapped_name.clone(), slot));
 
-        // 2. stage existing passphrase in tmpfs
-        let r = exec(&mut s, &format!("{sudo}sh -c 'umask 077 && mkdir -p /run/ltv && cat > /run/ltv/pass'"),
-                     Some(luks_pass.expose_secret().as_bytes()), t).await?;
-        if r.code != 0 { return Err(UnlockError::CryptsetupFailed { target: tm.mapped_name.clone(), code: r.code, stderr: r.stderr }); }
-
-        // 3. add key, 4. always clean up
+        // Get key for this target
         let key = secrets.keyfiles.iter().find(|k| k.luks_uuid == tm.luks_uuid)
             .ok_or(VaultError::Invariant("missing keyfile"))?;
-        let add = exec(&mut s,
-            &format!("{sudo}cryptsetup luksAddKey --key-file=/run/ltv/pass --new-keyfile=- --key-slot {slot} {dev}"),
-            Some(&key.keyfile), t).await;
-        let _ = exec(&mut s, &format!("{sudo}rm -f /run/ltv/pass"), None, t).await;
+
+        // 2. stage existing passphrase AND new key in tmpfs
+        let cmd = format!("{sudo}sh -c 'umask 077 && mkdir -p /run/ltv && cat > /run/ltv/pass'");
+        if let Some(verb) = verbose.as_mut() { verb(&cmd); }
+        let r = exec(&mut s, &cmd, Some(luks_pass.expose_secret().as_bytes()), t).await?;
+        if r.code != 0 { 
+            if let Some(verb) = verbose.as_mut() { verb(&format!("  [enroll] ! exit={} stderr: {}", r.code, r.stderr.trim())); }
+            return Err(UnlockError::CryptsetupFailed { target: tm.mapped_name.clone(), code: r.code, stderr: r.stderr }); 
+        }
+
+        // Write new key to tmpfs (binary safe, avoids stdin newline truncation)
+        let cmd = format!("{sudo}sh -c 'umask 077 && cat > /run/ltv/newkey'");
+        if let Some(verb) = verbose.as_mut() { verb(&cmd); }
+        let r = exec(&mut s, &cmd, Some(&key.keyfile), t).await?;
+        if r.code != 0 { 
+            if let Some(verb) = verbose.as_mut() { verb(&format!("  [enroll] ! exit={} stderr: {}", r.code, r.stderr.trim())); }
+            return Err(UnlockError::CryptsetupFailed { target: tm.mapped_name.clone(), code: r.code, stderr: r.stderr }); 
+        }
+
+        // 3. add key using both tmpfs files, 4. always clean up
+        let cmd = format!("{sudo}cryptsetup luksAddKey --key-file=/run/ltv/pass --new-keyfile=/run/ltv/newkey --key-slot {slot} {dev}");
+        if let Some(verb) = verbose.as_mut() { verb(&cmd); }
+        let add = exec(&mut s, &cmd, None, t).await;
+        let cmd = format!("{sudo}rm -f /run/ltv/pass /run/ltv/newkey");
+        if let Some(verb) = verbose.as_mut() { verb(&cmd); }
+        let _ = exec(&mut s, &cmd, None, t).await;
         let add = add?;
+        if add.code != 0 {
+            if let Some(verb) = verbose.as_mut() { verb(&format!("  [enroll] ! exit={} stderr: {}", add.code, add.stderr.trim())); }
+        }
         match add.code {
             0 => on(EnrollEvent::SlotAdded(tm.mapped_name.clone(), slot)),
             2 => return Err(UnlockError::KeyRejected(format!("{}: existing passphrase wrong", tm.mapped_name))),
@@ -103,14 +148,20 @@ pub async fn enroll(
         }
 
         // 5. verify with the new key itself (--test-passphrase doesn't open the device)
-        let v = exec(&mut s, &format!("{sudo}cryptsetup open --test-passphrase --key-file=- --key-slot {slot} {dev}"),
-                     Some(&key.keyfile), t).await?;
-        if v.code != 0 {
-            return Err(UnlockError::CryptsetupFailed { target: tm.mapped_name.clone(), code: v.code,
-                stderr: format!("verification failed: {}", v.stderr) });
+        let cmd = format!("{sudo}cryptsetup open --test-passphrase --key-file=- --key-slot {slot} {dev}");
+        if let Some(verb) = verbose.as_mut() { verb(&cmd); }
+        let verify = exec(&mut s, &cmd, Some(&key.keyfile), t).await?;
+        if verify.code != 0 {
+            if let Some(verb) = verbose.as_mut() { verb(&format!("  [enroll] ! exit={} stderr: {}", verify.code, verify.stderr.trim())); }
+            return Err(UnlockError::CryptsetupFailed { target: tm.mapped_name.clone(), code: verify.code,
+                stderr: format!("verification failed: {}", verify.stderr) });
         }
         on(EnrollEvent::Verified(tm.mapped_name.clone()));
         results.push(EnrollResult { luks_uuid: tm.luks_uuid.clone(), keyslot: slot });
+    }
+
+    if only_target.is_some() && !matched {
+        on(EnrollEvent::Skipped("--target".into(), format!("no target matches filter '{}'", only_target.unwrap())));
     }
 
     let _ = s.disconnect(russh::Disconnect::ByApplication, "done", "en").await;

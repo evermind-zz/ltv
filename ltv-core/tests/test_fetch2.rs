@@ -1,0 +1,45 @@
+use ltv_core::{Vault, fetch_luks_info, fetch_host_key, BootedAccess, BootedAuth};
+use secrecy::{SecretVec, SecretString};
+use std::fs;
+
+#[tokio::test]
+async fn test_fetch() {
+    let bytes = fs::read("../test2.ltv").unwrap();
+    let pass = SecretVec::new("abc".as_bytes().to_vec());
+    let mut vault = Vault::open(&bytes, &pass).unwrap();
+    
+    let uuid = vault.inventory.profiles[0].uuid;
+    let host = vault.inventory.profiles[0].host.clone();
+    let port = vault.inventory.profiles[0].port;
+    let connect_timeout = vault.inventory.profiles[0].connect_timeout_s;
+    
+    // Fetch and pin the host key
+    let hk = fetch_host_key(&host, port, connect_timeout).await.unwrap();
+    println!("Fetched host key: {}", hk.key_type);
+    vault.set_host_key(&uuid, hk, true).unwrap();
+    
+    // Test with password auth
+    let access = BootedAccess {
+        username: "root".to_string(),
+        auth: BootedAuth::Password(SecretString::new("abc".into())),
+        use_sudo: false,
+        connect_timeout_s: 10,
+    };
+    
+    let results = fetch_luks_info(&vault, &uuid, &access, None, Some(Box::new(|cmd: &str| println!("  [fetch] $ {cmd}")))).await;
+    
+    match results {
+        Ok(infos) => {
+            println!("Found {} LUKS volumes", infos.len());
+            for info in infos {
+                println!("  UUID: {}", info.luks_uuid);
+                println!("  Device: {}", info.device_path);
+                println!("  Cipher: {}", info.cipher);
+                println!("  Key size: {}", info.key_size);
+            }
+        }
+        Err(e) => {
+            println!("Fetch error: {}", e);
+        }
+    }
+}

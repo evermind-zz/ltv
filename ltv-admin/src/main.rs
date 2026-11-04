@@ -3,6 +3,7 @@ use ltv_core::{format::Argon2Params, model::{Profile, TargetMeta, ResumePolicy, 
 use std::path::Path;
 use rustyline::{error::ReadlineError, DefaultEditor};
 use secrecy::{ExposeSecret, SecretString, SecretVec};
+use getopts::Options;
 
 struct State { 
     path: Option<PathBuf>, 
@@ -13,11 +14,13 @@ struct State {
 fn pass(prompt: &str) -> SecretVec<u8> {
     SecretVec::new(rpassword::prompt_password(prompt).unwrap_or_default().into_bytes())
 }
+
 fn ask(prompt: &str) -> String {
     use std::io::{self, Write};
     print!("{prompt}"); io::stdout().flush().ok();
     let mut s = String::new(); io::stdin().read_line(&mut s).ok(); s.trim().to_string()
 }
+
 fn ask_or(prompt: &str, default: &str) -> String {
     let v = ask(&format!("{prompt} [{default}]: ")); if v.is_empty() { default.into() } else { v }
 }
@@ -52,21 +55,548 @@ fn cmd_add(st: &mut State) -> Result<(), String> {
         let mapped = ask_or("Mapper name", "cryptroot");
         let order: u8 = ask_or("Order", "0").parse().unwrap_or(0);
         let meta = TargetMeta { luks_uuid, fallback_path: if fallback.is_empty() { None } else { Some(fallback) },
-                                mapped_name: mapped, order, keyslot: None, token_id: None };
+                        mapped_name: mapped, order, keyslot: None, token_id: None };
         v.add_target(&uuid, meta, None).map_err(|e| e.to_string())?;
         println!("  target added, 64-byte keyfile generated.");
     }
-    let p = v.profile(&uuid).map_err(|e| e.to_string())?.clone();
-    println!("\nClient public key (deploy to initramfs authorized_keys):\n{}", v.authorized_keys_line(&p));
-    println!("Next: 'hostkey fetch {name}' once the server is in initramfs, then 'enroll {name}'.");
     Ok(())
 }
 
-async fn cmd_enroll(st: &mut State, name: &str, only: Option<&str>, verbose: bool) -> Result<(), String> {
-    let v = st.vault.as_mut().ok_or("no vault open")?;
+async fn cmd_server_setup(st: &mut State, name: &str, args: &[&str]) -> Result<(), String> {
+    let mut opts = Options::new();
+    opts.optopt("o", "out", "output directory", "DIR");
+    let matches = opts.parse(args).map_err(|e| e.to_string())?;
+    let out_dir = matches.opt_str("o").unwrap_or_else(|| format!("./ltv-deploy-{}", name));
+
+    let v = st.vault.as_ref().ok_or("no vault open")?;
     let p = resolve(v, name)?.clone();
 
-    // OS host key must be pinned first (admin-only TOFU)
+    if p.initramfs_host_key.is_none() {
+        return Err("initramfs host key not pinned. Run 'hostkey fetch <profile>' first.".into());
+    }
+
+    // Generate deployment artifacts
+    let deploy_dir = Path::new(&out_dir);
+    fs::create_dir_all(deploy_dir).map_err(|e| e.to_string())?;
+
+    // Build kernel cmdline snippet
+    let mut cmdline = String::from("ltv_mappers=");
+    let mut first = true;
+    for tm in &p.targets_meta {
+        if !first { cmdline.push(','); }
+        cmdline.push_str(&tm.mapped_name);
+        first = false;
+    }
+    cmdline.push('\n');
+    for tm in &p.targets_meta {
+        cmdline.push_str(&format!("ltv_{}={}\n", tm.mapped_name, tm.luks_uuid));
+    }
+
+    // 1a. feature file list (installed to /etc/mkinitfs/features.d/ltv.files)
+    let files = "ltv-hook.sh\nltv-common.sh\n";
+    fs::write(deploy_dir.join("ltv.files"), files).map_err(|e| e.to_string())?;
+
+    // 1b. kernel modules (empty - uses cryptsetup feature)
+    fs::write(deploy_dir.join("ltv.modules"), "").map_err(|e| e.to_string())?;
+
+    // 1c. APK packages needed
+    let packages = "dropbear\n";
+    fs::write(deploy_dir.join("ltv.packages"), packages).map_err(|e| e.to_string())?;
+
+    // 2. hook script
+    let hook = r#"#!/bin/sh
+# ltv-hook: push-to-stdin LUKS unlock via Dropbear
+# Runs after configure_ip, before nlplug-findfs
+
+. /lib/mkinitfs/ltv-common.sh
+
+ltv_unlock() {
+    local dev="$1" name="$2"
+    cryptsetup open --key-file=- "UUID=${dev}" "${name}" || return 1
+}
+
+# Read mapper specs from kernel cmdline: ltv_mappers=cryptroot,cryptdata
+mappers=$(getarg ltv_mappers=)
+if [ -n "$mappers" ]; then
+    OIFS=$IFS; IFS=,
+    for m in $mappers; do
+        IFS=$OIFS
+        dev=$(getarg "ltv_${m}=")
+        [ -n "$dev" ] && ltv_unlock "$dev" "$m"
+    done
+fi
+"#;
+    fs::write(deploy_dir.join("ltv-hook.sh"), hook).map_err(|e| e.to_string())?;
+
+    // 3. common lib
+    let common = r#"#!/bin/sh
+# ltv-common: shared functions for ltv hooks
+
+getarg() {
+    local name="$1" value
+    for x in $(cat /proc/cmdline); do
+        case $x in
+            ${name}=*) value=${x#*=} ;;
+        esac
+    done
+    echo "$value"
+}
+"#;
+    fs::write(deploy_dir.join("ltv-common.sh"), common).map_err(|e| e.to_string())?;
+
+    // 4. initramfs init patch (sed script)
+    let patch = r###"#!/bin/sh
+# initramfs-init.patch: sed script to insert ltv-hook call
+# Run with: sh initramfs-init.patch
+
+INIT=/usr/share/mkinitfs/initramfs-init
+if ! grep -q "ltv-hook" "$INIT"; then
+    sed -i '/^configure_ip/a ### LTV PATCH START ###\n. /lib/mkinitfs/ltv-hook.sh\n### LTV PATCH END ###' "$INIT"
+fi
+"###;
+    fs::write(deploy_dir.join("initramfs-init.patch"), patch).map_err(|e| e.to_string())?;
+
+    // 5. authorized_keys for initramfs (restricted client pubkey)
+    let auth_keys = v.authorized_keys_line(&p);
+    fs::write(deploy_dir.join("authorized_keys"), auth_keys).map_err(|e| e.to_string())?;
+
+    // 6. deploy.sh - run on target server
+    let deploy_sh = format!(r###"#!/bin/sh
+# deploy.sh: Run on target Alpine server to install LTV
+# Usage: sudo sh deploy.sh
+
+set -e
+
+echo "Installing mkinitfs feature files..."
+cp ltv.files ltv.modules ltv.packages /etc/mkinitfs/features.d/
+cp ltv-hook.sh /usr/share/mkinitfs/ltv-hook.sh
+chmod 755 /usr/share/mkinitfs/ltv-hook.sh
+cp ltv-common.sh /usr/share/mkinitfs/ltv-common.sh
+
+echo "Patching initramfs init script..."
+sh initramfs-init.patch
+
+echo "Generating Dropbear Ed25519 host key..."
+dropbearkey -t ed25519 -f /etc/dropbear/dropbear_ed25519_host_key
+
+echo "Creating authorized_keys overlay for initramfs..."
+mkdir -p /etc/mkinitfs/features.d/ltv-ssh.keys/root/.ssh
+cp authorized_keys /etc/mkinitfs/features.d/ltv-ssh.keys/root/.ssh/authorized_keys
+chmod 600 /etc/mkinitfs/features.d/ltv-ssh.keys/root/.ssh/authorized_keys
+
+echo "Regenerating initramfs..."
+KERNEL=$(uname -r)
+mkinitfs -F "base ltv cryptsetup network" -k "$KERNEL" \
+  -o "/boot/initramfs-ltv-$KERNEL" "$KERNEL"
+
+echo "Done! Update bootloader with kernel cmdline from cmdline.txt"
+echo "Then reboot."
+"###);
+    fs::write(deploy_dir.join("deploy.sh"), deploy_sh).map_err(|e| e.to_string())?;
+    // Make deploy.sh executable
+    use std::os::unix::fs::PermissionsExt;
+    let mut perms = fs::metadata(deploy_dir.join("deploy.sh")).map_err(|e| e.to_string())?.permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(deploy_dir.join("deploy.sh"), perms).map_err(|e| e.to_string())?;
+
+    // 7. cmdline.txt
+    fs::write(deploy_dir.join("cmdline.txt"), &cmdline).map_err(|e| e.to_string())?;
+
+    // 8. README
+    let readme = format!(r#"# LTV Deployment Artifacts for profile: {}
+
+## Files
+
+- `ltv.files` - Feature file list for mkinitfs
+- `ltv.modules` - Kernel modules (empty)
+- `ltv.packages` - APK packages: dropbear
+- `ltv-hook.sh` - Initramfs hook script
+- `ltv-common.sh` - Shared functions for hooks
+- `initramfs-init.patch` - Sed script to patch initramfs-init
+- `authorized_keys` - Restricted client public key for initramfs SSH
+- `deploy.sh` - Run this on the target server (sudo sh deploy.sh)
+- `cmdline.txt` - Kernel command line parameters
+
+## Quick Deploy
+
+On target Alpine server:
+
+```bash
+# Copy this entire directory to the server, then:
+sudo sh deploy.sh
+```
+
+## Bootloader Configuration
+
+Add to kernel command line (from cmdline.txt):
+{}
+## From Admin Machine
+
+After deployment and reboot:
+    ltv-admin> unlock {}
+
+# This will push keyfiles to initramfs Dropbear via SSH push-to-stdin
+"#, p.name, &cmdline, p.name);
+    fs::write(deploy_dir.join("README.md"), readme).map_err(|e| e.to_string())?;
+
+    println!("Deployment artifacts written to {}", deploy_dir.display());
+    println!("Run: sudo sh {}/deploy.sh on the target server", out_dir);
+    Ok(())
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut st = State { path: None, vault: None, verbose: false };
+    let mut rl = DefaultEditor::new()?;
+
+    println!("ltv-admin — LUKS SSH Unlock Admin");
+    println!("Type 'help' for commands.");
+
+    loop {
+        let line = match rl.readline("ltv-admin> ") {
+            Ok(l) => l.trim().to_string(),
+            Err(ReadlineError::Interrupted) => { println!("^C"); continue; }
+            Err(ReadlineError::Eof) => break,
+            Err(e) => return Err(e.into()),
+        };
+        if line.is_empty() { continue; }
+        let _ = rl.add_history_entry(&line);
+
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.is_empty() { continue; }
+
+        match handle_command(&mut st, &parts).await {
+            Ok(true) => break,
+            Ok(false) => {},
+            Err(e) => eprintln!("Error: {}", e),
+        }
+    }
+    Ok(())
+}
+
+async fn handle_command(st: &mut State, parts: &[&str]) -> Result<bool, String> {
+    match parts[0] {
+        "quit" | "exit" => {
+            if st.vault.as_ref().map_or(false, |v| v.is_dirty()) {
+                if ask("Unsaved changes. Save? [Y/n]: ").to_lowercase() != "n" { save_atomic(st)?; }
+            }
+            return Ok(true);
+        }
+        "help" => { print_help(); }
+        "verbose" => handle_verbose(st, parts)?,
+        "create" => handle_create(st, parts)?,
+        "open" => handle_open(st, parts)?,
+        "save" => { save_atomic(st)?; }
+        "close" => { st.vault = None; st.path = None; }
+        "status" => handle_status(st)?,
+        "ls" => handle_ls(st)?,
+        "show" => handle_show(st, parts)?,
+        "add" => { cmd_add(st)?; }
+        "rm" => handle_rm(st, parts)?,
+        "edit" => handle_edit(st, parts)?,
+        "target" => handle_target(st, parts)?,
+        "pubkey" => handle_pubkey(st, parts)?,
+        "hostkey" => handle_hostkey(st, parts).await?,
+        "probe" => handle_probe(st, parts).await?,
+        "unlock" => handle_unlock(st, parts).await?,
+        "enroll" => handle_enroll(st, parts).await?,
+        "fetch" => handle_fetch(st, parts).await?,
+        "server-setup" => handle_server_setup(st, parts).await?,
+        "passwd" => handle_passwd(st, parts)?,
+        "backup" => handle_backup(st, parts)?,
+        "import-profile" => println!("import-profile: not yet implemented"),
+        "export-profile" => println!("export-profile: not yet implemented"),
+        "rotate-key" => println!("rotate-key: not yet implemented"),
+        _ => return Err(format!("unknown command: {}. Type 'help' for list.", parts[0])),
+    }
+    Ok(false)
+}
+
+fn print_help() {
+    println!(r#"Commands:
+  create <file>                  Create new vault file, prompts passphrase twice
+  open <file>                    Open existing vault file
+  save                           Save changes to vault file (atomic write)
+  close                          Close current vault
+  status                         Show vault status (file, profile count, dirty flag)
+  ls                             List profiles: name, host, target count, hostkey status
+  show <profile>                 Show full profile details (public parts)
+  add                            Add new profile interactively (wizard)
+  rm <profile>                   Remove profile (requires confirmation)
+  edit <profile> [field=val...]  Edit scalar fields: name, host, port, user, notes,
+                                 connect_timeout, exec_timeout, resume
+  target add <profile>           Add target to profile interactively
+  target rm <profile> <uuid>     Remove target from profile
+  pubkey <profile>               Print Ed25519 public key (restricted authorized_keys line)
+  rotate-key <profile>           Generate new Ed25519 keypair for profile
+  hostkey fetch <profile> [--os] TOFU-fetch Dropbear/OS host key, confirm, store
+  probe <profile>|--all [--verbose]  State detection: Unreachable/WaitingInInitramfs/BootedOs/UnknownHostKey
+  unlock <profile> [--verbose]   Full push-unlock with live progress
+  enroll <profile> [--target <uuid|mapper>] [--verbose]
+                                 Enroll keyfiles into LUKS headers over booted OS
+  fetch <profile> [--verbose]    Discover LUKS volumes on booted OS, offer to add as targets
+  server-setup <profile> [--out <dir>]
+                                 Generate mkinitfs deployment artifacts for remote unlock
+  passwd                         Change master passphrase (re-derives, new salt)
+  backup <path>                  Create timestamped encrypted vault copy
+  import-profile                 Import profile from another vault
+  export-profile <profile> <dir> Export profile to directory
+  verbose [on|off|toggle]        Toggle verbose output for enroll/fetch/unlock/probe
+  quit | exit                    Exit (prompts to save if dirty)
+"#);
+}
+
+fn handle_verbose(st: &mut State, parts: &[&str]) -> Result<(), String> {
+    let mut opts = Options::new();
+    opts.optflag("h", "help", "show help");
+    let matches = opts.parse(&parts[1..]).map_err(|e| e.to_string())?;
+    
+    if matches.opt_present("h") || matches.free.is_empty() {
+        st.verbose = !st.verbose;
+    } else {
+        match matches.free[0].as_str() {
+            "on" => st.verbose = true,
+            "off" => st.verbose = false,
+            "toggle" => st.verbose = !st.verbose,
+            _ => return Err("Usage: verbose [on|off|toggle]".into()),
+        }
+    }
+    println!("Verbose: {}", if st.verbose { "on" } else { "off" });
+    Ok(())
+}
+
+fn handle_create(st: &mut State, parts: &[&str]) -> Result<(), String> {
+    let mut opts = Options::new();
+    opts.optflag("h", "help", "show help");
+    let matches = opts.parse(&parts[1..]).map_err(|e| e.to_string())?;
+    
+    if matches.free.is_empty() { return Err("Usage: create <file>".into()); }
+    let f = matches.free[0].clone();
+    let p1 = pass("New passphrase: "); let p2 = pass("Repeat: ");
+    if p1.expose_secret() != p2.expose_secret() { return Err("passphrases differ".into()); }
+    st.vault = Some(Vault::create(&p1, Argon2Params::default()).map_err(|e| e.to_string())?);
+    st.path = Some(PathBuf::from(f));
+    save_atomic(st)?;
+    Ok(())
+}
+
+fn handle_open(st: &mut State, parts: &[&str]) -> Result<(), String> {
+    let mut opts = Options::new();
+    opts.optflag("h", "help", "show help");
+    let matches = opts.parse(&parts[1..]).map_err(|e| e.to_string())?;
+    
+    if matches.free.is_empty() { return Err("Usage: open <file>".into()); }
+    let f = matches.free[0].clone();
+    let bytes = fs::read(&f).map_err(|e| e.to_string())?;
+    let v = Vault::open(&bytes, &pass("Passphrase: ")).map_err(|e| e.to_string())?;
+    println!("opened: {} profiles", v.inventory.profiles.len());
+    st.vault = Some(v); st.path = Some(PathBuf::from(f));
+    Ok(())
+}
+
+fn handle_status(st: &State) -> Result<(), String> {
+    match (&st.path, &st.vault) {
+        (Some(p), Some(v)) => println!("{} — {} profiles, dirty={}", p.display(), v.inventory.profiles.len(), v.is_dirty()),
+        _ => println!("no vault open"),
+    }
+    Ok(())
+}
+
+fn handle_ls(st: &State) -> Result<(), String> {
+    for p in &st.vault.as_ref().ok_or("no vault open")?.inventory.profiles {
+        println!("{:<16} {:<24} targets={} hostkey={}", p.name, format!("{}:{}", p.host, p.port),
+                 p.targets_meta.len(), if p.initramfs_host_key.is_some() { "pinned" } else { "MISSING" });
+    }
+    Ok(())
+}
+
+fn handle_show(st: &State, parts: &[&str]) -> Result<(), String> {
+    let mut opts = Options::new();
+    opts.optflag("h", "help", "show help");
+    let matches = opts.parse(&parts[1..]).map_err(|e| e.to_string())?;
+    
+    if matches.free.is_empty() { return Err("Usage: show <profile>".into()); }
+    let n = &matches.free[0];
+    let v = st.vault.as_ref().ok_or("no vault open")?; let p = resolve(v, n)?;
+    println!("name: {}\nhost: {}:{} user {}\nuuid: {}", p.name, p.host, p.port, p.username, uuid::Uuid::from_bytes(p.uuid));
+    if let Some(k) = &p.initramfs_host_key { println!("initramfs hostkey: {} {}", k.key_type, fingerprint_sha256(&k.key_bytes)); }
+    for t in &p.targets_meta { 
+        let fallback = t.fallback_path.as_deref().unwrap_or("none");
+        println!("  target {} UUID={} fallback={} slot={:?}", t.mapped_name, t.luks_uuid, fallback, t.keyslot); 
+    }
+    println!("pubkey: {}", v.export_public_key(p));
+    Ok(())
+}
+
+fn handle_rm(st: &mut State, parts: &[&str]) -> Result<(), String> {
+    let mut opts = Options::new();
+    opts.optflag("h", "help", "show help");
+    let matches = opts.parse(&parts[1..]).map_err(|e| e.to_string())?;
+    
+    if matches.free.is_empty() { return Err("Usage: rm <profile>".into()); }
+    let n = &matches.free[0];
+    let v = st.vault.as_mut().ok_or("no vault open")?;
+    let uuid = resolve(v, n)?.uuid;
+    if ask(&format!("Remove '{}'? type YES: ", n)) == "YES" { v.remove_profile(&uuid).map_err(|e| e.to_string())?; }
+    Ok(())
+}
+
+fn handle_edit(st: &mut State, parts: &[&str]) -> Result<(), String> {
+    let mut opts = Options::new();
+    opts.optflag("h", "help", "show help");
+    let matches = opts.parse(&parts[1..]).map_err(|e| e.to_string())?;
+    
+    if matches.free.is_empty() { return Err("Usage: edit <profile> [field=value ...]".into()); }
+    let n = &matches.free[0];
+    let rest = &matches.free[1..];
+    let v = st.vault.as_mut().ok_or("no vault open")?;
+    let uuid = resolve(v, n)?.uuid;
+    let mut p = v.profile(&uuid).map_err(|e| e.to_string())?.clone();
+    let mut changed = false;
+    for arg in rest {
+        if let Some((k, v)) = arg.split_once('=') {
+            match k {
+                "name" => { p.name = v.into(); changed = true; }
+                "host" => { p.host = v.into(); changed = true; }
+                "port" => { p.port = v.parse().map_err(|_| "bad port")?; changed = true; }
+                "user" | "username" => { p.username = v.into(); changed = true; }
+                "notes" => { p.notes = v.into(); changed = true; }
+                "connect_timeout" => { p.connect_timeout_s = v.parse().map_err(|_| "bad timeout")?; changed = true; }
+                "exec_timeout" => { p.exec_timeout_s = v.parse().map_err(|_| "bad timeout")?; changed = true; }
+                "resume" => {
+                    if v == "poll" { p.resume = ResumePolicy::DeviceMapperPoll; }
+                    else { p.resume = ResumePolicy::Command(v.into()); }
+                    changed = true;
+                }
+                _ => return Err(format!("unknown field: {k}")),
+            }
+        }
+    }
+    if changed { v.update_profile(&uuid, |p2| *p2 = p).map_err(|e| e.to_string())?; println!("profile updated"); } else { println!("no changes"); }
+    Ok(())
+}
+
+fn handle_target(st: &mut State, parts: &[&str]) -> Result<(), String> {
+    let mut opts = Options::new();
+    opts.optflag("h", "help", "show help");
+    let matches = opts.parse(&parts[1..]).map_err(|e| e.to_string())?;
+    
+    if matches.free.is_empty() { return Err("Usage: target add|rm <profile> ...".into()); }
+    match matches.free[0].as_str() {
+        "add" => {
+            if matches.free.len() < 2 { return Err("Usage: target add <profile>".into()); }
+            let n = &matches.free[1];
+            let v = st.vault.as_mut().ok_or("no vault open")?;
+            let uuid = resolve(v, n)?.uuid;
+            let luks_uuid = ask("LUKS UUID: "); if luks_uuid.is_empty() { return Err("uuid required".into()); }
+            let fallback = ask("Fallback device path (optional): ");
+            let mapped = ask_or("Mapper name", "cryptroot");
+            let order: u8 = ask_or("Order", "0").parse().unwrap_or(0);
+            let meta = TargetMeta { luks_uuid, fallback_path: if fallback.is_empty() { None } else { Some(fallback) },
+                            mapped_name: mapped, order, keyslot: None, token_id: None };
+            v.add_target(&uuid, meta, None).map_err(|e| e.to_string())?;
+            println!("  target added, 64-byte keyfile generated.");
+        }
+        "rm" => {
+            if matches.free.len() < 3 { return Err("Usage: target rm <profile> <uuid>".into()); }
+            let n = &matches.free[1];
+            let uuid_str = &matches.free[2];
+            let v = st.vault.as_mut().ok_or("no vault open")?;
+            let uuid = resolve(v, n)?.uuid;
+            v.remove_target(&uuid, uuid_str).map_err(|e| e.to_string())?;
+            println!("target removed");
+        }
+        _ => return Err("Usage: target add|rm <profile> ...".into()),
+    }
+    Ok(())
+}
+
+fn handle_pubkey(st: &State, parts: &[&str]) -> Result<(), String> {
+    let mut opts = Options::new();
+    opts.optflag("h", "help", "show help");
+    let matches = opts.parse(&parts[1..]).map_err(|e| e.to_string())?;
+    
+    if matches.free.is_empty() { return Err("Usage: pubkey <profile>".into()); }
+    let n = &matches.free[0];
+    let v = st.vault.as_ref().ok_or("no vault open")?; println!("{}", v.authorized_keys_line(resolve(v, n)?));
+    Ok(())
+}
+
+async fn handle_hostkey(st: &mut State, parts: &[&str]) -> Result<(), String> {
+    let mut opts = Options::new();
+    opts.optflag("", "os", "pin as OS host key instead of initramfs");
+    opts.optflag("h", "help", "show help");
+    let matches = opts.parse(&parts[1..]).map_err(|e| e.to_string())?;
+    
+    if matches.free.len() < 2 || matches.free[0] != "fetch" { return Err("Usage: hostkey fetch <profile> [--os]".into()); }
+    let n = &matches.free[1];
+    let is_os = matches.opt_present("os");
+    let v = st.vault.as_mut().ok_or("no vault open")?;
+    let p = resolve(v, n)?.clone();
+    let hk = fetch_host_key(&p.host, p.port, p.connect_timeout_s).await.map_err(|e| e.to_string())?;
+    println!("{} {}", hk.key_type, fingerprint_sha256(&hk.key_bytes));
+    if ask("Pin this key? [y/N]: ").to_lowercase() == "y" {
+        v.set_host_key(&p.uuid, hk, is_os).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+async fn handle_probe(st: &State, parts: &[&str]) -> Result<(), String> {
+    let mut opts = Options::new();
+    opts.optflag("", "verbose", "show SSH commands");
+    opts.optflag("h", "help", "show help");
+    let matches = opts.parse(&parts[1..]).map_err(|e| e.to_string())?;
+    
+    if matches.free.is_empty() { return Err("Usage: probe <profile>|--all [--verbose]".into()); }
+    let n = &matches.free[0];
+    let verbose = matches.opt_present("verbose") || st.verbose;
+    let v = st.vault.as_ref().ok_or("no vault open")?;
+    let ps: Vec<Profile> = if n == "--all" { v.inventory.profiles.clone() } else { vec![resolve(v, n)?.clone()] };
+    for p in ps {
+        let verbose_fn = if verbose { Some(Box::new(|msg: &str| println!("  [probe] {msg}")) as Box<dyn FnMut(&str) + Send>) } else { None };
+        let result = probe(&p, verbose_fn).await;
+        if !verbose {
+            println!("{:<16} {:?}", p.name, result);
+        }
+    }
+    Ok(())
+}
+
+async fn handle_unlock(st: &State, parts: &[&str]) -> Result<(), String> {
+    let mut opts = Options::new();
+    opts.optflag("", "verbose", "show cryptsetup commands");
+    opts.optflag("h", "help", "show help");
+    let matches = opts.parse(&parts[1..]).map_err(|e| e.to_string())?;
+    
+    if matches.free.is_empty() { return Err("Usage: unlock <profile> [--verbose]".into()); }
+    let n = &matches.free[0];
+    let verbose = matches.opt_present("verbose") || st.verbose;
+    let v = st.vault.as_ref().ok_or("no vault open")?;
+    let uuid = resolve(v, n)?.uuid;
+    let verbose_fn = if verbose { Some(Box::new(|cmd: &str| println!("  [unlock] $ {cmd}")) as Box<dyn FnMut(&str) + Send>) } else { None };
+    unlock(v, &uuid, |e| {
+        if !verbose {
+            println!(" ✓ {e:?}");
+        }
+    }, verbose_fn).await.map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+async fn handle_enroll(st: &mut State, parts: &[&str]) -> Result<(), String> {
+    let mut opts = Options::new();
+    opts.optopt("", "target", "filter by LUKS UUID or mapper name", "UUID|MAPPER");
+    opts.optflag("", "verbose", "show cryptsetup commands");
+    opts.optflag("h", "help", "show help");
+    let matches = opts.parse(&parts[1..]).map_err(|e| e.to_string())?;
+    
+    if matches.free.is_empty() { return Err("Usage: enroll <profile> [--target <uuid|mapper>] [--verbose]".into()); }
+    let n = &matches.free[0];
+    let only = matches.opt_str("target");
+    let verbose = matches.opt_present("verbose") || st.verbose;
+
+    let v = st.vault.as_mut().ok_or("no vault open")?;
+    let p = resolve(v, n)?.clone();
+
     if p.os_host_key.is_none() {
         println!("No OS host key pinned. Fetching from {}:{} ...", p.host, p.port);
         let hk = fetch_host_key(&p.host, p.port, p.connect_timeout_s).await.map_err(|e| e.to_string())?;
@@ -92,27 +622,32 @@ async fn cmd_enroll(st: &mut State, name: &str, only: Option<&str>, verbose: boo
     let access = BootedAccess { use_sudo: username != "root", username, auth, connect_timeout_s: p.connect_timeout_s };
     let luks_pass = SecretString::new(rpassword::prompt_password("Existing LUKS passphrase: ").unwrap_or_default());
 
-    let results = ltv_core::enroll(v, &p.uuid, &access, &luks_pass, only, |e| {
-        if verbose {
-            println!("  [enroll] {e:?}");
-        } else {
-            match e {
-                EnrollEvent::Skipped(t, why) => println!(" ! {t}: skipped ({why})"),
-                other => println!(" ✓ {other:?}"),
-            }
+    let results = ltv_core::enroll(v, &p.uuid, &access, &luks_pass, only.as_deref(), |e| {
+        match e {
+            EnrollEvent::Skipped(t, why) => println!(" ! {t}: skipped ({why})"),
+            other if !verbose => println!(" ✓ {other:?}"),
+            _ => {}
         }
-    }).await.map_err(|e| e.to_string())?;
+    }, if verbose { Some(Box::new(|cmd: &str| println!("  [enroll] $ {cmd}")) as Box<dyn FnMut(&str) + Send>) } else { None }).await.map_err(|e| e.to_string())?;
 
     for r in &results { v.set_keyslot(&p.uuid, &r.luks_uuid, r.keyslot).map_err(|e| e.to_string())?; }
     println!("enrolled {} target(s); keyslots recorded. Remember to 'save'.", results.len());
     Ok(())
 }
 
-async fn cmd_fetch(st: &mut State, name: &str, verbose: bool) -> Result<(), String> {
-    let v = st.vault.as_mut().ok_or("no vault open")?;
-    let p = resolve(v, name)?.clone();
+async fn handle_fetch(st: &mut State, parts: &[&str]) -> Result<(), String> {
+    let mut opts = Options::new();
+    opts.optflag("", "verbose", "show cryptsetup commands");
+    opts.optflag("h", "help", "show help");
+    let matches = opts.parse(&parts[1..]).map_err(|e| e.to_string())?;
+    
+    if matches.free.is_empty() { return Err("Usage: fetch <profile> [--verbose]".into()); }
+    let n = &matches.free[0];
+    let verbose = matches.opt_present("verbose") || st.verbose;
 
-    // OS host key must be pinned first
+    let v = st.vault.as_mut().ok_or("no vault open")?;
+    let p = resolve(v, n)?.clone();
+
     if p.os_host_key.is_none() {
         println!("No OS host key pinned. Fetching from {}:{} ...", p.host, p.port);
         let hk = fetch_host_key(&p.host, p.port, p.connect_timeout_s).await.map_err(|e| e.to_string())?;
@@ -137,7 +672,7 @@ async fn cmd_fetch(st: &mut State, name: &str, verbose: bool) -> Result<(), Stri
     };
     let access = BootedAccess { use_sudo: username != "root", username, auth, connect_timeout_s: p.connect_timeout_s };
 
-    let results = fetch_luks_info(v, &p.uuid, &access, None).await.map_err(|e| e.to_string())?;
+    let results = fetch_luks_info(v, &p.uuid, &access, None, if verbose { Some(Box::new(|cmd: &str| println!("  [fetch] $ {cmd}")) as Box<dyn FnMut(&str) + Send>) } else { None }).await.map_err(|e| e.to_string())?;
 
     if results.is_empty() {
         println!("No LUKS volumes found.");
@@ -162,660 +697,58 @@ async fn cmd_fetch(st: &mut State, name: &str, verbose: bool) -> Result<(), Stri
     if choice == "y" {
         for info in results {
             let mapped = format!("crypt{}", info.luks_uuid.split('-').next().unwrap_or("vol"));
-            let mapped_for_log = mapped.clone();
             let meta = TargetMeta {
                 luks_uuid: info.luks_uuid.clone(),
                 fallback_path: Some(info.device_path.clone()),
-                mapped_name: mapped,
+                mapped_name: mapped.clone(),
                 order: 0,
                 keyslot: None,
                 token_id: None,
             };
             v.add_target(&p.uuid, meta, None).map_err(|e| e.to_string())?;
-            if verbose {
-                println!("  [fetch] Added target: {} -> {}", info.luks_uuid, mapped_for_log);
-            } else {
-                println!("  added target for {}", info.luks_uuid);
-            }
+            println!("  added target {}", mapped);
         }
-        println!("Targets added. Remember to 'save'.");
+        println!("targets added. Remember to 'save'.");
     }
     Ok(())
 }
 
-fn require_args(parts: &[&str], min: usize, usage: &str) -> Result<(), String> {
-    if parts.len() < min {
-        return Err(format!("Usage: {}", usage));
-    }
+async fn handle_server_setup(st: &mut State, parts: &[&str]) -> Result<(), String> {
+    let mut opts = Options::new();
+    opts.optopt("o", "out", "output directory", "DIR");
+    opts.optflag("h", "help", "show help");
+    let matches = opts.parse(&parts[1..]).map_err(|e| e.to_string())?;
+    
+    if matches.free.is_empty() { return Err("Usage: server-setup <profile> [--out <dir>]".into()); }
+    let n = &matches.free[0];
+    let args: Vec<&str> = parts.iter().skip(2).map(|s| *s).collect();
+    cmd_server_setup(st, n, &args).await
+}
+
+fn handle_passwd(st: &mut State, parts: &[&str]) -> Result<(), String> {
+    let mut opts = Options::new();
+    opts.optflag("h", "help", "show help");
+    let _matches = opts.parse(&parts[1..]).map_err(|e| e.to_string())?;
+    
+    let v = st.vault.as_mut().ok_or("no vault open")?;
+    let p1 = pass("New passphrase: "); let p2 = pass("Repeat: ");
+    if p1.expose_secret() != p2.expose_secret() { return Err("passphrases differ".into()); }
+    v.change_passphrase(0, &p1, Argon2Params::default()).map_err(|e| e.to_string())?;
     Ok(())
 }
 
-async fn dispatch(st: &mut State, line: &str) -> Result<bool, String> {
-    let parts: Vec<&str> = line.split_whitespace().collect();
-    if parts.is_empty() {
-        return Ok(false);
-    }
-
-    match parts[0] {
-        "quit" | "exit" => {
-            require_args(&parts, 1, "quit")?;
-            if st.vault.as_ref().map(|v| v.is_dirty()).unwrap_or(false) {
-                if ask("Unsaved changes. Save? [Y/n]: ").to_lowercase() != "n" { save_atomic(st)?; }
-            }
-            return Ok(true);
-        }
-        "help" => {
-            require_args(&parts, 1, "help")?;
-            println!(r#"Commands:
-  create <file>                  Create new vault file, prompts passphrase twice
-  open <file>                    Open existing vault file
-  save                           Save changes to vault file (atomic write)
-  close                          Close current vault
-  status                         Show vault status (file, profile count, dirty flag)
-  ls                             List profiles: name, host, target count, hostkey status
-  show <profile>                 Show full profile details (public parts)
-  add                            Add new profile interactively (wizard)
-  rm <profile>                   Remove profile (requires confirmation)
-  edit <profile> [field=val...]  Edit scalar fields: name, host, port, user, notes,
-                                 connect_timeout, exec_timeout, resume
-  target add <profile>           Add target to profile interactively
-  target rm <profile> <uuid>     Remove target from profile
-  pubkey <profile>               Print Ed25519 public key (restricted authorized_keys line)
-  rotate-key <profile>           Generate new Ed25519 keypair for profile
-  hostkey fetch <profile> [--os] TOFU-fetch Dropbear/OS host key, confirm, store
-  probe <profile>|--all          State detection: Unreachable/WaitingInInitramfs/BootedOs/UnknownHostKey
-  unlock <profile>               Full push-unlock with live progress
-  enroll <profile> [--target <uuid|mapper>] [--verbose]
-                                 Enroll keyfiles into LUKS headers over booted OS
-  fetch <profile> [--verbose]    Discover LUKS volumes on booted OS, offer to add as targets
-  server-setup <profile> [--out <dir>]
-                                 Generate mkinitfs deployment artifacts for remote unlock
-  passwd                         Change master passphrase (re-derives, new salt)
-  backup <path>                  Create timestamped encrypted vault copy
-  import-profile                 Import profile from another vault
-  export-profile <profile> <dir> Export profile to directory
-  verbose [on|off|toggle]        Toggle verbose output for enroll/fetch/unlock/probe
-  quit | exit                    Exit (prompts to save if dirty)
-"#);
-        }
-        "verbose" => {
-            require_args(&parts, 1, "verbose [on|off|toggle]")?;
-            if parts.len() == 1 {
-                st.verbose = !st.verbose;
-            } else {
-                match parts[1] {
-                    "on" => st.verbose = true,
-                    "off" => st.verbose = false,
-                    "toggle" => st.verbose = !st.verbose,
-                    _ => return Err("Usage: verbose [on|off|toggle]".into()),
-                }
-            }
-            println!("Verbose: {}", if st.verbose { "on" } else { "off" });
-        }
-        "create" => {
-            require_args(&parts, 2, "create <file>")?;
-            let f = parts[1];
-            let p1 = pass("New passphrase: "); let p2 = pass("Repeat: ");
-            if p1.expose_secret() != p2.expose_secret() { return Err("passphrases differ".into()); }
-            st.vault = Some(Vault::create(&p1, Argon2Params::default()).map_err(|e| e.to_string())?);
-            st.path = Some(PathBuf::from(f));
-            save_atomic(st)?;
-        }
-        "open" => {
-            require_args(&parts, 2, "open <file>")?;
-            let f = parts[1];
-            let bytes = fs::read(f).map_err(|e| e.to_string())?;
-            let v = Vault::open(&bytes, &pass("Passphrase: ")).map_err(|e| e.to_string())?;
-            println!("opened: {} profiles", v.inventory.profiles.len());
-            st.vault = Some(v); st.path = Some(PathBuf::from(f));
-        }
-        "save" => { require_args(&parts, 1, "save")?; save_atomic(st)?; }
-        "close" => { require_args(&parts, 1, "close")?; st.vault = None; st.path = None; }
-        "status" => { require_args(&parts, 1, "status")?; match (&st.path, &st.vault) {
-            (Some(p), Some(v)) => println!("{} — {} profiles, dirty={}", p.display(), v.inventory.profiles.len(), v.is_dirty()),
-            _ => println!("no vault open"),
-        }}
-        "ls" => { require_args(&parts, 1, "ls")?; for p in &st.vault.as_ref().ok_or("no vault open")?.inventory.profiles {
-            println!("{:<16} {:<24} targets={} hostkey={}", p.name, format!("{}:{}", p.host, p.port),
-                     p.targets_meta.len(), if p.initramfs_host_key.is_some() { "pinned" } else { "MISSING" });
-        }}
-        "show" => {
-            require_args(&parts, 2, "show <profile>")?;
-            let n = parts[1];
-            let v = st.vault.as_ref().ok_or("no vault open")?; let p = resolve(v, n)?;
-            println!("name: {}\nhost: {}:{} user {}\nuuid: {}", p.name, p.host, p.port, p.username, uuid::Uuid::from_bytes(p.uuid));
-            if let Some(k) = &p.initramfs_host_key { println!("initramfs hostkey: {} {}", k.key_type, fingerprint_sha256(&k.key_bytes)); }
-            for t in &p.targets_meta { 
-                let fallback = t.fallback_path.as_deref().unwrap_or("none");
-                println!("  target {} UUID={} fallback={} slot={:?}", t.mapped_name, t.luks_uuid, fallback, t.keyslot); 
-            }
-            println!("pubkey: {}", v.export_public_key(p));
-        }
-        "add" => { require_args(&parts, 1, "add")?; cmd_add(st)?; }
-        "rm" => {
-            require_args(&parts, 2, "rm <profile>")?;
-            let n = parts[1];
-            let v = st.vault.as_mut().ok_or("no vault open")?;
-            let uuid = resolve(v, n)?.uuid;
-            if ask(&format!("Remove '{n}'? type YES: ")) == "YES" { v.remove_profile(&uuid).map_err(|e| e.to_string())?; }
-        }
-        "edit" => {
-            require_args(&parts, 2, "edit <profile> [field=value ...]")?;
-            let n = parts[1];
-            let rest = &parts[2..];
-            let v = st.vault.as_mut().ok_or("no vault open")?;
-            let uuid = resolve(v, n)?.uuid;
-            let mut p = v.profile(&uuid).map_err(|e| e.to_string())?.clone();
-            let mut changed = false;
-            for arg in rest {
-                if let Some((k, v)) = arg.split_once('=') {
-                    match k {
-                        "name" => { p.name = v.into(); changed = true; }
-                        "host" => { p.host = v.into(); changed = true; }
-                        "port" => { p.port = v.parse().map_err(|_| "bad port")?; changed = true; }
-                        "user" | "username" => { p.username = v.into(); changed = true; }
-                        "notes" => { p.notes = v.into(); changed = true; }
-                        "connect_timeout" => { p.connect_timeout_s = v.parse().map_err(|_| "bad timeout")?; changed = true; }
-                        "exec_timeout" => { p.exec_timeout_s = v.parse().map_err(|_| "bad timeout")?; changed = true; }
-                        "resume" => {
-                            if v == "poll" { p.resume = ResumePolicy::DeviceMapperPoll; }
-                            else { p.resume = ResumePolicy::Command(v.into()); }
-                            changed = true;
-                        }
-                        _ => return Err(format!("unknown field: {k}")),
-                    }
-                }
-            }
-            if changed { v.update_profile(&uuid, |p2| *p2 = p).map_err(|e| e.to_string())?; println!("profile updated"); } else { println!("no changes"); }
-        }
-        "target" => {
-            if parts.len() < 2 { return Err("Usage: target add|rm <profile> ...".into()); }
-            match parts[1] {
-                "add" => {
-                    require_args(&parts, 3, "target add <profile>")?;
-                    let n = parts[2];
-                    let v = st.vault.as_mut().ok_or("no vault open")?;
-                    let uuid = resolve(v, n)?.uuid;
-                    let luks_uuid = ask("LUKS UUID: "); if luks_uuid.is_empty() { return Err("uuid required".into()); }
-                    let fallback = ask("Fallback device path (optional): ");
-                    let mapped = ask_or("Mapper name", "cryptroot");
-                    let order: u8 = ask_or("Order", "0").parse().unwrap_or(0);
-                    let meta = TargetMeta { luks_uuid, fallback_path: if fallback.is_empty() { None } else { Some(fallback) },
-                                    mapped_name: mapped, order, keyslot: None, token_id: None };
-                    v.add_target(&uuid, meta, None).map_err(|e| e.to_string())?;
-                    println!("  target added, 64-byte keyfile generated.");
-                }
-                "rm" => {
-                    require_args(&parts, 4, "target rm <profile> <uuid>")?;
-                    let n = parts[2];
-                    let uuid_str = parts[3];
-                    let v = st.vault.as_mut().ok_or("no vault open")?;
-                    let uuid = resolve(v, n)?.uuid;
-                    v.remove_target(&uuid, uuid_str).map_err(|e| e.to_string())?;
-                    println!("target removed");
-                }
-                _ => return Err("Usage: target add|rm <profile> ...".into()),
-            }
-        }
-        "pubkey" => {
-            require_args(&parts, 2, "pubkey <profile>")?;
-            let n = parts[1];
-            let v = st.vault.as_ref().ok_or("no vault open")?; println!("{}", v.authorized_keys_line(resolve(v, n)?));
-        }
-        "hostkey" => {
-            if parts.len() < 3 || parts[1] != "fetch" { return Err("Usage: hostkey fetch <profile> [--os]".into()); }
-            require_args(&parts, 3, "hostkey fetch <profile> [--os]")?;
-            let n = parts[2];
-            let rest = &parts[3..];
-            let v = st.vault.as_mut().ok_or("no vault open")?;
-            let p = resolve(v, n)?.clone();
-            let hk = fetch_host_key(&p.host, p.port, p.connect_timeout_s).await.map_err(|e| e.to_string())?;
-            println!("{} {}", hk.key_type, fingerprint_sha256(&hk.key_bytes));
-            if ask("Pin this key? [y/N]: ").to_lowercase() == "y" {
-                v.set_host_key(&p.uuid, hk, rest.contains(&"--os")).map_err(|e| e.to_string())?;
-            }
-        }
-        "probe" => {
-            require_args(&parts, 2, "probe <profile>|--all [--verbose]")?;
-            let n = parts[1];
-            let mut verbose = st.verbose;
-            if parts.len() >= 3 && parts[2] == "--verbose" {
-                verbose = true;
-            }
-            let v = st.vault.as_ref().ok_or("no vault open")?;
-            let ps: Vec<Profile> = if n == "--all" { v.inventory.profiles.clone() } else { vec![resolve(v, n)?.clone()] };
-            for p in ps { 
-                let result = probe(&p).await;
-                if verbose {
-                    println!("{:<16} {:?}", p.name, result);
-                    println!("  Host: {}:{} | Initramfs key: {} | OS key: {}", 
-                        p.host, p.port, 
-                        if p.initramfs_host_key.is_some() { "pinned" } else { "not pinned" },
-                        if p.os_host_key.is_some() { "pinned" } else { "not pinned" });
-                } else {
-                    println!("{:<16} {:?}", p.name, result);
-                }
-            }
-        }
-        "unlock" => {
-            require_args(&parts, 2, "unlock <profile> [--verbose]")?;
-            let n = parts[1];
-            let mut verbose = st.verbose;
-            if parts.len() >= 3 && parts[2] == "--verbose" {
-                verbose = true;
-            }
-            let v = st.vault.as_ref().ok_or("no vault open")?;
-            let uuid = resolve(v, n)?.uuid;
-            unlock(v, &uuid, |e| {
-                if verbose {
-                    println!("  [unlock] {e:?}");
-                } else {
-                    println!(" ✓ {e:?}");
-                }
-            }).await.map_err(|e| e.to_string())?;
-        }
-        "enroll" => {
-            require_args(&parts, 2, "enroll <profile> [--target <uuid|mapper>] [--verbose]")?;
-            let n = parts[1];
-            let mut only = None;
-            let mut verbose = st.verbose;
-            let mut i = 2;
-            while i < parts.len() {
-                match parts[i] {
-                    "--target" => {
-                        if i + 1 >= parts.len() { return Err("--target requires a value".into()); }
-                        only = Some(parts[i + 1]);
-                        i += 2;
-                    }
-                    "--verbose" => {
-                        verbose = true;
-                        i += 1;
-                    }
-                    _ => i += 1,
-                }
-            }
-            cmd_enroll(st, n, only, verbose).await?
-        }
-        "fetch" => {
-            require_args(&parts, 2, "fetch <profile> [--verbose]")?;
-            let n = parts[1];
-            let mut verbose = st.verbose;
-            if parts.len() >= 3 && parts[2] == "--verbose" {
-                verbose = true;
-            }
-            cmd_fetch(st, n, verbose).await?
-        }
-        "server-setup" => {
-            require_args(&parts, 2, "server-setup <profile> [--out <dir>]")?;
-            let n = parts[1];
-            let rest = &parts[2..];
-            cmd_server_setup(st, n, rest).await?
-        }
-        "passwd" => {
-            require_args(&parts, 1, "passwd")?;
-            let v = st.vault.as_mut().ok_or("no vault open")?;
-            let p1 = pass("New passphrase: "); let p2 = pass("Repeat: ");
-            if p1.expose_secret() != p2.expose_secret() { return Err("passphrases differ".into()); }
-            v.change_passphrase(0, &p1, Argon2Params::default()).map_err(|e| e.to_string())?;
-        }
-        "backup" => {
-            require_args(&parts, 2, "backup <path>")?;
-            let path = parts[1];
-            let v = st.vault.as_mut().ok_or("no vault open")?;
-            let bytes = v.save().map_err(|e| e.to_string())?;
-            let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
-            let backup_path = format!("{}.{}.bak", path, ts);
-            fs::write(&backup_path, bytes).map_err(|e| e.to_string())?;
-            println!("backup saved to {}", backup_path);
-        }
-        "import-profile" => {
-            require_args(&parts, 1, "import-profile")?;
-            // TODO: implement
-            println!("import-profile: not yet implemented");
-        }
-        "export-profile" => {
-            require_args(&parts, 3, "export-profile <profile> <dir>")?;
-            // TODO: implement
-            println!("export-profile: not yet implemented");
-        }
-        "rotate-key" => {
-            require_args(&parts, 2, "rotate-key <profile>")?;
-            // TODO: implement
-            println!("rotate-key: not yet implemented");
-        }
-        _ => return Err(format!("unknown command: {}. Type 'help' for list.", parts[0])),
-    }
-    Ok(false)
-}
-
-async fn cmd_server_setup(st: &mut State, name: &str, args: &[&str]) -> Result<(), String> {
-    let v = st.vault.as_ref().ok_or("no vault open")?;
-    let p = resolve(v, name)?.clone();
-
-    // Check initramfs host key is pinned
-    if p.initramfs_host_key.is_none() {
-        return Err("initramfs host key not pinned. Run 'hostkey fetch <profile>' first.".into());
-    }
-
-    // Parse --out argument
-    let mut out_dir = format!("./ltv-deploy-{}", p.name);
-    let mut i = 0;
-    while i < args.len() {
-        if args[i] == "--out" {
-            if i + 1 >= args.len() { return Err("--out requires a directory".into()); }
-            out_dir = args[i + 1].to_string();
-            i += 2;
-        } else {
-            i += 1;
-        }
-    }
-
-    let out_path = Path::new(&out_dir);
-    fs::create_dir_all(out_path).map_err(|e| format!("create dir: {e}"))?;
-
-    // Get mapper names from targets (ordered by order field)
-    let mut targets: Vec<_> = p.targets_meta.clone();
-    targets.sort_by_key(|t| t.order);
-    let mappers: Vec<String> = targets.iter().map(|t| t.mapped_name.clone()).collect();
-    let mappers_csv = mappers.join(",");
-
-    // Get initramfs host key fingerprint for display
-    let hk = p.initramfs_host_key.as_ref().unwrap();
-    let hk_fp = fingerprint_sha256(&hk.key_bytes);
-
-    // 1. Generate ltv.files
-    let ltv_files = r#"/usr/sbin/dropbear
-/etc/dropbear/dropbear_ed25519_host_key
-/usr/share/mkinitfs/ltv-hook.sh
-"#;
-    fs::write(out_path.join("ltv.files"), ltv_files).map_err(|e| format!("write ltv.files: {e}"))?;
-
-    // 1b. Generate ltv-ssh.keys.files for authorized_keys overlay
-    let ltv_ssh_keys_files = r#"/root/.ssh/authorized_keys
-"#;
-    fs::create_dir_all(out_path.join("etc/mkinitfs/features.d"))
-        .map_err(|e| format!("create dir: {e}"))?;
-    fs::write(out_path.join("etc/mkinitfs/features.d/ltv-ssh.keys.files"), ltv_ssh_keys_files)
-        .map_err(|e| format!("write ltv-ssh.keys.files: {e}"))?;
-
-    // 2. Generate ltv.modules (empty - depends on cryptsetup feature for modules)
-    let ltv_modules = r#"# ltv feature depends on cryptsetup feature for kernel modules
-# No additional modules needed
-"#;
-    fs::write(out_path.join("ltv.modules"), ltv_modules).map_err(|e| format!("write ltv.modules: {e}"))?;
-
-    // 3. Generate ltv.packages
-    let ltv_packages = r#"dropbear
-"#;
-    fs::write(out_path.join("ltv.packages"), ltv_packages).map_err(|e| format!("write ltv.packages: {e}"))?;
-
-    // 4. Generate ltv-hook.sh (installed to /usr/share/mkinitfs/)
-    let ltv_hook = format!(r#"#!/bin/sh
-# ltv-hook: Start dropbear and wait for LTV mappers
-# Called from patched initramfs init
-# Kernel cmdline: ltv_mappers={}
-
-set -e
-
-MAPPERS="{}"
-TIMEOUT=300
-ELAPSED=0
-
-mkdir -p /run/ltv
-
-# Ensure dropbear host keys exist (should be pre-installed by feature)
-for keytype in ed25519 ecdsa rsa; do
-    keyfile="/etc/dropbear/dropbear_${{keytype}}_host_key"
-    [ -f "$keyfile" ] || dropbearkey -t "$keytype" -f "$keyfile" >/dev/null 2>&1
-done
-
-# Start dropbear on port 22
-# -R: don't daemonize (we background manually)
-# -s: disable password auth
-# -j: disable local port forwarding
-# -k: disable keepalive
-# -p: port
-# -r: host key file
-dropbear -R -s -j -k -p 22 -r /etc/dropbear/dropbear_ed25519_host_key &
-DROPBEAR_PID=$!
-
-echo "ltv-hook: dropbear started (pid $DROPBEAR_PID), waiting for mappers: $MAPPERS"
-
-# Wait for mappers or resume signal
-while [ $ELAPSED -lt $TIMEOUT ]; do
-    ready=1
-    for m in $MAPPERS; do
-        [ -e "/dev/mapper/$m" ] || ready=0
-    done
-    [ $ready -eq 1 ] && break
-    [ -e /run/ltv/resume ] && break
-    sleep 1
-    ELAPSED=$((ELAPSED + 1))
-done
-
-if [ $ELAPSED -ge $TIMEOUT ]; then
-    echo "ltv-hook: TIMEOUT after ${{TIMEOUT}}s waiting for mappers"
-    kill $DROPBEAR_PID 2>/dev/null
-    wait $DROPBEAR_PID 2>/dev/null
-    exit 1
-fi
-
-echo "ltv-hook: all mappers ready or resume signal received"
-kill $DROPBEAR_PID 2>/dev/null
-wait $DROPBEAR_PID 2>/dev/null
-
-exit 0
-"#, mappers_csv, mappers_csv);
-
-    // Create usr/share/mkinitfs directory
-    fs::create_dir_all(out_path.join("usr/share/mkinitfs"))
-        .map_err(|e| format!("create dir: {e}"))?;
-    fs::write(out_path.join("usr/share/mkinitfs/ltv-hook.sh"), ltv_hook)
-        .map_err(|e| format!("write ltv-hook.sh: {e}"))?;
-
-    // 5. Generate init script patch (sed script to insert hook call) - uses markers for idempotent patching
-    let init_patch = r#"#!/bin/sh
-# initramfs-init.patch - patches /usr/share/mkinitfs/initramfs-init to call ltv-hook
-# This is applied by deploy.sh before running mkinitfs
-# Uses markers to allow idempotent re-patching
-# Backup is created BEFORE any patching, from clean original
-
-set -e
-
-INIT_SCRIPT="/usr/share/mkinitfs/initramfs-init"
-BACKUP_SCRIPT="/usr/share/mkinitfs/initramfs-init.ltv-backup"
-
-if [ ! -f "$INIT_SCRIPT" ]; then
-    echo "ERROR: $INIT_SCRIPT not found"
-    exit 1
-fi
-
-# Create backup BEFORE any patching (only on first run)
-# Must do this BEFORE the sed insert below
-if [ ! -f "$BACKUP_SCRIPT" ]; then
-    cp "$INIT_SCRIPT" "$BACKUP_SCRIPT"
-    echo "Created clean backup: $BACKUP_SCRIPT"
-fi
-
-# ALWAYS restore from clean backup first
-cp "$BACKUP_SCRIPT" "$INIT_SCRIPT"
-
-# Insert new patch after "run nlplug-findfs before SINGLEMODE" with markers
-sed -i '/run nlplug-findfs before SINGLEMODE/a\
-\
-### LTV PATCH START ###\
-# LTV hook - start dropbear for remote unlock\
-if [ -n "$KOPT_ltv_mappers" ]; then\
-    export LTV_MAPPERS="$KOPT_ltv_mappers"\
-    /usr/share/mkinitfs/ltv-hook.sh\
-fi\
-### LTV PATCH END ###' "$INIT_SCRIPT"
-
-echo "Patched $INIT_SCRIPT to call ltv-hook"
-"#;
-    fs::write(out_path.join("usr/share/mkinitfs/initramfs-init.patch"), init_patch)
-        .map_err(|e| format!("write initramfs-init.patch: {e}"))?;
-
-    // 6. Note: dropbear host key will be generated on target by deploy.sh
-    // (generating proper Dropbear key format requires dropbearkey binary)
-    fs::create_dir_all(out_path.join("etc/dropbear")).map_err(|e| format!("create dir: {e}"))?;
-    fs::write(out_path.join("etc/dropbear/README.txt"), 
-        "Run on target: dropbearkey -t ed25519 -f /etc/dropbear/dropbear_ed25519_host_key\n")
-        .map_err(|e| format!("write README.txt: {e}"))?;
-
-    // 7. Generate authorized_keys for initramfs
-    let authorized_keys = v.authorized_keys_line(&p);
-    fs::write(out_path.join("authorized_keys"), authorized_keys)
-        .map_err(|e| format!("write authorized_keys: {e}"))?;
-
-    // 8. Generate cmdline.txt (no init= wrapper needed - hook is in init script)
-    let cmdline = format!("ltv_mappers={}", mappers_csv);
-    fs::write(out_path.join("cmdline.txt"), &cmdline)
-        .map_err(|e| format!("write cmdline.txt: {e}"))?;
-
-    // 9. Generate deploy.sh
-    let deploy_sh = format!(r#"#!/bin/sh
-# deploy.sh - Run as root on target Alpine server
-# Generated by ltv-admin server-setup for profile: {}
-# Run from the directory containing this script
-set -e
-
-echo "Installing LTV mkinitfs feature..."
-
-# 1. Install feature files (ltv.files, ltv.modules, ltv.packages are in the same dir as this script)
-cp ltv.files ltv.modules ltv.packages /etc/mkinitfs/features.d/
-cp etc/mkinitfs/features.d/ltv-ssh.keys.files /etc/mkinitfs/features.d/
-cp usr/share/mkinitfs/ltv-hook.sh /usr/share/mkinitfs/ltv-hook.sh
-chmod 755 /usr/share/mkinitfs/ltv-hook.sh
-
-# 2. Patch initramfs init script to call ltv-hook
-sh usr/share/mkinitfs/initramfs-init.patch
-
-# 3. Generate dropbear host key (run on target)
-dropbearkey -t ed25519 -f /etc/dropbear/dropbear_ed25519_host_key
-
-# 4. Install authorized_keys for initramfs (via feature overlay)
-mkdir -p /etc/mkinitfs/features.d/ltv-ssh.keys/root/.ssh
-cp authorized_keys /etc/mkinitfs/features.d/ltv-ssh.keys/root/.ssh/authorized_keys
-chmod 600 /etc/mkinitfs/features.d/ltv-ssh.keys/root/.ssh/authorized_keys
-
-# 5. Regenerate initramfs
-KERNEL=$(uname -r)
-echo "Regenerating initramfs for kernel $KERNEL..."
-mkinitfs -F "base ltv ltv-ssh.keys cryptsetup network" -k "$KERNEL" -o "/boot/initramfs-ltv-$KERNEL" "$KERNEL"
-
-# 6. Update bootloader
-echo ""
-echo "=== NEXT STEPS ==="
-echo "1. Update your bootloader to use the new initramfs:"
-echo "   /boot/initramfs-ltv-$KERNEL"
-echo "2. Add kernel cmdline parameters:"
-echo "   {}"
-echo "3. For syslinux: edit /etc/syslinux.conf"
-echo "   For GRUB: edit /etc/default/grub then run grub-mkconfig"
-echo "4. Reboot to test"
-"#, p.name, &cmdline);
-
-    fs::write(out_path.join("deploy.sh"), deploy_sh)
-        .map_err(|e| format!("write deploy.sh: {e}"))?;
-
-    // 10. Generate README.md
-    let readme = format!(r#"# LTV Deployment for {}
-
-## Generated Files
-
-- `ltv.files` - mkinitfs feature file list (installed to `/etc/mkinitfs/features.d/`)
-- `ltv.modules` - kernel modules needed (empty, uses cryptsetup feature)
-- `ltv.packages` - APK packages to install (dropbear)
-- `ltv-hook.sh` - initramfs hook (starts dropbear, waits for mappers, installed to `/usr/share/mkinitfs/`)
-- `initramfs-init.patch` - sed script to patch `/usr/share/mkinitfs/initramfs-init`
-- `etc/dropbear/README.txt` - Instructions to generate Dropbear host key on target
-- `authorized_keys` - Client public key for initramfs SSH (restricted)
-- `cmdline.txt` - Kernel cmdline to add (`ltv_mappers=...`)
-- `deploy.sh` - Run this on the target Alpine server
-
-## Initramfs Host Key
-
-**Fingerprint (SHA256): {}**
-
-This key is pinned in the vault profile. Verify it matches on first connection.
-**Note**: The actual host key is generated on the target by `deploy.sh` using `dropbearkey`.
-
-## Target Mappers
-
-{}
-(Order matches target `order` field in profile)
-
-## Deployment
-
-```bash
-# On target Alpine server (as root):
-cd /path/to/this/directory
-./deploy.sh
-reboot
-```
-
-## Manual Deployment (if deploy.sh fails)
-
-```bash
-# 1. Copy feature files
-cp ltv.files ltv.modules ltv.packages /etc/mkinitfs/features.d/
-cp ltv-hook.sh /usr/share/mkinitfs/ltv-hook.sh
-chmod 755 /usr/share/mkinitfs/ltv-hook.sh
-
-# 2. Patch initramfs init script to call ltv-hook
-sh initramfs-init.patch
-
-# 3. Generate dropbear host key (on target)
-dropbearkey -t ed25519 -f /etc/dropbear/dropbear_ed25519_host_key
-
-# 4. Create authorized_keys overlay for initramfs
-mkdir -p /etc/mkinitfs/features.d/ltv-ssh.keys/root/.ssh
-cp authorized_keys /etc/mkinitfs/features.d/ltv-ssh.keys/root/.ssh/authorized_keys
-chmod 600 /etc/mkinitfs/features.d/ltv-ssh.keys/root/.ssh/authorized_keys
-
-# 5. Regenerate initramfs
-mkinitfs -F "base ltv cryptsetup network" -k $(uname -r) -o /boot/initramfs-ltv-$(uname -r) $(uname -r)
-
-# 6. Update bootloader with kernel cmdline from cmdline.txt:
-#    ltv_mappers={}
-```
-"#, p.name, hk_fp, mappers.join("\n"), mappers_csv);
-
-    fs::write(out_path.join("README.md"), readme)
-        .map_err(|e| format!("write README.md: {e}"))?;
-
-    println!("Generated deployment in: {}", out_path.display());
-    println!("");
-    println!("Initramfs host key fingerprint: {}", hk_fp);
-    println!("Target mappers: {}", mappers_csv);
-    println!("");
-    println!("Next steps:");
-    println!("  1. Copy {} to target server", out_dir);
-    println!("  2. On target (as root): cd {} && ./deploy.sh", out_dir);
-    println!("  3. Update bootloader with cmdline from cmdline.txt");
-    println!("  4. Reboot");
-
+fn handle_backup(st: &mut State, parts: &[&str]) -> Result<(), String> {
+    let mut opts = Options::new();
+    opts.optflag("h", "help", "show help");
+    let matches = opts.parse(&parts[1..]).map_err(|e| e.to_string())?;
+    
+    if matches.free.is_empty() { return Err("Usage: backup <path>".into()); }
+    let path = &matches.free[0];
+    let v = st.vault.as_mut().ok_or("no vault open")?;
+    let bytes = v.save().map_err(|e| e.to_string())?;
+    let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    let backup_path = format!("{}.{}.bak", path, ts);
+    fs::write(&backup_path, bytes).map_err(|e| e.to_string())?;
+    println!("backup saved to {}", backup_path);
     Ok(())
-}
-
-#[tokio::main]
-async fn main() {
-    let mut rl = DefaultEditor::new().expect("readline");
-    let mut st = State { path: None, vault: None, verbose: false };
-    loop {
-        let prompt = match &st.path { Some(p) => format!("ltv-admin({})> ", p.file_stem().unwrap().to_string_lossy()), None => "ltv-admin> ".into() };
-        match rl.readline(&prompt) {
-            Ok(line) => {
-                let _ = rl.add_history_entry(line.as_str());
-                match dispatch(&mut st, &line).await {
-                    Ok(true) => break,
-                    Ok(false) => {}
-                    Err(e) => eprintln!("error: {e}"),
-                }
-            }
-            Err(ReadlineError::Interrupted) | Err(ReadlineError::Eof) => break,
-            Err(e) => { eprintln!("{e}"); break; }
-        }
-    }
 }

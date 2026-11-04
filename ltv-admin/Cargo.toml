@@ -14,3 +14,4 @@ russh-keys.workspace = true
 ed25519-dalek.workspace = true
 base64.workspace = true
 rand.workspace = true
+getopts = "0.2"
