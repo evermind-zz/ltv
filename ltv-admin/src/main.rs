@@ -93,13 +93,14 @@ async fn cmd_server_setup(st: &mut State, name: &str, args: &[&str]) -> Result<(
     }
 
     // 1a. feature file list (installed to /etc/mkinitfs/features.d/ltv.files)
-    let files = "ltv-hook.sh\nltv-common.sh\n";
+    // Full paths for mkinitfs feature files
+    let files = "/usr/share/mkinitfs/ltv-hook.sh\n/usr/share/mkinitfs/ltv-common.sh\n/usr/sbin/dropbear\n";
     fs::write(deploy_dir.join("ltv.files"), files).map_err(|e| e.to_string())?;
 
     // 1b. kernel modules (empty - uses cryptsetup feature)
     fs::write(deploy_dir.join("ltv.modules"), "").map_err(|e| e.to_string())?;
 
-    // 1c. APK packages needed
+    // 1c. APK packages needed - mkinitfs uses this to know what packages to install
     let packages = "dropbear\n";
     fs::write(deploy_dir.join("ltv.packages"), packages).map_err(|e| e.to_string())?;
 
@@ -161,7 +162,7 @@ fi
     fs::write(deploy_dir.join("authorized_keys"), auth_keys).map_err(|e| e.to_string())?;
 
     // 6. deploy.sh - run on target server
-    let deploy_sh = format!(r###"#!/bin/sh
+    let deploy_sh = r###"#!/bin/sh
 # deploy.sh: Run on target Alpine server to install LTV
 # Usage: sudo sh deploy.sh
 
@@ -169,14 +170,20 @@ set -e
 
 echo "Installing mkinitfs feature files..."
 cp ltv.files ltv.modules ltv.packages /etc/mkinitfs/features.d/
+
+echo "Installing hook and common lib to /usr/share/mkinitfs/"
 cp ltv-hook.sh /usr/share/mkinitfs/ltv-hook.sh
 chmod 755 /usr/share/mkinitfs/ltv-hook.sh
 cp ltv-common.sh /usr/share/mkinitfs/ltv-common.sh
+
+echo "Installing /usr/sbin/dropbear (ensures binary in initramfs)"
+# /usr/sbin/dropbear is listed in ltv.files, mkinitfs will copy it
 
 echo "Patching initramfs init script..."
 sh initramfs-init.patch
 
 echo "Generating Dropbear Ed25519 host key..."
+mkdir -p /etc/dropbear
 dropbearkey -t ed25519 -f /etc/dropbear/dropbear_ed25519_host_key
 
 echo "Creating authorized_keys overlay for initramfs..."
@@ -191,7 +198,7 @@ mkinitfs -F "base ltv cryptsetup network" -k "$KERNEL" \
 
 echo "Done! Update bootloader with kernel cmdline from cmdline.txt"
 echo "Then reboot."
-"###);
+"###;
     fs::write(deploy_dir.join("deploy.sh"), deploy_sh).map_err(|e| e.to_string())?;
     // Make deploy.sh executable
     use std::os::unix::fs::PermissionsExt;

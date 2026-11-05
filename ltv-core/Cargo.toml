@@ -9,6 +9,7 @@ write = []          # vault mutation; disable for mobile build
 
 [dependencies]
 serde.workspace = true
+serde_json.workspace = true
 postcard.workspace = true
 zeroize.workspace = true
 secrecy.workspace = true

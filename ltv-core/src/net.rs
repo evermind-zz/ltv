@@ -156,8 +156,8 @@ pub async fn fetch_luks_info(
     let sudo = if access.use_sudo && access.username != "root" { "sudo -n " } else { "" };
     let t = Duration::from_secs(p.exec_timeout_s.max(30) as u64);
 
-    // Find all LUKS devices via blkid
-    let cmd = format!("{sudo}blkid -t TYPE=crypto_LUKS -o export");
+    // Find all LUKS devices via lsblk (works on Alpine with util-linux)
+    let cmd = format!("{sudo}lsblk -J -o NAME,UUID,TYPE,FSTYPE,MOUNTPOINT");
     if let Some(v) = verbose.as_mut() { v(&cmd); }
     let r = exec(&mut s, &cmd, None, t).await?;
     if r.code != 0 {
@@ -165,45 +165,71 @@ pub async fn fetch_luks_info(
         return Err(UnlockError::CryptsetupFailed { target: "discovery".into(), code: r.code, stderr: r.stderr });
     }
 
-    let mut results = Vec::new();
-    let mut current_uuid = String::new();
-    let mut current_dev = String::new();
+    // Parse JSON output
+    use serde_json::Value;
+    let json: Value = match serde_json::from_str(&r.stdout) {
+        Ok(v) => v,
+        Err(e) => {
+            if let Some(v) = verbose.as_mut() { v(&format!("  [fetch] JSON parse error: {}", e)); }
+            return Err(UnlockError::CryptsetupFailed { target: "discovery".into(), code: 1, stderr: format!("JSON parse: {}", e) });
+        }
+    };
 
-    for line in r.stdout.lines() {
-        let line = line.trim();
-        if line.starts_with("DEVNAME=") {
-            current_dev = line["DEVNAME=".len()..].to_string();
-        } else if line.starts_with("UUID=") && current_uuid.is_empty() {
-            current_uuid = line["UUID=".len()..].to_string();
-        } else if line.is_empty() && !current_uuid.is_empty() && !current_dev.is_empty() {
-            // Got a complete device entry, now get details
-            let _filter = only_mapped; // reserved for future filtering by mapper name
-            let cmd = format!("{sudo}cryptsetup luksDump UUID={}", current_uuid);
-            if let Some(v) = verbose.as_mut() { v(&cmd); }
-            let dump = exec(&mut s, &cmd, None, t).await?;
-            if dump.code != 0 {
-                if let Some(v) = verbose.as_mut() { v(&format!("  [fetch] ! exit={} stderr: {}", dump.code, dump.stderr.trim())); }
-            } else {
-                // Parse cipher, key_size, version from luksDump
-                let mut cipher = String::new();
-                let mut key_size = 0;
-                let mut version = String::new();
-                for dl in dump.stdout.lines() {
-                    let dl = dl.trim();
-                    if dl.starts_with("Cipher name:") { cipher = dl["Cipher name:".len()..].trim().to_string(); }
-                    else if dl.starts_with("Key size:") { key_size = dl["Key size:".len()..].trim().parse().unwrap_or(0); }
-                    else if dl.starts_with("Version:") { version = dl["Version:".len()..].trim().to_string(); }
+    fn find_luks_devices(dev: &Value, results: &mut Vec<(String, String)>) {
+        if let Some(fstype) = dev.get("fstype").and_then(|v| v.as_str()) {
+            if fstype == "crypto_LUKS" {
+                if let (Some(uuid), Some(name)) = (
+                    dev.get("uuid").and_then(|v| v.as_str()),
+                    dev.get("name").and_then(|v| v.as_str()),
+                ) {
+                    if !uuid.is_empty() && !name.is_empty() {
+                        results.push((uuid.to_string(), name.to_string()));
+                    }
                 }
-                results.push(FetchedLuksInfo {
-                    luks_uuid: current_uuid.clone(),
-                    device_path: current_dev.clone(),
-                    cipher,
-                    key_size,
-                    header_version: version,
-                });
             }
-            current_uuid.clear();
-            current_dev.clear();
+        }
+        if let Some(children) = dev.get("children").and_then(|v| v.as_array()) {
+            for child in children {
+                find_luks_devices(child, results);
+            }
+        }
+    }
+
+    let mut luks_devices = Vec::new();
+    if let Some(blockdevices) = json.get("blockdevices").and_then(|v| v.as_array()) {
+        for dev in blockdevices {
+            find_luks_devices(dev, &mut luks_devices);
+        }
+    }
+
+    let mut results = Vec::new();
+    for (uuid, name) in luks_devices {
+        let dev_path = format!("/dev/{}", name);
+
+        // Get LUKS details
+        let cmd = format!("{sudo}cryptsetup luksDump UUID={}", uuid);
+        if let Some(v) = verbose.as_mut() { v(&cmd); }
+        let dump = exec(&mut s, &cmd, None, t).await?;
+        if dump.code != 0 {
+            if let Some(v) = verbose.as_mut() { v(&format!("  [fetch] ! exit={} stderr: {}", dump.code, dump.stderr.trim())); }
+        } else {
+            let mut cipher = String::new();
+            let mut key_size = 0;
+            let mut version = String::new();
+            for dl in dump.stdout.lines() {
+                let dl = dl.trim();
+                if dl.starts_with("cipher:") { cipher = dl["cipher:".len()..].trim().to_string(); }
+                else if dl.starts_with("Cipher:") { cipher = dl["Cipher:".len()..].trim().to_string(); }
+                else if dl.starts_with("Key:") { key_size = dl["Key:".len()..].trim().split_whitespace().next().unwrap_or("0").to_string().parse().unwrap_or(0); }
+                else if dl.starts_with("Version:") { version = dl["Version:".len()..].trim().to_string(); }
+            }
+            results.push(FetchedLuksInfo {
+                luks_uuid: uuid.to_string(),
+                device_path: dev_path,
+                cipher,
+                key_size,
+                header_version: version,
+            });
         }
     }
 
