@@ -269,7 +269,8 @@ pub async fn unlock(
             .ok_or(VaultError::Invariant("missing keyfile"))?;
 
         // Stage keyfile in tmpfs (binary safe, avoids stdin newline truncation)
-        let cmd = format!("sudo sh -c 'umask 077 && cat > /run/ltv/key'");
+        // Running as root in initramfs, no sudo needed. Create /run/ltv dir first.
+        let cmd = format!("sh -c 'mkdir -p /run/ltv && umask 077 && cat > /run/ltv/key'");
         if let Some(v) = verbose.as_mut() { v(&cmd); }
         let r = exec(&mut session, &cmd, Some(&key.keyfile), t).await?;
         if r.code != 0 {
@@ -299,7 +300,7 @@ pub async fn unlock(
         }
 
         // Cleanup keyfile
-        let cmd = format!("sudo rm -f /run/ltv/key");
+        let cmd = format!("rm -f /run/ltv/key");
         if let Some(v) = verbose.as_mut() { v(&cmd); }
         let _ = exec(&mut session, &cmd, None, t).await;
     }

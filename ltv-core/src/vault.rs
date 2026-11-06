@@ -205,7 +205,8 @@ impl Vault {
     }
 
     pub fn authorized_keys_line(&self, p: &Profile) -> String {
-        format!("no-port-forwarding,no-agent-forwarding,no-X11-forwarding,no-pty {}", self.export_public_key(p))
+        // Client pubkey only (no forced commands) - current unlock uses full shell
+        self.export_public_key(p)
     }
 }
 

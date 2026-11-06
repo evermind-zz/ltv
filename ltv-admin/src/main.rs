@@ -1,9 +1,12 @@
 use std::{fs, path::PathBuf};
-use ltv_core::{format::Argon2Params, model::{Profile, TargetMeta, ResumePolicy, BootedAccess, BootedAuth, fingerprint_sha256}, net::{fetch_host_key, fetch_luks_info, probe, unlock}, vault::Vault, enroll::EnrollEvent};
+use ltv_core::{format::Argon2Params, model::{Profile, TargetMeta, ResumePolicy, BootedAccess, BootedAuth, fingerprint_sha256, HostKey}, net::{fetch_host_key, fetch_luks_info, probe, unlock}, vault::Vault, enroll::EnrollEvent, scripts::{render_cmdline, render_deploy_sh, render_deploy_nopatch_sh, LTV_FILES, LTV_MODULES, LTV_PACKAGES, LTV_HOOK, LTV_COMMON, INITRAMFS_PATCH}};
 use std::path::Path;
 use rustyline::{error::ReadlineError, DefaultEditor};
 use secrecy::{ExposeSecret, SecretString, SecretVec};
 use getopts::Options;
+use ed25519_dalek::SigningKey;
+use rand::rngs::OsRng;
+use base64::Engine;
 
 struct State { 
     path: Option<PathBuf>, 
@@ -68,148 +71,79 @@ async fn cmd_server_setup(st: &mut State, name: &str, args: &[&str]) -> Result<(
     let matches = opts.parse(args).map_err(|e| e.to_string())?;
     let out_dir = matches.opt_str("o").unwrap_or_else(|| format!("./ltv-deploy-{}", name));
 
-    let v = st.vault.as_ref().ok_or("no vault open")?;
-    let p = resolve(v, name)?.clone();
+    let v = st.vault.as_mut().ok_or("no vault open")?;
+    let p = resolve(&v, name)?.clone();
 
+    // Generate Dropbear host keypair locally (ed25519)
+    let mut csprng = OsRng;
+    let signing_key = SigningKey::generate(&mut csprng);
+    let verifying_key = signing_key.verifying_key();
+    let host_key_private = signing_key.to_bytes();
+    let host_key_public = verifying_key.to_bytes();
+
+    // Pin the initramfs host key in the vault (if not already pinned)
     if p.initramfs_host_key.is_none() {
-        return Err("initramfs host key not pinned. Run 'hostkey fetch <profile>' first.".into());
+        v.set_host_key(&p.uuid, HostKey {
+            key_type: "ssh-ed25519".into(),
+            key_bytes: host_key_public.to_vec(),
+        }, false).map_err(|e| e.to_string())?;
+        // Save vault immediately so the pinned key persists
+        if let Some(path) = &st.path {
+            let bytes = v.save().map_err(|e| e.to_string())?;
+            fs::write(path, bytes).map_err(|e| e.to_string())?;
+        }
     }
 
     // Generate deployment artifacts
     let deploy_dir = Path::new(&out_dir);
     fs::create_dir_all(deploy_dir).map_err(|e| e.to_string())?;
 
-    // Build kernel cmdline snippet
-    let mut cmdline = String::from("ltv_mappers=");
-    let mut first = true;
-    for tm in &p.targets_meta {
-        if !first { cmdline.push(','); }
-        cmdline.push_str(&tm.mapped_name);
-        first = false;
-    }
-    cmdline.push('\n');
-    for tm in &p.targets_meta {
-        cmdline.push_str(&format!("ltv_{}={}\n", tm.mapped_name, tm.luks_uuid));
-    }
+    // 1. mkinitfs feature files (from embedded scripts)
+    fs::write(deploy_dir.join("ltv.files"), LTV_FILES).map_err(|e| e.to_string())?;
+    fs::write(deploy_dir.join("ltv.modules"), LTV_MODULES).map_err(|e| e.to_string())?;
+    fs::write(deploy_dir.join("ltv.packages"), LTV_PACKAGES).map_err(|e| e.to_string())?;
 
-    // 1a. feature file list (installed to /etc/mkinitfs/features.d/ltv.files)
-    // Full paths for mkinitfs feature files
-    let files = "/usr/share/mkinitfs/ltv-hook.sh\n/usr/share/mkinitfs/ltv-common.sh\n/usr/sbin/dropbear\n";
-    fs::write(deploy_dir.join("ltv.files"), files).map_err(|e| e.to_string())?;
+    // 2. hook & common lib
+    fs::write(deploy_dir.join("ltv-hook.sh"), LTV_HOOK).map_err(|e| e.to_string())?;
+    fs::write(deploy_dir.join("ltv-common.sh"), LTV_COMMON).map_err(|e| e.to_string())?;
 
-    // 1b. kernel modules (empty - uses cryptsetup feature)
-    fs::write(deploy_dir.join("ltv.modules"), "").map_err(|e| e.to_string())?;
+    // 3. initramfs init patch
+    fs::write(deploy_dir.join("initramfs-init.patch"), INITRAMFS_PATCH).map_err(|e| e.to_string())?;
 
-    // 1c. APK packages needed - mkinitfs uses this to know what packages to install
-    let packages = "dropbear\n";
-    fs::write(deploy_dir.join("ltv.packages"), packages).map_err(|e| e.to_string())?;
-
-    // 2. hook script
-    let hook = r#"#!/bin/sh
-# ltv-hook: push-to-stdin LUKS unlock via Dropbear
-# Runs after configure_ip, before nlplug-findfs
-
-. /lib/mkinitfs/ltv-common.sh
-
-ltv_unlock() {
-    local dev="$1" name="$2"
-    cryptsetup open --key-file=- "UUID=${dev}" "${name}" || return 1
-}
-
-# Read mapper specs from kernel cmdline: ltv_mappers=cryptroot,cryptdata
-mappers=$(getarg ltv_mappers=)
-if [ -n "$mappers" ]; then
-    OIFS=$IFS; IFS=,
-    for m in $mappers; do
-        IFS=$OIFS
-        dev=$(getarg "ltv_${m}=")
-        [ -n "$dev" ] && ltv_unlock "$dev" "$m"
-    done
-fi
-"#;
-    fs::write(deploy_dir.join("ltv-hook.sh"), hook).map_err(|e| e.to_string())?;
-
-    // 3. common lib
-    let common = r#"#!/bin/sh
-# ltv-common: shared functions for ltv hooks
-
-getarg() {
-    local name="$1" value
-    for x in $(cat /proc/cmdline); do
-        case $x in
-            ${name}=*) value=${x#*=} ;;
-        esac
-    done
-    echo "$value"
-}
-"#;
-    fs::write(deploy_dir.join("ltv-common.sh"), common).map_err(|e| e.to_string())?;
-
-    // 4. initramfs init patch (sed script)
-    let patch = r###"#!/bin/sh
-# initramfs-init.patch: sed script to insert ltv-hook call
-# Run with: sh initramfs-init.patch
-
-INIT=/usr/share/mkinitfs/initramfs-init
-if ! grep -q "ltv-hook" "$INIT"; then
-    sed -i '/^configure_ip/a ### LTV PATCH START ###\n. /lib/mkinitfs/ltv-hook.sh\n### LTV PATCH END ###' "$INIT"
-fi
-"###;
-    fs::write(deploy_dir.join("initramfs-init.patch"), patch).map_err(|e| e.to_string())?;
-
-    // 5. authorized_keys for initramfs (restricted client pubkey)
+    // 4. authorized_keys (runtime generated from vault)
     let auth_keys = v.authorized_keys_line(&p);
     fs::write(deploy_dir.join("authorized_keys"), auth_keys).map_err(|e| e.to_string())?;
 
-    // 6. deploy.sh - run on target server
-    let deploy_sh = r###"#!/bin/sh
-# deploy.sh: Run on target Alpine server to install LTV
-# Usage: sudo sh deploy.sh
-
-set -e
-
-echo "Installing mkinitfs feature files..."
-cp ltv.files ltv.modules ltv.packages /etc/mkinitfs/features.d/
-
-echo "Installing hook and common lib to /usr/share/mkinitfs/"
-cp ltv-hook.sh /usr/share/mkinitfs/ltv-hook.sh
-chmod 755 /usr/share/mkinitfs/ltv-hook.sh
-cp ltv-common.sh /usr/share/mkinitfs/ltv-common.sh
-
-echo "Installing /usr/sbin/dropbear (ensures binary in initramfs)"
-# /usr/sbin/dropbear is listed in ltv.files, mkinitfs will copy it
-
-echo "Patching initramfs init script..."
-sh initramfs-init.patch
-
-echo "Generating Dropbear Ed25519 host key..."
-mkdir -p /etc/dropbear
-dropbearkey -t ed25519 -f /etc/dropbear/dropbear_ed25519_host_key
-
-echo "Creating authorized_keys overlay for initramfs..."
-mkdir -p /etc/mkinitfs/features.d/ltv-ssh.keys/root/.ssh
-cp authorized_keys /etc/mkinitfs/features.d/ltv-ssh.keys/root/.ssh/authorized_keys
-chmod 600 /etc/mkinitfs/features.d/ltv-ssh.keys/root/.ssh/authorized_keys
-
-echo "Regenerating initramfs..."
-KERNEL=$(uname -r)
-mkinitfs -F "base ltv cryptsetup network" -k "$KERNEL" \
-  -o "/boot/initramfs-ltv-$KERNEL" "$KERNEL"
-
-echo "Done! Update bootloader with kernel cmdline from cmdline.txt"
-echo "Then reboot."
-"###;
-    fs::write(deploy_dir.join("deploy.sh"), deploy_sh).map_err(|e| e.to_string())?;
-    // Make deploy.sh executable
+    // 5. Dropbear host keys (pre-generated locally)
     use std::os::unix::fs::PermissionsExt;
+    fs::write(deploy_dir.join("dropbear_ed25519_host_key"), &host_key_private).map_err(|e| e.to_string())?;
+    let mut perms = fs::metadata(deploy_dir.join("dropbear_ed25519_host_key")).map_err(|e| e.to_string())?.permissions();
+    perms.set_mode(0o600);
+    fs::set_permissions(deploy_dir.join("dropbear_ed25519_host_key"), perms).map_err(|e| e.to_string())?;
+    let pub_key_line = format!("ssh-ed25519 {} ltv-initramfs", base64::engine::general_purpose::STANDARD.encode(&host_key_public));
+    fs::write(deploy_dir.join("dropbear_ed25519_host_key.pub"), &pub_key_line).map_err(|e| e.to_string())?;
+
+    // 6. deploy.sh (with kernel version template)
+    let kernel_version = std::process::Command::new("uname").arg("-r").output().map_err(|e| e.to_string())?.stdout;
+    let kernel_version = String::from_utf8_lossy(&kernel_version).trim().to_string();
+    let deploy_sh = render_deploy_sh(&kernel_version);
+    fs::write(deploy_dir.join("deploy.sh"), deploy_sh).map_err(|e| e.to_string())?;
     let mut perms = fs::metadata(deploy_dir.join("deploy.sh")).map_err(|e| e.to_string())?.permissions();
     perms.set_mode(0o755);
     fs::set_permissions(deploy_dir.join("deploy.sh"), perms).map_err(|e| e.to_string())?;
 
-    // 7. cmdline.txt
+    // 7. deploy_nopatch.sh (alternative without patching)
+    let deploy_nopatch_sh = render_deploy_nopatch_sh(&kernel_version);
+    fs::write(deploy_dir.join("deploy_nopatch.sh"), deploy_nopatch_sh).map_err(|e| e.to_string())?;
+    let mut perms = fs::metadata(deploy_dir.join("deploy_nopatch.sh")).map_err(|e| e.to_string())?.permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(deploy_dir.join("deploy_nopatch.sh"), perms).map_err(|e| e.to_string())?;
+
+    // 8. cmdline.txt (from template)
+    let cmdline = render_cmdline(&p);
     fs::write(deploy_dir.join("cmdline.txt"), &cmdline).map_err(|e| e.to_string())?;
 
-    // 8. README
+    // 9. README
     let readme = format!(r#"# LTV Deployment Artifacts for profile: {}
 
 ## Files
@@ -217,11 +151,14 @@ echo "Then reboot."
 - `ltv.files` - Feature file list for mkinitfs
 - `ltv.modules` - Kernel modules (empty)
 - `ltv.packages` - APK packages: dropbear
-- `ltv-hook.sh` - Initramfs hook script
+- `ltv-hook.sh` - Initramfs hook script (starts Dropbear)
 - `ltv-common.sh` - Shared functions for hooks
 - `initramfs-init.patch` - Sed script to patch initramfs-init
-- `authorized_keys` - Restricted client public key for initramfs SSH
+- `authorized_keys` - Client public key for initramfs SSH (no forced commands)
+- `dropbear_ed25519_host_key` - Dropbear host private key (pre-generated)
+- `dropbear_ed25519_host_key.pub` - Dropbear host public key
 - `deploy.sh` - Run this on the target server (sudo sh deploy.sh)
+- `deploy_nopatch.sh` - Alternative without patching initramfs-init
 - `cmdline.txt` - Kernel command line parameters
 
 ## Quick Deploy
@@ -231,6 +168,8 @@ On target Alpine server:
 ```bash
 # Copy this entire directory to the server, then:
 sudo sh deploy.sh
+# OR (if initramfs-init is handcrafted):
+sudo sh deploy_nopatch.sh
 ```
 
 ## Bootloader Configuration
@@ -242,7 +181,7 @@ Add to kernel command line (from cmdline.txt):
 After deployment and reboot:
     ltv-admin> unlock {}
 
-# This will push keyfiles to initramfs Dropbear via SSH push-to-stdin
+# This will push keyfiles to initramfs Dropbear via SSH (full shell, not push-to-stdin yet)
 "#, p.name, &cmdline, p.name);
     fs::write(deploy_dir.join("README.md"), readme).map_err(|e| e.to_string())?;
 

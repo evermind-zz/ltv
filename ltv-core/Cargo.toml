@@ -25,3 +25,7 @@ tokio.workspace = true
 russh.workspace = true
 russh-keys.workspace = true
 async-trait.workspace = true
+base64.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
