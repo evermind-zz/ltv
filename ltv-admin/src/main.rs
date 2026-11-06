@@ -79,26 +79,34 @@ async fn cmd_server_setup(st: &mut State, name: &str, args: &[&str]) -> Result<(
     fs::create_dir_all(deploy_dir).map_err(|e| e.to_string())?;
 
     // Generate Dropbear host keypair locally (ed25519) in dropbear native format
-    // Dropbear format: uint32 type_len(LE) + "ssh-ed25519" + uint32 pubkey_len + pubkey(32) + seed(32)
+    // Dropbear format (from dropbearkey.c source):
+    // string "ssh-ed25519"  -> uint32 len(11) BE + "ssh-ed25519"
+    // string k+A (64 bytes) -> uint32 len(64) BE + seed(32) + pubkey(32)
     // Total: 4 + 11 + 4 + 32 + 32 = 83 bytes
+    // All uint32 length fields are BIG-ENDIAN (RFC 4253 network byte order)
+    // Seed must be clamped per Ed25519 spec: seed[0] &= 0xF8, seed[31] = (seed[31] & 0x7F) | 0x40
 
     let mut csprng = OsRng;
     let signing_key = SigningKey::generate(&mut csprng);
     let verifying_key = signing_key.verifying_key();
     let pubkey = verifying_key.as_bytes();
-    let seed = signing_key.to_bytes();
+    let mut seed = signing_key.to_bytes();
+    
+    // Clamp seed per Ed25519 spec (required for dropbear to accept the key)
+    seed[0] &= 0xF8;  // Clear bottom 3 bits
+    seed[31] = (seed[31] & 0x7F) | 0x40;  // Clear bit 7, set bit 6
 
     let key_path = deploy_dir.join("dropbear_ed25519_host_key");
     let pub_key_path = deploy_dir.join("dropbear_ed25519_host_key.pub");
 
     // Write dropbear native format private key
     let type_str = b"ssh-ed25519";
-    let mut key_data = Vec::with_capacity(4 + type_str.len() + 4 + pubkey.len() + seed.len());
-    key_data.extend_from_slice(&(type_str.len() as u32).to_le_bytes());
-    key_data.extend_from_slice(type_str);
-    key_data.extend_from_slice(&(pubkey.len() as u32).to_le_bytes());
-    key_data.extend_from_slice(pubkey);
-    key_data.extend_from_slice(seed.as_slice()); // seed only, no length prefix
+    let mut key_data = Vec::with_capacity(83);
+    key_data.extend_from_slice(&(type_str.len() as u32).to_be_bytes()); // type_len = 11 (BE)
+    key_data.extend_from_slice(type_str); // "ssh-ed25519" (11 bytes)
+    key_data.extend_from_slice(&(64u32).to_be_bytes()); // key_len = 64 (BE)
+    key_data.extend_from_slice(&seed); // 32 bytes (clamped seed = k)
+    key_data.extend_from_slice(pubkey); // 32 bytes (A = public key)
 
     fs::write(&key_path, &key_data).map_err(|e| e.to_string())?;
     use std::os::unix::fs::PermissionsExt;
