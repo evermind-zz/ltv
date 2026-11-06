@@ -1,6 +1,6 @@
-usr/share/mkinitfs/ltv-hook.sh
-usr/share/mkinitfs/ltv-common.sh
-usr/sbin/dropbear
-etc/dropbear/dropbear_ed25519_host_key
-etc/dropbear/dropbear_ed25519_host_key.pub
-root/.ssh/authorized_keys
+/usr/share/mkinitfs/ltv-hook.sh
+/usr/share/mkinitfs/ltv-common.sh
+/usr/sbin/dropbear
+/etc/mkinitfs/ltv-stuff/etc/dropbear/dropbear_ed25519_host_key
+/etc/mkinitfs/ltv-stuff/etc/dropbear/dropbear_ed25519_host_key.pub
+/etc/mkinitfs/ltv-stuff/root/.ssh/authorized_keys

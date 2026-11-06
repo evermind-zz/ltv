@@ -4,8 +4,6 @@ use std::path::Path;
 use rustyline::{error::ReadlineError, DefaultEditor};
 use secrecy::{ExposeSecret, SecretString, SecretVec};
 use getopts::Options;
-use ed25519_dalek::SigningKey;
-use rand::rngs::OsRng;
 use base64::Engine;
 
 struct State { 
@@ -74,18 +72,40 @@ async fn cmd_server_setup(st: &mut State, name: &str, args: &[&str]) -> Result<(
     let v = st.vault.as_mut().ok_or("no vault open")?;
     let p = resolve(&v, name)?.clone();
 
-    // Generate Dropbear host keypair locally (ed25519)
-    let mut csprng = OsRng;
-    let signing_key = SigningKey::generate(&mut csprng);
-    let verifying_key = signing_key.verifying_key();
-    let host_key_private = signing_key.to_bytes();
-    let host_key_public = verifying_key.to_bytes();
+    // Generate deployment artifacts directory early for key generation
+    let deploy_dir = Path::new(&out_dir);
+    fs::create_dir_all(deploy_dir).map_err(|e| e.to_string())?;
+
+    // Generate Dropbear host keypair locally (ed25519) using ssh-keygen for proper OpenSSH format
+    let key_path = deploy_dir.join("dropbear_ed25519_host_key");
+    let pub_key_path = deploy_dir.join("dropbear_ed25519_host_key.pub");
+    
+    // Generate key using ssh-keygen (produces OpenSSH format that dropbear accepts)
+    let output = std::process::Command::new("ssh-keygen")
+        .args(["-t", "ed25519", "-f", key_path.to_str().unwrap(), "-N", "", "-C", "ltv-initramfs"])
+        .output()
+        .map_err(|e| format!("ssh-keygen failed: {}", e))?;
+    if !output.status.success() {
+        return Err(format!("ssh-keygen failed: {}", String::from_utf8_lossy(&output.stderr)));
+    }
+    
+    // Read the generated public key
+    let host_key_public = fs::read(&pub_key_path).map_err(|e| e.to_string())?;
+    let pub_key_line = String::from_utf8_lossy(&host_key_public).trim().to_string();
+    
+    // Parse public key bytes for vault (ssh-ed25519 AAAA... format)
+    let pub_key_parts: Vec<&str> = pub_key_line.split_whitespace().collect();
+    let host_key_public_bytes = if pub_key_parts.len() >= 2 {
+        base64::engine::general_purpose::STANDARD.decode(pub_key_parts[1]).map_err(|e| e.to_string())?
+    } else {
+        return Err("invalid public key format".into());
+    };
 
     // Pin the initramfs host key in the vault (if not already pinned)
     if p.initramfs_host_key.is_none() {
         v.set_host_key(&p.uuid, HostKey {
             key_type: "ssh-ed25519".into(),
-            key_bytes: host_key_public.to_vec(),
+            key_bytes: host_key_public_bytes,
         }, false).map_err(|e| e.to_string())?;
         // Save vault immediately so the pinned key persists
         if let Some(path) = &st.path {
@@ -93,10 +113,6 @@ async fn cmd_server_setup(st: &mut State, name: &str, args: &[&str]) -> Result<(
             fs::write(path, bytes).map_err(|e| e.to_string())?;
         }
     }
-
-    // Generate deployment artifacts
-    let deploy_dir = Path::new(&out_dir);
-    fs::create_dir_all(deploy_dir).map_err(|e| e.to_string())?;
 
     // 1. mkinitfs feature files (from embedded scripts)
     fs::write(deploy_dir.join("ltv.files"), LTV_FILES).map_err(|e| e.to_string())?;
@@ -114,14 +130,18 @@ async fn cmd_server_setup(st: &mut State, name: &str, args: &[&str]) -> Result<(
     let auth_keys = v.authorized_keys_line(&p);
     fs::write(deploy_dir.join("authorized_keys"), auth_keys).map_err(|e| e.to_string())?;
 
-    // 5. Dropbear host keys (pre-generated locally)
+    // 5. Dropbear host keys (pre-generated locally with ssh-keygen - already written above)
+    // Set permissions
     use std::os::unix::fs::PermissionsExt;
-    fs::write(deploy_dir.join("dropbear_ed25519_host_key"), &host_key_private).map_err(|e| e.to_string())?;
-    let mut perms = fs::metadata(deploy_dir.join("dropbear_ed25519_host_key")).map_err(|e| e.to_string())?.permissions();
+    let mut perms = fs::metadata(&key_path).map_err(|e| e.to_string())?.permissions();
     perms.set_mode(0o600);
-    fs::set_permissions(deploy_dir.join("dropbear_ed25519_host_key"), perms).map_err(|e| e.to_string())?;
-    let pub_key_line = format!("ssh-ed25519 {} ltv-initramfs", base64::engine::general_purpose::STANDARD.encode(&host_key_public));
-    fs::write(deploy_dir.join("dropbear_ed25519_host_key.pub"), &pub_key_line).map_err(|e| e.to_string())?;
+    fs::set_permissions(&key_path, perms).map_err(|e| e.to_string())?;
+    let mut perms = fs::metadata(&pub_key_path).map_err(|e| e.to_string())?.permissions();
+    perms.set_mode(0o644);
+    fs::set_permissions(&pub_key_path, perms).map_err(|e| e.to_string())?;
+    
+    // Write public key in authorized_keys format (already done by ssh-keygen, but ensure format)
+    fs::write(&pub_key_path, &pub_key_line).map_err(|e| e.to_string())?;
 
     // 6. deploy.sh (with kernel version template)
     let kernel_version = std::process::Command::new("uname").arg("-r").output().map_err(|e| e.to_string())?.stdout;
