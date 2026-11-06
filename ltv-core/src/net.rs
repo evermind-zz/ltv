@@ -161,7 +161,7 @@ pub async fn fetch_luks_info(
     if let Some(v) = verbose.as_mut() { v(&cmd); }
     let r = exec(&mut s, &cmd, None, t).await?;
     if r.code != 0 {
-        if let Some(v) = verbose.as_mut() { v(&format!("  [fetch] ! exit={} stderr: {}", r.code, r.stderr.trim())); }
+        if let Some(v) = verbose.as_mut() { v(&format!("  [fetch] ! cmd={} exit={} stderr: {}", &cmd, r.code, r.stderr.trim())); }
         return Err(UnlockError::CryptsetupFailed { target: "discovery".into(), code: r.code, stderr: r.stderr });
     }
 
@@ -211,7 +211,7 @@ pub async fn fetch_luks_info(
         if let Some(v) = verbose.as_mut() { v(&cmd); }
         let dump = exec(&mut s, &cmd, None, t).await?;
         if dump.code != 0 {
-            if let Some(v) = verbose.as_mut() { v(&format!("  [fetch] ! exit={} stderr: {}", dump.code, dump.stderr.trim())); }
+            if let Some(v) = verbose.as_mut() { v(&format!("  [fetch] ! cmd={} exit={} stderr: {}", &cmd, dump.code, dump.stderr.trim())); }
         } else {
             let mut cipher = String::new();
             let mut key_size = 0;
@@ -274,7 +274,7 @@ pub async fn unlock(
         if let Some(v) = verbose.as_mut() { v(&cmd); }
         let r = exec(&mut session, &cmd, Some(&key.keyfile), t).await?;
         if r.code != 0 {
-            if let Some(v) = verbose.as_mut() { v(&format!("  [unlock] ! exit={} stderr: {}", r.code, r.stderr.trim())); }
+            if let Some(v) = verbose.as_mut() { v(&format!("  [unlock] ! cmd={} exit={} stderr: {}", &cmd, r.code, r.stderr.trim())); }
             return Err(UnlockError::CryptsetupFailed { target: tm.mapped_name.clone(), code: r.code, stderr: r.stderr });
         }
 
@@ -290,7 +290,7 @@ pub async fn unlock(
             }
         }
         if r.code != 0 {
-            if let Some(v) = verbose.as_mut() { v(&format!("  [unlock] ! exit={} stderr: {}", r.code, r.stderr.trim())); }
+            if let Some(v) = verbose.as_mut() { v(&format!("  [unlock] ! cmd={} exit={} stderr: {}", &cmd, r.code, r.stderr.trim())); }
         }
         match r.code {
             0 => on(UnlockEvent::TargetDone(tm.mapped_name.clone())),
@@ -309,7 +309,7 @@ pub async fn unlock(
         if let Some(v) = &mut verbose { v(c); }
         let r = exec(&mut session, c, None, t).await?;
         if r.code != 0 {
-            if let Some(v) = verbose.as_mut() { v(&format!("  [unlock] ! exit={} stderr: {}", r.code, r.stderr.trim())); }
+            if let Some(v) = verbose.as_mut() { v(&format!("  [unlock] ! cmd={} exit={} stderr: {}", c, r.code, r.stderr.trim())); }
             return Err(UnlockError::ResumeFailed(r.stderr));
         }
         on(UnlockEvent::ResumeSent);

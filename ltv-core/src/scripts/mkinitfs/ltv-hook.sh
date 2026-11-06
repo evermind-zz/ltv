@@ -2,7 +2,7 @@
 # ltv-hook: Start Dropbear for push-to-stdin LUKS unlock
 # Runs after configure_ip, before nlplug-findfs
 
-. /lib/mkinitfs/ltv-common.sh
+. /usr/share/mkinitfs/ltv-common.sh
 
 # Create forced-command script for future push-to-stdin unlock
 if [ ! -f /tmp/ltv-unlock.sh ]; then

@@ -89,7 +89,7 @@ pub async fn enroll(
             }
         }
         if r.code != 0 {
-            if let Some(verb) = verbose.as_mut() { verb(&format!("  [enroll] ! exit={} stderr: {}", r.code, r.stderr.trim())); }
+            if let Some(verb) = verbose.as_mut() { verb(&format!("  [enroll] ! cmd={} exit={} stderr: {}", &cmd, r.code, r.stderr.trim())); }
             on(EnrollEvent::Skipped(tm.mapped_name.clone(), format!("not a LUKS device: {}", r.stderr.trim())));
             continue;
         }
@@ -98,7 +98,7 @@ pub async fn enroll(
         if let Some(verb) = verbose.as_mut() { verb(&cmd); }
         let dump = exec(&mut s, &cmd, None, t).await?;
         if dump.code != 0 {
-            if let Some(verb) = verbose.as_mut() { verb(&format!("  [enroll] ! exit={} stderr: {}", dump.code, dump.stderr.trim())); }
+            if let Some(verb) = verbose.as_mut() { verb(&format!("  [enroll] ! cmd={} exit={} stderr: {}", &cmd, dump.code, dump.stderr.trim())); }
         }
         let used = parse_used_slots(&dump.stdout);
         let slot = match tm.keyslot {
@@ -117,7 +117,7 @@ pub async fn enroll(
         if let Some(verb) = verbose.as_mut() { verb(&cmd); }
         let r = exec(&mut s, &cmd, Some(luks_pass.expose_secret().as_bytes()), t).await?;
         if r.code != 0 { 
-            if let Some(verb) = verbose.as_mut() { verb(&format!("  [enroll] ! exit={} stderr: {}", r.code, r.stderr.trim())); }
+            if let Some(verb) = verbose.as_mut() { verb(&format!("  [enroll] ! cmd={} exit={} stderr: {}", &cmd, r.code, r.stderr.trim())); }
             return Err(UnlockError::CryptsetupFailed { target: tm.mapped_name.clone(), code: r.code, stderr: r.stderr }); 
         }
 
@@ -126,7 +126,7 @@ pub async fn enroll(
         if let Some(verb) = verbose.as_mut() { verb(&cmd); }
         let r = exec(&mut s, &cmd, Some(&key.keyfile), t).await?;
         if r.code != 0 { 
-            if let Some(verb) = verbose.as_mut() { verb(&format!("  [enroll] ! exit={} stderr: {}", r.code, r.stderr.trim())); }
+            if let Some(verb) = verbose.as_mut() { verb(&format!("  [enroll] ! cmd={} exit={} stderr: {}", &cmd, r.code, r.stderr.trim())); }
             return Err(UnlockError::CryptsetupFailed { target: tm.mapped_name.clone(), code: r.code, stderr: r.stderr }); 
         }
 
@@ -139,7 +139,7 @@ pub async fn enroll(
         let _ = exec(&mut s, &cmd, None, t).await;
         let add = add?;
         if add.code != 0 {
-            if let Some(verb) = verbose.as_mut() { verb(&format!("  [enroll] ! exit={} stderr: {}", add.code, add.stderr.trim())); }
+            if let Some(verb) = verbose.as_mut() { verb(&format!("  [enroll] ! cmd={} exit={} stderr: {}", &cmd, add.code, add.stderr.trim())); }
         }
         match add.code {
             0 => on(EnrollEvent::SlotAdded(tm.mapped_name.clone(), slot)),
@@ -152,7 +152,7 @@ pub async fn enroll(
         if let Some(verb) = verbose.as_mut() { verb(&cmd); }
         let verify = exec(&mut s, &cmd, Some(&key.keyfile), t).await?;
         if verify.code != 0 {
-            if let Some(verb) = verbose.as_mut() { verb(&format!("  [enroll] ! exit={} stderr: {}", verify.code, verify.stderr.trim())); }
+            if let Some(verb) = verbose.as_mut() { verb(&format!("  [enroll] ! cmd={} exit={} stderr: {}", &cmd, verify.code, verify.stderr.trim())); }
             return Err(UnlockError::CryptsetupFailed { target: tm.mapped_name.clone(), code: verify.code,
                 stderr: format!("verification failed: {}", verify.stderr) });
         }
