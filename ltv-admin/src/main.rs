@@ -5,6 +5,8 @@ use rustyline::{error::ReadlineError, DefaultEditor};
 use secrecy::{ExposeSecret, SecretString, SecretVec};
 use getopts::Options;
 use base64::Engine;
+use ed25519_dalek::SigningKey;
+use rand::rngs::OsRng;
 
 struct State { 
     path: Option<PathBuf>, 
@@ -76,30 +78,42 @@ async fn cmd_server_setup(st: &mut State, name: &str, args: &[&str]) -> Result<(
     let deploy_dir = Path::new(&out_dir);
     fs::create_dir_all(deploy_dir).map_err(|e| e.to_string())?;
 
-    // Generate Dropbear host keypair locally (ed25519) using ssh-keygen for proper OpenSSH format
+    // Generate Dropbear host keypair locally (ed25519) in dropbear native format
+    // Dropbear format: uint32 type_len(LE) + "ssh-ed25519" + uint32 pubkey_len + pubkey(32) + seed(32)
+    // Total: 4 + 11 + 4 + 32 + 32 = 83 bytes
+
+    let mut csprng = OsRng;
+    let signing_key = SigningKey::generate(&mut csprng);
+    let verifying_key = signing_key.verifying_key();
+    let pubkey = verifying_key.as_bytes();
+    let seed = signing_key.to_bytes();
+
     let key_path = deploy_dir.join("dropbear_ed25519_host_key");
     let pub_key_path = deploy_dir.join("dropbear_ed25519_host_key.pub");
-    
-    // Generate key using ssh-keygen (produces OpenSSH format that dropbear accepts)
-    let output = std::process::Command::new("ssh-keygen")
-        .args(["-t", "ed25519", "-f", key_path.to_str().unwrap(), "-N", "", "-C", "ltv-initramfs"])
-        .output()
-        .map_err(|e| format!("ssh-keygen failed: {}", e))?;
-    if !output.status.success() {
-        return Err(format!("ssh-keygen failed: {}", String::from_utf8_lossy(&output.stderr)));
-    }
-    
-    // Read the generated public key
-    let host_key_public = fs::read(&pub_key_path).map_err(|e| e.to_string())?;
-    let pub_key_line = String::from_utf8_lossy(&host_key_public).trim().to_string();
-    
-    // Parse public key bytes for vault (ssh-ed25519 AAAA... format)
-    let pub_key_parts: Vec<&str> = pub_key_line.split_whitespace().collect();
-    let host_key_public_bytes = if pub_key_parts.len() >= 2 {
-        base64::engine::general_purpose::STANDARD.decode(pub_key_parts[1]).map_err(|e| e.to_string())?
-    } else {
-        return Err("invalid public key format".into());
-    };
+
+    // Write dropbear native format private key
+    let type_str = b"ssh-ed25519";
+    let mut key_data = Vec::with_capacity(4 + type_str.len() + 4 + pubkey.len() + seed.len());
+    key_data.extend_from_slice(&(type_str.len() as u32).to_le_bytes());
+    key_data.extend_from_slice(type_str);
+    key_data.extend_from_slice(&(pubkey.len() as u32).to_le_bytes());
+    key_data.extend_from_slice(pubkey);
+    key_data.extend_from_slice(seed.as_slice()); // seed only, no length prefix
+
+    fs::write(&key_path, &key_data).map_err(|e| e.to_string())?;
+    use std::os::unix::fs::PermissionsExt;
+    let mut perms = fs::metadata(&key_path).map_err(|e| e.to_string())?.permissions();
+    perms.set_mode(0o600);
+    fs::set_permissions(&key_path, perms).map_err(|e| e.to_string())?;
+
+    // Write public key in authorized_keys format
+    let pub_key_line = format!("ssh-ed25519 {} ltv-initramfs", base64::engine::general_purpose::STANDARD.encode(pubkey));
+    fs::write(&pub_key_path, &pub_key_line).map_err(|e| e.to_string())?;
+    let mut perms = fs::metadata(&pub_key_path).map_err(|e| e.to_string())?.permissions();
+    perms.set_mode(0o644);
+    fs::set_permissions(&pub_key_path, perms).map_err(|e| e.to_string())?;
+
+    let host_key_public_bytes = pubkey.to_vec();
 
     // Pin the initramfs host key in the vault (if not already pinned)
     if p.initramfs_host_key.is_none() {
@@ -130,20 +144,7 @@ async fn cmd_server_setup(st: &mut State, name: &str, args: &[&str]) -> Result<(
     let auth_keys = v.authorized_keys_line(&p);
     fs::write(deploy_dir.join("authorized_keys"), auth_keys).map_err(|e| e.to_string())?;
 
-    // 5. Dropbear host keys (pre-generated locally with ssh-keygen - already written above)
-    // Set permissions
-    use std::os::unix::fs::PermissionsExt;
-    let mut perms = fs::metadata(&key_path).map_err(|e| e.to_string())?.permissions();
-    perms.set_mode(0o600);
-    fs::set_permissions(&key_path, perms).map_err(|e| e.to_string())?;
-    let mut perms = fs::metadata(&pub_key_path).map_err(|e| e.to_string())?.permissions();
-    perms.set_mode(0o644);
-    fs::set_permissions(&pub_key_path, perms).map_err(|e| e.to_string())?;
-    
-    // Write public key in authorized_keys format (already done by ssh-keygen, but ensure format)
-    fs::write(&pub_key_path, &pub_key_line).map_err(|e| e.to_string())?;
-
-    // 6. deploy.sh (with kernel version template)
+    // 5. deploy.sh (with kernel version template)
     let kernel_version = std::process::Command::new("uname").arg("-r").output().map_err(|e| e.to_string())?.stdout;
     let kernel_version = String::from_utf8_lossy(&kernel_version).trim().to_string();
     let deploy_sh = render_deploy_sh(&kernel_version);
