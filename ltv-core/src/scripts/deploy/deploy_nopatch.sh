@@ -6,7 +6,8 @@
 set -e
 
 echo "Installing mkinitfs feature files..."
-cp ltv.files ltv.modules ltv.packages /etc/mkinitfs/features.d/
+mkdir -p /etc/mkinitfs/ltv-stuff
+cp ltv.files ltv.modules ltv.packages /etc/mkinitfs/ltv-stuff/
 
 echo "Installing hook and common lib to /usr/share/mkinitfs/"
 cp ltv-hook.sh /usr/share/mkinitfs/ltv-hook.sh
