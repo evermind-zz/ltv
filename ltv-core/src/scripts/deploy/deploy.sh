@@ -14,14 +14,14 @@ chmod 755 /usr/share/mkinitfs/ltv-hook.sh
 cp ltv-common.sh /usr/share/mkinitfs/ltv-common.sh
 
 echo "Installing Dropbear host key and authorized_keys overlay..."
-mkdir -p /etc/mkinitfs/features.d/ltv-ssh.keys/etc/dropbear
-cp dropbear_ed25519_host_key /etc/mkinitfs/features.d/ltv-ssh.keys/etc/dropbear/
-cp dropbear_ed25519_host_key.pub /etc/mkinitfs/features.d/ltv-ssh.keys/etc/dropbear/
-mkdir -p /etc/mkinitfs/features.d/ltv-ssh.keys/root/.ssh
-cp authorized_keys /etc/mkinitfs/features.d/ltv-ssh.keys/root/.ssh/authorized_keys
-chmod 600 /etc/mkinitfs/features.d/ltv-ssh.keys/etc/dropbear/dropbear_ed25519_host_key
-chmod 644 /etc/mkinitfs/features.d/ltv-ssh.keys/etc/dropbear/dropbear_ed25519_host_key.pub
-chmod 600 /etc/mkinitfs/features.d/ltv-ssh.keys/root/.ssh/authorized_keys
+mkdir -p /etc/mkinitfs/ltv-stuff/etc/dropbear
+cp dropbear_ed25519_host_key /etc/mkinitfs/ltv-stuff/etc/dropbear/
+cp dropbear_ed25519_host_key.pub /etc/mkinitfs/ltv-stuff/etc/dropbear/
+mkdir -p /etc/mkinitfs/ltv-stuff/root/.ssh
+cp authorized_keys /etc/mkinitfs/ltv-stuff/root/.ssh/authorized_keys
+chmod 600 /etc/mkinitfs/ltv-stuff/etc/dropbear/dropbear_ed25519_host_key
+chmod 644 /etc/mkinitfs/ltv-stuff/etc/dropbear/dropbear_ed25519_host_key.pub
+chmod 600 /etc/mkinitfs/ltv-stuff/root/.ssh/authorized_keys
 
 echo "Patching initramfs init script..."
 sh initramfs-init.patch
