@@ -317,7 +317,7 @@ pub async fn unlock(
 
     // Kill dropbear and any remaining cryptsetup processes waiting for passphrase
     // This allows the initramfs boot to continue cleanly
-    let kill_cmd = "pkill -f 'dropbear.*-p 22' 2>/dev/null; pkill -f 'cryptsetup.*--key-file' 2>/dev/null; true";
+    let kill_cmd = "pkill dropbear 2>/dev/null; pkill cryptsetup 2>/dev/null; pkill nlplug-findfs 2>/dev/null; true";
     if let Some(v) = verbose.as_mut() { v(&format!("  [unlock] $ {}", kill_cmd)); }
     let _ = exec(&mut session, kill_cmd, None, t).await;
 
