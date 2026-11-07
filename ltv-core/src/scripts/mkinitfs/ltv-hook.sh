@@ -11,4 +11,4 @@ if [ ! -f /tmp/ltv-unlock.sh ]; then
 fi
 
 # Start Dropbear SSH server
-dropbear -E -p 22 -r /etc/mkinitfs/ltv-stuff/etc/dropbear/dropbear_ed25519_host_key -D /etc/mkinitfs/ltv-stuff/root/.ssh/authorized_keys &
+dropbear -E -p 22 -r /etc/mkinitfs/ltv-stuff/etc/dropbear/dropbear_ed25519_host_key -D /etc/mkinitfs/ltv-stuff/root/.ssh/ &

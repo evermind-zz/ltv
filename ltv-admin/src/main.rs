@@ -5,8 +5,6 @@ use rustyline::{error::ReadlineError, DefaultEditor};
 use secrecy::{ExposeSecret, SecretString, SecretVec};
 use getopts::Options;
 use base64::Engine;
-use ed25519_dalek::SigningKey;
-use rand::rngs::OsRng;
 
 struct State { 
     path: Option<PathBuf>, 
@@ -78,63 +76,80 @@ async fn cmd_server_setup(st: &mut State, name: &str, args: &[&str]) -> Result<(
     let deploy_dir = Path::new(&out_dir);
     fs::create_dir_all(deploy_dir).map_err(|e| e.to_string())?;
 
-    // Generate Dropbear host keypair locally (ed25519) in dropbear native format
-    // Dropbear format (from dropbearkey.c source):
-    // string "ssh-ed25519"  -> uint32 len(11) BE + "ssh-ed25519"
-    // string k+A (64 bytes) -> uint32 len(64) BE + seed(32) + pubkey(32)
-    // Total: 4 + 11 + 4 + 32 + 32 = 83 bytes
-    // All uint32 length fields are BIG-ENDIAN (RFC 4253 network byte order)
-    // Seed must be clamped per Ed25519 spec: seed[0] &= 0xF8, seed[31] = (seed[31] & 0x7F) | 0x40
-
-    let mut csprng = OsRng;
-    let signing_key = SigningKey::generate(&mut csprng);
-    let verifying_key = signing_key.verifying_key();
-    let pubkey = verifying_key.as_bytes();
-    let mut seed = signing_key.to_bytes();
-    
-    // Clamp seed per Ed25519 spec (required for dropbear to accept the key)
-    seed[0] &= 0xF8;  // Clear bottom 3 bits
-    seed[31] = (seed[31] & 0x7F) | 0x40;  // Clear bit 7, set bit 6
-
     let key_path = deploy_dir.join("dropbear_ed25519_host_key");
     let pub_key_path = deploy_dir.join("dropbear_ed25519_host_key.pub");
 
-    // Write dropbear native format private key
-    let type_str = b"ssh-ed25519";
-    let mut key_data = Vec::with_capacity(83);
-    key_data.extend_from_slice(&(type_str.len() as u32).to_be_bytes()); // type_len = 11 (BE)
-    key_data.extend_from_slice(type_str); // "ssh-ed25519" (11 bytes)
-    key_data.extend_from_slice(&(64u32).to_be_bytes()); // key_len = 64 (BE)
-    key_data.extend_from_slice(&seed); // 32 bytes (clamped seed = k)
-    key_data.extend_from_slice(pubkey); // 32 bytes (A = public key)
+    // Generate Dropbear host keypair LOCALLY using dropbearkey binary
+    // Native dropbear format (83 bytes) with correct magic ensures russh connects
+    println!("Generating dropbear host key locally using dropbearkey...");
+    let output = std::process::Command::new("dropbearkey")
+        .args(["-t", "ed25519", "-f", key_path.to_str().unwrap()])
+        .output()
+        .map_err(|e| format!("dropbearkey failed: {}", e))?;
 
-    fs::write(&key_path, &key_data).map_err(|e| e.to_string())?;
+    if !output.status.success() {
+        return Err(format!("dropbearkey failed: {}", String::from_utf8_lossy(&output.stderr)));
+    }
+    let gen_out = String::from_utf8_lossy(&output.stdout);
+    for line in gen_out.lines() {
+        if !line.starts_with("Generating") { println!("{}", line); }
+    }
+
+    // Extract public key locally
+    let output = std::process::Command::new("dropbearkey")
+        .args(["-y", "-f", key_path.to_str().unwrap()])
+        .output()
+        .map_err(|e| format!("dropbearkey -y failed: {}", e))?;
+
+    if !output.status.success() {
+        return Err(format!("dropbearkey -y failed: {}", String::from_utf8_lossy(&output.stderr)));
+    }
+    let pub_output = String::from_utf8_lossy(&output.stdout);
+    for line in pub_output.lines() {
+        if !line.starts_with("Generating") { println!("{}", line); }
+    }
+
+    // Parse public key line
+    let pub_key_line = pub_output.lines()
+        .find(|l| l.starts_with("ssh-ed25519 "))
+        .ok_or("no public key in dropbearkey output")?;
+    let pub_key_parts: Vec<&str> = pub_key_line.split_whitespace().collect();
+    let pub_b64 = pub_key_parts.get(1).ok_or("invalid public key format")?;
+    let host_key_public_bytes_full = base64::engine::general_purpose::STANDARD.decode(pub_b64).map_err(|e| e.to_string())?;
+
+    // host_key_public_bytes_full is the full SSH wire format (51 bytes):
+    // 4 bytes len("ssh-ed25519") + 11 bytes "ssh-ed25519" + 4 bytes len(pubkey) + 32 bytes pubkey
+    // This matches what russh presents via PublicKey::public_key_bytes() and what dropbearkey fingerprint uses.
+
+    // Compute fingerprint on FULL 51-byte blob (matches dropbearkey output)
+    let fp = fingerprint_sha256(&host_key_public_bytes_full);
+    println!("Pin initramfs_host_key fingerprint: {}", fp);
+
     use std::os::unix::fs::PermissionsExt;
     let mut perms = fs::metadata(&key_path).map_err(|e| e.to_string())?.permissions();
     perms.set_mode(0o600);
     fs::set_permissions(&key_path, perms).map_err(|e| e.to_string())?;
 
-    // Write public key in authorized_keys format
-    let pub_key_line = format!("ssh-ed25519 {} ltv-initramfs", base64::engine::general_purpose::STANDARD.encode(pubkey));
-    fs::write(&pub_key_path, &pub_key_line).map_err(|e| e.to_string())?;
+    // Write public key in authorized_keys format locally
+    fs::write(&pub_key_path, pub_key_line).map_err(|e| e.to_string())?;
     let mut perms = fs::metadata(&pub_key_path).map_err(|e| e.to_string())?.permissions();
     perms.set_mode(0o644);
     fs::set_permissions(&pub_key_path, perms).map_err(|e| e.to_string())?;
 
-    let host_key_public_bytes = pubkey.to_vec();
+    // Store FULL 51-byte SSH wire format in vault (matches russh presented key)
+    let host_key_public_bytes = host_key_public_bytes_full;
 
-    // Pin the initramfs host key in the vault (if not already pinned)
-    if p.initramfs_host_key.is_none() {
-        v.set_host_key(&p.uuid, HostKey {
-            key_type: "ssh-ed25519".into(),
-            key_bytes: host_key_public_bytes,
-        }, false).map_err(|e| e.to_string())?;
-        // Save vault immediately so the pinned key persists
-        if let Some(path) = &st.path {
-            let bytes = v.save().map_err(|e| e.to_string())?;
-            fs::write(path, bytes).map_err(|e| e.to_string())?;
-        }
+    // Always pin the freshly generated initramfs host key (overwrite any stale value)
+    v.set_host_key(&p.uuid, HostKey {
+        key_type: "ssh-ed25519".into(),
+        key_bytes: host_key_public_bytes,
+    }, false).map_err(|e| e.to_string())?;
+    // Save vault immediately so the pinned key persists
+    if let Some(path) = &st.path {
+        let bytes = v.save().map_err(|e| e.to_string())?;
+        fs::write(path, bytes).map_err(|e| e.to_string())?;
     }
+    println!("Pinned initramfs_host_key in vault (fingerprint: {})", fp);
 
     // 1. mkinitfs feature files (from embedded scripts)
     fs::write(deploy_dir.join("ltv.files"), LTV_FILES).map_err(|e| e.to_string())?;
@@ -150,6 +165,8 @@ async fn cmd_server_setup(st: &mut State, name: &str, args: &[&str]) -> Result<(
 
     // 4. authorized_keys (runtime generated from vault)
     let auth_keys = v.authorized_keys_line(&p);
+    // Ensure trailing newline for authorized_keys
+    let auth_keys = if auth_keys.ends_with('\n') { auth_keys } else { format!("{}\n", auth_keys) };
     fs::write(deploy_dir.join("authorized_keys"), auth_keys).map_err(|e| e.to_string())?;
 
     // 5. deploy.sh (with kernel version template)
