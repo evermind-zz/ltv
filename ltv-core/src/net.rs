@@ -314,6 +314,13 @@ pub async fn unlock(
         }
         on(UnlockEvent::ResumeSent);
     }
+
+    // Kill dropbear and any remaining cryptsetup processes waiting for passphrase
+    // This allows the initramfs boot to continue cleanly
+    let kill_cmd = "pkill -f 'dropbear.*-p 22' 2>/dev/null; pkill -f 'cryptsetup.*--key-file' 2>/dev/null; true";
+    if let Some(v) = verbose.as_mut() { v(&format!("  [unlock] $ {}", kill_cmd)); }
+    let _ = exec(&mut session, kill_cmd, None, t).await;
+
     let _ = session.disconnect(russh::Disconnect::ByApplication, "done", "en").await;
     drop(secrets);
     on(UnlockEvent::Disconnected);
