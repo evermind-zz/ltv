@@ -25,9 +25,14 @@ pub fn render_cmdline(p: &Profile) -> String {
         .map(|t| format!("ltv_{}={}", t.mapped_name, t.luks_uuid))
         .collect::<Vec<_>>()
         .join("\n");
+    let root_mapper = p.targets_meta.iter()
+        .min_by_key(|t| t.order)
+        .map(|t| format!("root=/dev/mapper/{}", t.mapped_name))
+        .unwrap_or_default();
     CMDLINE_TMPL
         .replace("{mappers}", &mappers)
         .replace("{ltv_uuids}", &ltv_uuids)
+        .replace("{root}", &root_mapper)
 }
 
 /// Render deploy.sh with kernel version.
