@@ -186,7 +186,7 @@ pub struct FetchedLuksInfo {
 /// Auth: either the client's Ed25519 key (from vault) or password via BootedAuth.
 /// If `verbose` is provided, it will be called with each command executed on the target.
 pub async fn fetch_luks_info(
-    vault: &Vault, uuid: &[u8; 16], access: &BootedAccess, only_mapped: Option<&str>,
+    vault: &Vault, uuid: &[u8; 16], access: &BootedAccess, _only_mapped: Option<&str>,
     mut verbose: Option<Box<dyn FnMut(&str) + Send>>,
 ) -> Result<Vec<FetchedLuksInfo>, UnlockError> {
     let p = vault.profile(uuid)?.clone();
