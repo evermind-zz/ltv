@@ -1,7 +1,6 @@
 use std::time::Duration;
 use secrecy::{ExposeSecret, SecretString};
-
-use crate::{error::*, model::BootedAccess, model::BootedAuth, net::*, vault::Vault};
+use crate::{constants::*, error::*, model::BootedAccess, model::BootedAuth, net::*, vault::Vault};
 
 #[derive(Debug, Clone)]
 pub enum EnrollEvent {
@@ -113,7 +112,7 @@ pub async fn enroll(
             .ok_or(VaultError::Invariant("missing keyfile"))?;
 
         // 2. stage existing passphrase AND new key in tmpfs
-        let cmd = format!("{sudo}sh -c 'umask 077 && mkdir -p /run/ltv && cat > /run/ltv/pass'");
+        let cmd = format!("{sudo}sh -c 'umask {UMASK_TMPFS} && mkdir -p {TMPFS_BASE} && cat > {TMPFS_PASSFILE}'");
         if let Some(verb) = verbose.as_mut() { verb(&cmd); }
         let r = exec(&mut s, &cmd, Some(luks_pass.expose_secret().as_bytes()), t).await?;
         if r.code != 0 { 
@@ -122,7 +121,7 @@ pub async fn enroll(
         }
 
         // Write new key to tmpfs (binary safe, avoids stdin newline truncation)
-        let cmd = format!("{sudo}sh -c 'umask 077 && cat > /run/ltv/newkey'");
+        let cmd = format!("{sudo}sh -c 'umask {UMASK_TMPFS} && cat > {TMPFS_NEWKEYFILE}'");
         if let Some(verb) = verbose.as_mut() { verb(&cmd); }
         let r = exec(&mut s, &cmd, Some(&key.keyfile), t).await?;
         if r.code != 0 { 
@@ -134,7 +133,7 @@ pub async fn enroll(
         let cmd = format!("{sudo}cryptsetup luksAddKey --key-file=/run/ltv/pass --new-keyfile=/run/ltv/newkey --key-slot {slot} {dev}");
         if let Some(verb) = verbose.as_mut() { verb(&cmd); }
         let add = exec(&mut s, &cmd, None, t).await;
-        let cmd = format!("{sudo}rm -f /run/ltv/pass /run/ltv/newkey");
+        let cmd = format!("{sudo}rm -f {TMPFS_PASSFILE} {TMPFS_NEWKEYFILE}");
         if let Some(verb) = verbose.as_mut() { verb(&cmd); }
         let _ = exec(&mut s, &cmd, None, t).await;
         let add = add?;

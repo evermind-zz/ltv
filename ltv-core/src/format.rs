@@ -1,5 +1,5 @@
 //! On-disk header, slot table, AAD construction.
-use crate::error::VaultError;
+use crate::{constants::*, error::VaultError};
 
 pub const MAGIC: &[u8; 4] = b"LTCV";
 pub const VERSION: u8 = 1;
@@ -13,7 +13,7 @@ pub const MIN_TIME: u32 = 2;
 #[derive(Clone, Copy, Debug)]
 pub struct Argon2Params { pub mem_kib: u32, pub time: u32, pub par: u8 }
 impl Default for Argon2Params {
-    fn default() -> Self { Self { mem_kib: 65536, time: 3, par: 1 } }
+    fn default() -> Self { Self { mem_kib: DEFAULT_ARGON2_MEM_MIB * 1024, time: DEFAULT_ARGON2_TIME, par: DEFAULT_ARGON2_PAR } }
 }
 
 #[derive(Clone)]

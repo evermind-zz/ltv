@@ -1,3 +1,4 @@
+use base64::Engine;
 use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
@@ -46,7 +47,7 @@ pub struct TargetMeta {
 pub enum ResumePolicy { DeviceMapperPoll, Command(String) }
 
 impl Default for ResumePolicy {
-    fn default() -> Self { ResumePolicy::Command("touch /run/ltv/resume".into()) }
+    fn default() -> Self { ResumePolicy::Command("".into()) }
 }
 
 // ---------- JIT-decrypted, zeroized ----------
@@ -61,26 +62,13 @@ pub struct TargetKey { pub luks_uuid: String, pub keyfile: Vec<u8> }
 
 pub fn fingerprint_sha256(blob: &[u8]) -> String {
     use sha2::{Digest, Sha256};
-    use std::fmt::Write;
+    
     let d = Sha256::digest(blob);
     // base64 without padding, like OpenSSH
-    let mut s = String::from("SHA256:");
-    let _ = write!(s, "{}", base64_nopad(&d));
-    s
+    format!("SHA256:{}", base64::engine::general_purpose::STANDARD_NO_PAD.encode(d))
 }
 
-fn base64_nopad(b: &[u8]) -> String {
-    const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::new();
-    for c in b.chunks(3) {
-        let n = (c[0] as u32) << 16 | (*c.get(1).unwrap_or(&0) as u32) << 8 | *c.get(2).unwrap_or(&0) as u32;
-        out.push(T[(n >> 18) as usize & 63] as char);
-        out.push(T[(n >> 12) as usize & 63] as char);
-        if c.len() > 1 { out.push(T[(n >> 6) as usize & 63] as char); }
-        if c.len() > 2 { out.push(T[n as usize & 63] as char); }
-    }
-    out
-}
+
 
 /// How to reach the *booted* OS (not the initramfs) for enroll/fetch operations.
 #[derive(Debug, Clone)]

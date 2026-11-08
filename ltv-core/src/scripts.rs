@@ -43,7 +43,7 @@ pub fn render_deploy_nopatch_sh(kernel_version: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Profile, TargetMeta, HostKey, ResumePolicy};
+    use crate::{constants::*, model::{Profile, TargetMeta, HostKey, ResumePolicy}};
     use uuid::Uuid;
 
     fn test_profile() -> Profile {
@@ -52,7 +52,7 @@ mod tests {
             name: "test".into(),
             notes: "".into(),
             host: "1.2.3.4".into(),
-            port: 22,
+            port: DEFAULT_SSH_PORT,
             username: "root".into(),
             initramfs_host_key: None,
             os_host_key: None,
@@ -79,7 +79,7 @@ mod tests {
             resume: ResumePolicy::default(),
             connect_timeout_s: 10,
             exec_timeout_s: 30,
-            envelope_nonce: [0u8; 24],
+            envelope_nonce: [0u8; NONCE_LEN],
             envelope_ciphertext: vec![],
         }
     }

@@ -6,7 +6,7 @@ use secrecy::{ExposeSecret, SecretVec};
 use sha2::Sha256;
 use zeroize::Zeroizing;
 
-use crate::{error::VaultError, format::Argon2Params};
+use crate::{constants::*, error::VaultError, format::Argon2Params};
 
 pub type Key32 = Zeroizing<[u8; 32]>;
 
@@ -15,7 +15,7 @@ pub fn random<const N: usize>() -> [u8; N] {
 }
 
 pub fn kdf(pass: &SecretVec<u8>, salt: &[u8; 16], p: Argon2Params) -> Result<Key32, VaultError> {
-    let params = Params::new(p.mem_kib, p.time, p.par as u32, Some(32)).map_err(|_| VaultError::Crypto)?;
+    let params = Params::new(p.mem_kib, p.time, p.par as u32, Some(KEY_LEN)).map_err(|_| VaultError::Crypto)?;
     let a = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
     let mut out = Zeroizing::new([0u8; 32]);
     a.hash_password_into(pass.expose_secret(), salt, out.as_mut()).map_err(|_| VaultError::Crypto)?;
@@ -37,7 +37,7 @@ pub fn open(key: &[u8; 32], nonce: &[u8; 24], aad: &[u8], ct: &[u8]) -> Result<Z
 
 pub fn envelope_key(master: &[u8; 32], profile_uuid: &[u8; 16]) -> Key32 {
     let hk = Hkdf::<Sha256>::new(None, master);
-    let mut info = b"ltv-envelope:v1:".to_vec();
+    let mut info = ENV_PREFIX.to_vec();
     info.extend_from_slice(profile_uuid);
     let mut out = Zeroizing::new([0u8; 32]);
     hk.expand(&info, out.as_mut()).expect("hkdf 32 bytes");

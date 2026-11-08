@@ -1,5 +1,6 @@
 use std::{sync::{Arc, Mutex}, time::Duration};
 use secrecy::ExposeSecret;
+use crate::constants::*;
 use async_trait::async_trait;
 use russh::{client, ChannelMsg};
 use russh_keys::key::{KeyPair, PublicKey};
@@ -270,7 +271,7 @@ pub async fn unlock(
 
         // Stage keyfile in tmpfs (binary safe, avoids stdin newline truncation)
         // Running as root in initramfs, no sudo needed. Create /run/ltv dir first.
-        let cmd = format!("sh -c 'mkdir -p /run/ltv && umask 077 && cat > /run/ltv/key'");
+        let cmd = format!("{} {}/key'", TMPFS_CREATE, TMPFS_BASE);
         if let Some(v) = verbose.as_mut() { v(&cmd); }
         let r = exec(&mut session, &cmd, Some(&key.keyfile), t).await?;
         if r.code != 0 {
@@ -300,7 +301,7 @@ pub async fn unlock(
         }
 
         // Cleanup keyfile
-        let cmd = format!("rm -f /run/ltv/key");
+        let cmd = format!("rm -f {}", TMPFS_KEYFILE);
         if let Some(v) = verbose.as_mut() { v(&cmd); }
         let _ = exec(&mut session, &cmd, None, t).await;
     }
@@ -317,7 +318,7 @@ pub async fn unlock(
 
     // Kill dropbear and any remaining cryptsetup processes waiting for passphrase
     // This allows the initramfs boot to continue cleanly
-    let kill_cmd = "pkill -9 nlplug-findfs 2>/dev/null; pkill dropbear 2>/dev/null; pkill cryptsetup 2>/dev/null; true";
+    let kill_cmd = KILL_CMD;
     if let Some(v) = verbose.as_mut() { v(&format!("  [unlock] $ {}", kill_cmd)); }
     let _ = exec(&mut session, kill_cmd, None, t).await;
 

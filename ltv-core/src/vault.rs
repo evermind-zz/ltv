@@ -1,7 +1,9 @@
+use base64::Engine;
 use secrecy::SecretVec;
 use zeroize::Zeroizing;
 
-use crate::{crypto::*, error::VaultError, format::*, model::*};
+use crate::{constants::*, crypto::*, error::VaultError, format::*, model::*};
+
 
 pub struct Vault {
     header: Header,
@@ -22,7 +24,7 @@ impl Vault {
         for (i, slot) in header.slots.iter().enumerate() {
             let kek = kdf(pass, &slot.salt, slot.params)?;
             if let Ok(mk) = open(&kek, &slot.wrap_nonce, &header.slot_aad(i), &slot.wrapped) {
-                let mut k = Zeroizing::new([0u8; 32]);
+                let mut k = Zeroizing::new([0u8; KEY_LEN]);
                 k.copy_from_slice(&mk);
                 master = Some(k);
                 break;
@@ -78,7 +80,7 @@ impl Vault {
         let wrap_nonce = random::<24>();
         let kek = kdf(pass, &salt, params)?;
         let ct = seal(&kek, &wrap_nonce, &header.slot_aad(idx), master)?;
-        let mut wrapped = [0u8; 48]; wrapped.copy_from_slice(&ct);
+        let mut wrapped = [0u8; WRAPPED_LEN]; wrapped.copy_from_slice(&ct);
         Ok(Slot { params, salt, wrap_nonce, wrapped })
     }
 
@@ -119,7 +121,7 @@ impl Vault {
             uuid, name: name.into(), notes: String::new(), host: host.into(), port, username: username.into(),
             initramfs_host_key: None, os_host_key: None, host_key_pinned_at: 0,
             client_public_key: pubblob, targets_meta: vec![], resume: ResumePolicy::default(),
-            connect_timeout_s: 10, exec_timeout_s: 30, envelope_nonce: [0; 24], envelope_ciphertext: vec![],
+            connect_timeout_s: DEFAULT_CONNECT_TIMEOUT, exec_timeout_s: DEFAULT_EXEC_TIMEOUT, envelope_nonce: [0; NONCE_LEN], envelope_ciphertext: vec![],
         };
         self.seal_secrets(&mut p, &secrets)?;
         self.inventory.profiles.push(p);
@@ -201,7 +203,7 @@ impl Vault {
     }
 
     pub fn export_public_key(&self, p: &Profile) -> String {
-        format!("ssh-ed25519 {} ltv:{}", b64(&p.client_public_key), p.name)
+        format!("ssh-ed25519 {} ltv:{}", base64::engine::general_purpose::STANDARD_NO_PAD.encode(&p.client_public_key), p.name)
     }
 
     pub fn authorized_keys_line(&self, p: &Profile) -> String {
@@ -212,25 +214,13 @@ impl Vault {
 
 pub fn ssh_ed25519_blob(pk: &[u8; 32]) -> Vec<u8> {
     let mut b = Vec::new();
-    for part in [&b"ssh-ed25519"[..], pk] {
+    for part in [SSH_KEY_TYPE.as_bytes(), pk.as_slice()] {
         b.extend_from_slice(&(part.len() as u32).to_be_bytes());
         b.extend_from_slice(part);
     }
     b
 }
 
-fn b64(d: &[u8]) -> String {
-    const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::new();
-    for c in d.chunks(3) {
-        let n = (c[0] as u32) << 16 | (*c.get(1).unwrap_or(&0) as u32) << 8 | *c.get(2).unwrap_or(&0) as u32;
-        out.push(T[(n >> 18) as usize & 63] as char);
-        out.push(T[(n >> 12) as usize & 63] as char);
-        out.push(if c.len() > 1 { T[(n >> 6) as usize & 63] as char } else { '=' });
-        out.push(if c.len() > 2 { T[n as usize & 63] as char } else { '=' });
-    }
-    out
-}
 
 #[cfg(all(test, feature = "write"))]
 mod tests {
