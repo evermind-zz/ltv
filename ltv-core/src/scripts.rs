@@ -8,7 +8,8 @@ pub const LTV_MODULES: &str = include_str!("scripts/mkinitfs/ltv.modules");
 pub const LTV_PACKAGES: &str = include_str!("scripts/mkinitfs/ltv.packages");
 pub const LTV_HOOK: &str = include_str!("scripts/mkinitfs/ltv-hook.sh");
 pub const LTV_COMMON: &str = include_str!("scripts/mkinitfs/ltv-common.sh");
-pub const INITRAMFS_PATCH: &str = include_str!("scripts/mkinitfs/initramfs-init.patch");
+pub const LTV_PATCH_INIT: &str = include_str!("scripts/mkinitfs/ltv-patch-init.sh");
+pub const LTV_COMMIT_HOOK: &str = include_str!("scripts/deploy/ltv-commit-hook.sh");
 pub const DEPLOY_SH: &str = include_str!("scripts/deploy/deploy.sh");
 pub const DEPLOY_NOPATCH_SH: &str = include_str!("scripts/deploy/deploy_nopatch.sh");
 pub const CMDLINE_TMPL: &str = include_str!("scripts/cmdline.txt.tmpl");
@@ -38,6 +39,12 @@ pub fn render_deploy_sh(kernel_version: &str) -> String {
 /// Render deploy_nopatch.sh with kernel version.
 pub fn render_deploy_nopatch_sh(kernel_version: &str) -> String {
     DEPLOY_NOPATCH_SH.replace("{kernel_version}", kernel_version)
+}
+
+/// Render ltv-hook.sh with the SSH port for dropbear.
+/// Uses the profile's `port` field (defaults to 22).
+pub fn render_ltv_hook(p: &Profile) -> String {
+    LTV_HOOK.replace("{port}", &p.port.to_string())
 }
 
 #[cfg(test)]
@@ -99,7 +106,6 @@ mod tests {
         let out = render_deploy_sh("6.18.60-0-virt");
         assert!(out.contains("6.18.60-0-virt"));
         assert!(out.contains("virtio base cryptsetup ltv network"));
-        assert!(out.contains("initramfs-init.patch"));
     }
 
     #[test]
@@ -107,6 +113,13 @@ mod tests {
         let out = render_deploy_nopatch_sh("6.18.60-0-virt");
         assert!(out.contains("6.18.60-0-virt"));
         assert!(out.contains("virtio base cryptsetup ltv network"));
-        assert!(!out.contains("initramfs-init.patch"));
+    }
+
+    #[test]
+    fn test_render_ltv_hook() {
+        let p = test_profile();
+        let out = render_ltv_hook(&p);
+        assert!(out.contains("-p 22"));
+        assert!(!out.contains("{port}"));
     }
 }

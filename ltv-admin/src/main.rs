@@ -1,5 +1,5 @@
 use std::{fs, path::PathBuf};
-use ltv_core::{format::Argon2Params, model::{Profile, TargetMeta, ResumePolicy, BootedAccess, BootedAuth, fingerprint_sha256, HostKey}, net::{fetch_host_key, fetch_luks_info, probe, unlock}, vault::Vault, enroll::EnrollEvent, scripts::{render_cmdline, render_deploy_sh, render_deploy_nopatch_sh, LTV_FILES, LTV_MODULES, LTV_PACKAGES, LTV_HOOK, LTV_COMMON, INITRAMFS_PATCH}};
+use ltv_core::{format::Argon2Params, model::{Profile, TargetMeta, ResumePolicy, BootedAccess, BootedAuth, fingerprint_sha256, HostKey}, net::{fetch_host_key, fetch_luks_info, probe, unlock}, vault::Vault, enroll::EnrollEvent, scripts::{render_cmdline, render_deploy_sh, render_deploy_nopatch_sh, render_ltv_hook, LTV_FILES, LTV_MODULES, LTV_PACKAGES, LTV_HOOK, LTV_COMMON, LTV_PATCH_INIT, LTV_COMMIT_HOOK}};
 use std::path::Path;
 use rustyline::{error::ReadlineError, DefaultEditor};
 use secrecy::{ExposeSecret, SecretString, SecretVec};
@@ -160,8 +160,16 @@ async fn cmd_server_setup(st: &mut State, name: &str, args: &[&str]) -> Result<(
     fs::write(deploy_dir.join("ltv-hook.sh"), LTV_HOOK).map_err(|e| e.to_string())?;
     fs::write(deploy_dir.join("ltv-common.sh"), LTV_COMMON).map_err(|e| e.to_string())?;
 
-    // 3. initramfs init patch
-    fs::write(deploy_dir.join("initramfs-init.patch"), INITRAMFS_PATCH).map_err(|e| e.to_string())?;
+    // 3. patch script + commit hook (idempotent re-patch after mkinitfs upgrade)
+    fs::write(deploy_dir.join("ltv-patch-init.sh"), LTV_PATCH_INIT).map_err(|e| e.to_string())?;
+    let mut perms = fs::metadata(deploy_dir.join("ltv-patch-init.sh")).map_err(|e| e.to_string())?.permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(deploy_dir.join("ltv-patch-init.sh"), perms).map_err(|e| e.to_string())?;
+
+    fs::write(deploy_dir.join("ltv-commit-hook.sh"), LTV_COMMIT_HOOK).map_err(|e| e.to_string())?;
+    let mut perms = fs::metadata(deploy_dir.join("ltv-commit-hook.sh")).map_err(|e| e.to_string())?.permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(deploy_dir.join("ltv-commit-hook.sh"), perms).map_err(|e| e.to_string())?;
 
     // 4. authorized_keys (runtime generated from vault)
     let auth_keys = v.authorized_keys_line(&p);

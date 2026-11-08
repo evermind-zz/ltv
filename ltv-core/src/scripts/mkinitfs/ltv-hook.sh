@@ -6,12 +6,6 @@
 
 . /usr/share/mkinitfs/ltv-common.sh
 
-# Create forced-command script for future push-to-stdin unlock
-if [ ! -f /tmp/ltv-unlock.sh ]; then
-	printf '#!/bin/sh\ncryptsetup open --key-file=- "UUID=$1" "$2"\n' > /tmp/ltv-unlock.sh
-	chmod +x /tmp/ltv-unlock.sh
-fi
-
 # Start Dropbear SSH server in background; init must continue to nlplug-findfs
-dropbear -E -p 22 -r /etc/mkinitfs/ltv-stuff/etc/dropbear/dropbear_ed25519_host_key -D /etc/mkinitfs/ltv-stuff/root/.ssh/ &
-
+# Port is configured at deploy time via server-setup (template: {port})
+dropbear -E -p {port} -r /etc/mkinitfs/ltv-stuff/etc/dropbear/dropbear_ed25519_host_key -D /etc/mkinitfs/ltv-stuff/root/.ssh/ &
