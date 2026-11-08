@@ -126,6 +126,51 @@ pub(crate) fn keypair_from_seed(seed: &[u8; 32]) -> Arc<KeyPair> {
     Arc::new(KeyPair::Ed25519(ed25519_dalek::SigningKey::from_bytes(seed)))
 }
 
+/// Stage binary data to a tmpfs file on the remote (umask 077, mkdir -p).
+/// Returns Ok(()) or NetError.
+pub(crate) async fn tmpfs_stage(
+    session: &mut client::Handle<Hk>,
+    path: &str,
+    data: &[u8],
+    timeout: Duration,
+) -> Result<(), NetError> {
+    let cmd = format!("{} '{}'", TMPFS_CREATE, path);
+    exec(session, &cmd, Some(data), timeout).await?;
+    Ok(())
+}
+
+/// Remove tmpfs files on the remote.
+pub(crate) async fn tmpfs_cleanup(
+    session: &mut client::Handle<Hk>,
+    paths: &[&str],
+    timeout: Duration,
+) -> Result<(), NetError> {
+    if paths.is_empty() { return Ok(()); }
+    let cmd = format!("rm -f {}", paths.join(" "));
+    let _ = exec(session, &cmd, None, timeout).await;
+    Ok(())
+}
+
+/// Connect to host:port, verify host key matches `expected`, then authenticate.
+/// Auth methods: "ed25519" with seed, or "password" with SecretString.
+/// Returns authenticated session + presented HostKey.
+pub(crate) async fn connect_and_auth(
+    host: &str,
+    port: u16,
+    connect_timeout: u16,
+    expected_key: Option<HostKey>,
+    username: &str,
+    auth: &BootedAuth,
+) -> Result<(client::Handle<Hk>, HostKey), UnlockError> {
+    let (mut session, presented) = connect(host, port, connect_timeout, expected_key).await?;
+    let ok = match auth {
+        BootedAuth::Password(pw) => session.authenticate_password(username, pw.expose_secret()).await,
+        BootedAuth::Ed25519Seed(seed) => session.authenticate_publickey(username, keypair_from_seed(seed)).await,
+    }.map_err(|e| NetError::Ssh(e.to_string()))?;
+    if !ok { return Err(UnlockError::AuthRejected); }
+    Ok((session, presented))
+}
+
 /// Result of fetching LUKS details from a booted server
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct FetchedLuksInfo {
@@ -146,13 +191,7 @@ pub async fn fetch_luks_info(
 ) -> Result<Vec<FetchedLuksInfo>, UnlockError> {
     let p = vault.profile(uuid)?.clone();
     let os_key = p.os_host_key.clone().ok_or(UnlockError::HostKeyMismatch)?;
-    let (mut s, _) = connect(&p.host, p.port, access.connect_timeout_s, Some(os_key)).await?;
-
-    let ok = match &access.auth {
-        BootedAuth::Password(pw) => s.authenticate_password(&access.username, pw.expose_secret()).await,
-        BootedAuth::Ed25519Seed(seed) => s.authenticate_publickey(&access.username, keypair_from_seed(seed)).await,
-    }.map_err(|e| NetError::Ssh(e.to_string()))?;
-    if !ok { return Err(UnlockError::AuthRejected); }
+    let (mut s, _) = connect_and_auth(&p.host, p.port, access.connect_timeout_s, Some(os_key), &access.username, &access.auth).await?;
 
     let sudo = if access.use_sudo && access.username != "root" { "sudo -n " } else { "" };
     let t = Duration::from_secs(p.exec_timeout_s.max(30) as u64);
@@ -270,22 +309,16 @@ pub async fn unlock(
             .ok_or(VaultError::Invariant("missing keyfile"))?;
 
         // Stage keyfile in tmpfs (binary safe, avoids stdin newline truncation)
-        // Running as root in initramfs, no sudo needed. Create /run/ltv dir first.
-        let cmd = format!("{} {}/key'", TMPFS_CREATE, TMPFS_BASE);
-        if let Some(v) = verbose.as_mut() { v(&cmd); }
-        let r = exec(&mut session, &cmd, Some(&key.keyfile), t).await?;
-        if r.code != 0 {
-            if let Some(v) = verbose.as_mut() { v(&format!("  [unlock] ! cmd={} exit={} stderr: {}", &cmd, r.code, r.stderr.trim())); }
-            return Err(UnlockError::CryptsetupFailed { target: tm.mapped_name.clone(), code: r.code, stderr: r.stderr });
-        }
+        tmpfs_stage(&mut session, TMPFS_KEYFILE, &key.keyfile, t).await?;
+        if let Some(v) = verbose.as_mut() { v(&format!("  [unlock] $ {}", TMPFS_CREATE.replace("sh -c '", "sh -c ").replace("'", ""))); }
 
         // Use tmpfs file for unlock
-        let cmd = format!("cryptsetup luksOpen --key-file=/run/ltv/key UUID={} {}", tm.luks_uuid, tm.mapped_name);
+        let cmd = format!("cryptsetup luksOpen --key-file={} UUID={} {}", TMPFS_KEYFILE, tm.luks_uuid, tm.mapped_name);
         if let Some(v) = verbose.as_mut() { v(&cmd); }
         let mut r = exec(&mut session, &cmd, None, t).await?;
         if r.code != 0 && r.stderr.to_lowercase().contains("not exist") {
             if let Some(fp) = &tm.fallback_path {
-                let cmd = format!("cryptsetup luksOpen --key-file=/run/ltv/key {} {}", fp, tm.mapped_name);
+                let cmd = format!("cryptsetup luksOpen --key-file={} {} {}", TMPFS_KEYFILE, fp, tm.mapped_name);
                 if let Some(v) = verbose.as_mut() { v(&cmd); }
                 r = exec(&mut session, &cmd, None, t).await?;
             }
@@ -301,9 +334,7 @@ pub async fn unlock(
         }
 
         // Cleanup keyfile
-        let cmd = format!("rm -f {}", TMPFS_KEYFILE);
-        if let Some(v) = verbose.as_mut() { v(&cmd); }
-        let _ = exec(&mut session, &cmd, None, t).await;
+        tmpfs_cleanup(&mut session, &[TMPFS_KEYFILE], t).await?;
     }
 
     if let ResumePolicy::Command(c) = &p.resume {

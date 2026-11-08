@@ -111,22 +111,21 @@ pub async fn enroll(
         let key = secrets.keyfiles.iter().find(|k| k.luks_uuid == tm.luks_uuid)
             .ok_or(VaultError::Invariant("missing keyfile"))?;
 
-        // 2. stage existing passphrase AND new key in tmpfs
-        let cmd = format!("{sudo}sh -c 'umask {UMASK_TMPFS} && mkdir -p {TMPFS_BASE} && cat > {TMPFS_PASSFILE}'");
+        // Stage existing passphrase + new key in tmpfs
+        let path = TMPFS_PASSFILE;
+        let cmd = format!("{sudo}sh -c 'umask {UMASK_TMPFS} && mkdir -p {TMPFS_BASE} && cat > {path}'");
         if let Some(verb) = verbose.as_mut() { verb(&cmd); }
         let r = exec(&mut s, &cmd, Some(luks_pass.expose_secret().as_bytes()), t).await?;
-        if r.code != 0 { 
+        if r.code != 0 {
             if let Some(verb) = verbose.as_mut() { verb(&format!("  [enroll] ! cmd={} exit={} stderr: {}", &cmd, r.code, r.stderr.trim())); }
-            return Err(UnlockError::CryptsetupFailed { target: tm.mapped_name.clone(), code: r.code, stderr: r.stderr }); 
+            return Err(UnlockError::CryptsetupFailed { target: tm.mapped_name.clone(), code: r.code, stderr: r.stderr });
         }
-
-        // Write new key to tmpfs (binary safe, avoids stdin newline truncation)
         let cmd = format!("{sudo}sh -c 'umask {UMASK_TMPFS} && cat > {TMPFS_NEWKEYFILE}'");
         if let Some(verb) = verbose.as_mut() { verb(&cmd); }
         let r = exec(&mut s, &cmd, Some(&key.keyfile), t).await?;
-        if r.code != 0 { 
+        if r.code != 0 {
             if let Some(verb) = verbose.as_mut() { verb(&format!("  [enroll] ! cmd={} exit={} stderr: {}", &cmd, r.code, r.stderr.trim())); }
-            return Err(UnlockError::CryptsetupFailed { target: tm.mapped_name.clone(), code: r.code, stderr: r.stderr }); 
+            return Err(UnlockError::CryptsetupFailed { target: tm.mapped_name.clone(), code: r.code, stderr: r.stderr });
         }
 
         // 3. add key using both tmpfs files, 4. always clean up
