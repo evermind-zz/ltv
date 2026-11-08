@@ -1,8 +1,0 @@
-#!/bin/sh
-# initramfs-init.patch: sed script to insert ltv-hook call
-# Run with: sh initramfs-init.patch
-
-INIT=/usr/share/mkinitfs/initramfs-init
-if ! grep -q "ltv-hook" "$INIT"; then
-    sed -i '/^configure_ip/a ### LTV PATCH START ###\n. /lib/mkinitfs/ltv-hook.sh\n### LTV PATCH END ###' "$INIT"
-fi

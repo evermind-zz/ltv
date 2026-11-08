@@ -24,8 +24,15 @@ chmod 600 /etc/mkinitfs/ltv-stuff/etc/dropbear/dropbear_ed25519_host_key
 chmod 644 /etc/mkinitfs/ltv-stuff/etc/dropbear/dropbear_ed25519_host_key.pub
 chmod 600 /etc/mkinitfs/ltv-stuff/root/.ssh/authorized_keys
 
+echo "Installing patch script and commit hook..."
+cp ltv-patch-init.sh /etc/mkinitfs/ltv-stuff/ltv-patch-init.sh
+chmod 755 /etc/mkinitfs/ltv-stuff/ltv-patch-init.sh
+mkdir -p /etc/apk/commit_hooks.d
+cp ltv-commit-hook.sh /etc/apk/commit_hooks.d/ltv-commit-hook.sh
+chmod 755 /etc/apk/commit_hooks.d/ltv-commit-hook.sh
+
 echo "Patching initramfs init script..."
-sh initramfs-init.patch
+sh /etc/mkinitfs/ltv-stuff/ltv-patch-init.sh /usr/share/mkinitfs/initramfs-init
 
 echo "Regenerating initramfs..."
 KERNEL="{kernel_version}"
