@@ -826,6 +826,11 @@ async fn handle_fetch(st: &mut State, parts: &[&str]) -> Result<(), String> {
     println!("\nDiscovered LUKS volumes:");
     for (i, info) in results.iter().enumerate() {
         println!("  [{}] UUID: {}", i, info.luks_uuid);
+        if let Some(mapper) = &info.mapper_name {
+            println!("       Mapper: {} (active)", mapper);
+        } else {
+            println!("       Mapper: (not decrypted)");
+        }
         if verbose {
             println!("       Device: {}", info.device_path);
             println!("       Cipher: {}", info.cipher);
@@ -840,7 +845,13 @@ async fn handle_fetch(st: &mut State, parts: &[&str]) -> Result<(), String> {
     let choice = ask("\nAdd all as targets? [y/N]: ").to_lowercase();
     if choice == "y" {
         for info in results {
-            let mapped = format!("crypt{}", info.luks_uuid.split('-').next().unwrap_or("vol"));
+            // Use existing mapper name if available, otherwise ask user
+            let mapped = if let Some(mapper) = info.mapper_name {
+                mapper
+            } else {
+                let default = format!("crypt{}", info.luks_uuid.split('-').next().unwrap_or("vol"));
+                ask_or(&format!("Mapper name for {}", info.luks_uuid), &default)
+            };
             let meta = TargetMeta {
                 luks_uuid: info.luks_uuid.clone(),
                 fallback_path: Some(info.device_path.clone()),

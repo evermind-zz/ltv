@@ -191,6 +191,7 @@ pub struct FetchedLuksInfo {
     pub cipher: String,
     pub key_size: u32,
     pub header_version: String,
+    pub mapper_name: Option<String>,  // active dm-crypt mapping if decrypted
 }
 
 /// Connect to the booted OS and discover all LUKS volumes.
@@ -227,7 +228,9 @@ pub async fn fetch_luks_info(
         }
     };
 
-    fn find_luks_devices(dev: &Value, results: &mut Vec<(String, String)>) {
+    /// Find LUKS devices and their active mapper (if decrypted)
+    /// Returns (luks_uuid, device_name, mapper_name)
+    fn find_luks_devices(dev: &Value, results: &mut Vec<(String, String, Option<String>)>) {
         if let Some(fstype) = dev.get("fstype").and_then(|v| v.as_str()) {
             if fstype == "crypto_LUKS" {
                 if let (Some(uuid), Some(name)) = (
@@ -235,7 +238,9 @@ pub async fn fetch_luks_info(
                     dev.get("name").and_then(|v| v.as_str()),
                 ) {
                     if !uuid.is_empty() && !name.is_empty() {
-                        results.push((uuid.to_string(), name.to_string()));
+                        // Look for active mapper in children (TYPE="crypt")
+                        let mapper = find_crypt_mapper(dev);
+                        results.push((uuid.to_string(), name.to_string(), mapper));
                     }
                 }
             }
@@ -247,6 +252,23 @@ pub async fn fetch_luks_info(
         }
     }
 
+    fn find_crypt_mapper(dev: &Value) -> Option<String> {
+        if let Some(children) = dev.get("children").and_then(|v| v.as_array()) {
+            for child in children {
+                if let Some(ctype) = child.get("type").and_then(|v| v.as_str()) {
+                    if ctype == "crypt" {
+                        if let Some(name) = child.get("name").and_then(|v| v.as_str()) {
+                            if !name.is_empty() {
+                                return Some(name.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
     let mut luks_devices = Vec::new();
     if let Some(blockdevices) = json.get("blockdevices").and_then(|v| v.as_array()) {
         for dev in blockdevices {
@@ -255,7 +277,7 @@ pub async fn fetch_luks_info(
     }
 
     let mut results = Vec::new();
-    for (uuid, name) in luks_devices {
+    for (uuid, name, mapper) in luks_devices {
         let dev_path = format!("/dev/{}", name);
 
         // Get LUKS details
@@ -281,6 +303,7 @@ pub async fn fetch_luks_info(
                 cipher,
                 key_size,
                 header_version: version,
+                mapper_name: mapper,
             });
         }
     }
