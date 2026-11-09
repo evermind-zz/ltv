@@ -102,9 +102,9 @@ Auth: (p)assword / (k)ey file [k]: k
 Key file [/home/user/.ssh/id_ed25519]: 
 Existing LUKS passphrase: ********
 
- ✓ EnrollEvent::LuksAddKeyStarted { target: "aaaa-bbbb-cccc-dddd" }
- ✓ EnrollEvent::KeySlotAssigned { target: "aaaa-bbbb-cccc-dddd", keyslot: 1 }
- ✓ EnrollEvent::Verified { target: "aaaa-bbbb-cccc-dddd" }
+ ✓ TargetStart("aaaa-bbbb-cccc-dddd")
+ ✓ SlotAdded("aaaa-bbbb-cccc-dddd", 1)
+ ✓ Verified("aaaa-bbbb-cccc-dddd")
 
 enrolled 1 target(s); keyslots recorded. Remember to 'save'.
 ```
@@ -112,10 +112,11 @@ enrolled 1 target(s); keyslots recorded. Remember to 'save'.
 **What happens:**
 1. Connects to **booted OS** via SSH
 2. Stages existing LUKS passphrase in `/run/ltv/pass` (tmpfs)
-3. Runs `cryptsetup luksAddKey /dev/sda2 -` (reads our keyfile from stdin)
-4. Verifies with `cryptsetup open --test-passphrase --key-slot 1 --key-file=-`
-5. Records keyslot 1 in vault
-6. Cleans up tmpfs passphrase
+3. Stages new keyfile in `/run/ltv/newkey` (tmpfs)
+4. Runs `cryptsetup luksAddKey --key-file=/run/ltv/pass --new-keyfile=/run/ltv/newkey --key-slot N <dev>`
+5. Verifies with `cryptsetup open --test-passphrase --key-file=- --key-slot N <dev>`
+6. Records keyslot in vault
+7. Cleans up tmpfs files
 
 ## 5. Remote Unlock (Boot Time)
 

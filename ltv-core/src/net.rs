@@ -127,26 +127,34 @@ pub(crate) fn keypair_from_seed(seed: &[u8; 32]) -> Arc<KeyPair> {
 }
 
 /// Stage binary data to a tmpfs file on the remote (umask 077, mkdir -p).
-/// Returns Ok(()) or NetError.
+/// `sudo` prefix (e.g. "sudo -n ") can be empty. Returns Ok(()) or NetError.
 pub(crate) async fn tmpfs_stage(
     session: &mut client::Handle<Hk>,
     path: &str,
     data: &[u8],
+    sudo: &str,
     timeout: Duration,
 ) -> Result<(), NetError> {
-    let cmd = format!("{} '{}'", TMPFS_CREATE, path);
-    exec(session, &cmd, Some(data), timeout).await?;
+    let cmd = format!("{}sh -c 'umask {UMASK_TMPFS} && mkdir -p {TMPFS_BASE} && cat > {path}'", sudo, path=path);
+    let r = exec(session, &cmd, Some(data), timeout).await?;
+    if r.code != 0 {
+        return Err(NetError::Ssh(format!(
+            "tmpfs stage failed: exit {}: {}", r.code, r.stderr.trim()
+        )));
+    }
     Ok(())
 }
 
 /// Remove tmpfs files on the remote.
+/// `sudo` prefix (e.g. "sudo -n ") can be empty. Best-effort, errors ignored.
 pub(crate) async fn tmpfs_cleanup(
     session: &mut client::Handle<Hk>,
     paths: &[&str],
+    sudo: &str,
     timeout: Duration,
 ) -> Result<(), NetError> {
     if paths.is_empty() { return Ok(()); }
-    let cmd = format!("rm -f {}", paths.join(" "));
+    let cmd = format!("{}rm -f {}", sudo, paths.join(" "));
     let _ = exec(session, &cmd, None, timeout).await;
     Ok(())
 }
@@ -301,6 +309,7 @@ pub async fn unlock(
     on(UnlockEvent::Authenticated);
 
     let t = Duration::from_secs(p.exec_timeout_s as u64);
+    let sudo = ""; // initramfs runs as root, no sudo needed
     let mut targets = p.targets_meta.clone();
     targets.sort_by_key(|x| x.order);
     for tm in &targets {
@@ -309,8 +318,9 @@ pub async fn unlock(
             .ok_or(VaultError::Invariant("missing keyfile"))?;
 
         // Stage keyfile in tmpfs (binary safe, avoids stdin newline truncation)
-        tmpfs_stage(&mut session, TMPFS_KEYFILE, &key.keyfile, t).await?;
-        if let Some(v) = verbose.as_mut() { v(&format!("  [unlock] $ {}", TMPFS_CREATE.replace("sh -c '", "sh -c ").replace("'", ""))); }
+        let stage_cmd = format!("sh -c 'umask {UMASK_TMPFS} && mkdir -p {TMPFS_BASE} && cat > {TMPFS_KEYFILE}'");
+        if let Some(v) = verbose.as_mut() { v(&format!("  [unlock] $ {stage_cmd}")); }
+        tmpfs_stage(&mut session, TMPFS_KEYFILE, &key.keyfile, sudo, t).await?;
 
         // Use tmpfs file for unlock
         let cmd = format!("cryptsetup luksOpen --key-file={} UUID={} {}", TMPFS_KEYFILE, tm.luks_uuid, tm.mapped_name);
@@ -334,7 +344,7 @@ pub async fn unlock(
         }
 
         // Cleanup keyfile
-        tmpfs_cleanup(&mut session, &[TMPFS_KEYFILE], t).await?;
+        tmpfs_cleanup(&mut session, &[TMPFS_KEYFILE], sudo, t).await?;
     }
 
     if let ResumePolicy::Command(c) = &p.resume {

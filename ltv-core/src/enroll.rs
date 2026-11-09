@@ -48,14 +48,13 @@ pub async fn enroll(
 ) -> Result<Vec<EnrollResult>, UnlockError> {
     let p = vault.profile(uuid)?.clone();
     let os_key = p.os_host_key.clone().ok_or(UnlockError::HostKeyMismatch)?;
-    let (mut s, _) = connect(&p.host, p.port, access.connect_timeout_s, Some(os_key)).await?;
-    on(EnrollEvent::Connected);
 
-    let ok = match &access.auth {
-        BootedAuth::Password(pw) => s.authenticate_password(&access.username, pw.expose_secret()).await,
-        BootedAuth::Ed25519Seed(seed) => s.authenticate_publickey(&access.username, keypair_from_seed(seed)).await,
-    }.map_err(|e| NetError::Ssh(e.to_string()))?;
-    if !ok { return Err(UnlockError::AuthRejected); }
+    // Connect and authenticate using the shared helper.
+    let (mut s, _) = connect_and_auth(
+        &p.host, p.port, access.connect_timeout_s,
+        Some(os_key), &access.username, &access.auth,
+    ).await?;
+    on(EnrollEvent::Connected);
     on(EnrollEvent::Authenticated);
 
     let sudo = if access.use_sudo && access.username != "root" { "sudo -n " } else { "" };
@@ -92,12 +91,15 @@ pub async fn enroll(
             on(EnrollEvent::Skipped(tm.mapped_name.clone(), format!("not a LUKS device: {}", r.stderr.trim())));
             continue;
         }
-        // 1. pick slot
+
+        // 1. pick slot: dump LUKS header
         let cmd = format!("{sudo}cryptsetup luksDump {dev}");
         if let Some(verb) = verbose.as_mut() { verb(&cmd); }
         let dump = exec(&mut s, &cmd, None, t).await?;
         if dump.code != 0 {
             if let Some(verb) = verbose.as_mut() { verb(&format!("  [enroll] ! cmd={} exit={} stderr: {}", &cmd, dump.code, dump.stderr.trim())); }
+            on(EnrollEvent::Skipped(tm.mapped_name.clone(), format!("luksDump failed: {}", dump.stderr.trim())));
+            continue;
         }
         let used = parse_used_slots(&dump.stdout);
         let slot = match tm.keyslot {
@@ -111,30 +113,36 @@ pub async fn enroll(
         let key = secrets.keyfiles.iter().find(|k| k.luks_uuid == tm.luks_uuid)
             .ok_or(VaultError::Invariant("missing keyfile"))?;
 
-        // Stage existing passphrase + new key in tmpfs
-        let path = TMPFS_PASSFILE;
-        let cmd = format!("{sudo}sh -c 'umask {UMASK_TMPFS} && mkdir -p {TMPFS_BASE} && cat > {path}'");
-        if let Some(verb) = verbose.as_mut() { verb(&cmd); }
-        let r = exec(&mut s, &cmd, Some(luks_pass.expose_secret().as_bytes()), t).await?;
-        if r.code != 0 {
-            if let Some(verb) = verbose.as_mut() { verb(&format!("  [enroll] ! cmd={} exit={} stderr: {}", &cmd, r.code, r.stderr.trim())); }
-            return Err(UnlockError::CryptsetupFailed { target: tm.mapped_name.clone(), code: r.code, stderr: r.stderr });
-        }
-        let cmd = format!("{sudo}sh -c 'umask {UMASK_TMPFS} && cat > {TMPFS_NEWKEYFILE}'");
-        if let Some(verb) = verbose.as_mut() { verb(&cmd); }
-        let r = exec(&mut s, &cmd, Some(&key.keyfile), t).await?;
-        if r.code != 0 {
-            if let Some(verb) = verbose.as_mut() { verb(&format!("  [enroll] ! cmd={} exit={} stderr: {}", &cmd, r.code, r.stderr.trim())); }
-            return Err(UnlockError::CryptsetupFailed { target: tm.mapped_name.clone(), code: r.code, stderr: r.stderr });
-        }
+        // 2. stage existing passphrase in tmpfs
+        let stage_pass_cmd = format!("{sudo}sh -c 'umask {UMASK_TMPFS} && mkdir -p {TMPFS_BASE} && cat > {TMPFS_PASSFILE}'");
+        if let Some(verb) = verbose.as_mut() { verb(&stage_pass_cmd); }
+        tmpfs_stage(&mut s, TMPFS_PASSFILE, luks_pass.expose_secret().as_bytes(), sudo, t).await
+            .map_err(|e| UnlockError::CryptsetupFailed {
+                target: tm.mapped_name.clone(),
+                code: 0,
+                stderr: format!("stage passphrase: {e}"),
+            })?;
 
-        // 3. add key using both tmpfs files, 4. always clean up
-        let cmd = format!("{sudo}cryptsetup luksAddKey --key-file=/run/ltv/pass --new-keyfile=/run/ltv/newkey --key-slot {slot} {dev}");
+        // 3. stage new key in tmpfs
+        let stage_key_cmd = format!("{sudo}sh -c 'umask {UMASK_TMPFS} && cat > {TMPFS_NEWKEYFILE}'");
+        if let Some(verb) = verbose.as_mut() { verb(&stage_key_cmd); }
+        tmpfs_stage(&mut s, TMPFS_NEWKEYFILE, &key.keyfile, sudo, t).await
+            .map_err(|e| UnlockError::CryptsetupFailed {
+                target: tm.mapped_name.clone(),
+                code: 0,
+                stderr: format!("stage keyfile: {e}"),
+            })?;
+
+        // 4. add key using both tmpfs files
+        let cmd = format!("{sudo}cryptsetup luksAddKey --key-file={TMPFS_PASSFILE} --new-keyfile={TMPFS_NEWKEYFILE} --key-slot {slot} {dev}");
         if let Some(verb) = verbose.as_mut() { verb(&cmd); }
         let add = exec(&mut s, &cmd, None, t).await;
-        let cmd = format!("{sudo}rm -f {TMPFS_PASSFILE} {TMPFS_NEWKEYFILE}");
-        if let Some(verb) = verbose.as_mut() { verb(&cmd); }
-        let _ = exec(&mut s, &cmd, None, t).await;
+
+        // 5. always clean up tmpfs
+        let cleanup_cmd = format!("{sudo}rm -f {TMPFS_PASSFILE} {TMPFS_NEWKEYFILE}");
+        if let Some(verb) = verbose.as_mut() { verb(&cleanup_cmd); }
+        let _ = tmpfs_cleanup(&mut s, &[TMPFS_PASSFILE, TMPFS_NEWKEYFILE], sudo, t).await;
+
         let add = add?;
         if add.code != 0 {
             if let Some(verb) = verbose.as_mut() { verb(&format!("  [enroll] ! cmd={} exit={} stderr: {}", &cmd, add.code, add.stderr.trim())); }
@@ -145,7 +153,7 @@ pub async fn enroll(
             c => return Err(UnlockError::CryptsetupFailed { target: tm.mapped_name.clone(), code: c, stderr: add.stderr }),
         }
 
-        // 5. verify with the new key itself (--test-passphrase doesn't open the device)
+        // 6. verify with the new key itself (--test-passphrase doesn't open the device)
         let cmd = format!("{sudo}cryptsetup open --test-passphrase --key-file=- --key-slot {slot} {dev}");
         if let Some(verb) = verbose.as_mut() { verb(&cmd); }
         let verify = exec(&mut s, &cmd, Some(&key.keyfile), t).await?;

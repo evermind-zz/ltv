@@ -60,7 +60,7 @@ error: initramfs host key not pinned. Run 'hostkey fetch <profile>' first.
 ### 6. Enroll Fails: "KeyRejected"
 
 ```bash
- ✓ EnrollEvent::LuksAddKeyStarted { target: "aaaa-bbbb-cccc-dddd" }
+ ✓ TargetStart("aaaa-bbbb-cccc-dddd")
 error: KeyRejected: existing passphrase wrong
 ```
 

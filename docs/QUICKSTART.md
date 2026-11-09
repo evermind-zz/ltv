@@ -81,9 +81,9 @@ Auth: (p)assword / (k)ey file [k]: k
 Key file [/home/user/.ssh/id_ed25519]: 
 Existing LUKS passphrase: ********
 
- ✓ EnrollEvent::LuksAddKeyStarted { target: "aaaa-bbbb-cccc-dddd" }
- ✓ EnrollEvent::KeySlotAssigned { target: "aaaa-bbbb-cccc-dddd", keyslot: 1 }
- ✓ EnrollEvent::Verified { target: "aaaa-bbbb-cccc-dddd" }
+  ✓ TargetStart("aaaa-bbbb-cccc-dddd")
+  ✓ SlotAdded("aaaa-bbbb-cccc-dddd", 1)
+  ✓ Verified("aaaa-bbbb-cccc-dddd")
 enrolled 1 target(s); keyslots recorded. Remember to 'save'.
 ```
 
