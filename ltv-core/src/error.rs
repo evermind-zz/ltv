@@ -23,11 +23,30 @@ pub enum NetError {
     #[error("timeout")] Timeout,
 }
 
+#[derive(Debug, Clone)]
+pub struct HostKeyMismatchError {
+    pub expected: crate::model::HostKey,
+    pub actual: crate::model::HostKey,
+}
+
+impl std::fmt::Display for HostKeyMismatchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "host key mismatch\n  expected: {} {}\n  actual:   {} {}",
+            self.expected.key_type,
+            crate::model::fingerprint_sha256(&self.expected.key_bytes),
+            self.actual.key_type,
+            crate::model::fingerprint_sha256(&self.actual.key_bytes))
+    }
+}
+
+impl std::error::Error for HostKeyMismatchError {}
+
 #[derive(Debug, Error)]
 pub enum UnlockError {
     #[error(transparent)] Vault(#[from] VaultError),
     #[error(transparent)] Net(#[from] NetError),
-    #[error("host key mismatch")] HostKeyMismatch,
+    #[error(transparent)] HostKeyMismatch(#[from] HostKeyMismatchError),
+    #[error("host key not pinned")] HostKeyNotPinned,
     #[error("server already booted into OS")] StateBootedOs,
     #[error("authentication rejected")] AuthRejected,
     #[error("key rejected for target {0}")] KeyRejected(String),

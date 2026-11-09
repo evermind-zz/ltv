@@ -53,7 +53,7 @@ pub(crate) async fn connect(host: &str, port: u16, connect_s: u16, expected: Opt
     -> Result<(client::Handle<Hk>, HostKey), UnlockError>
 {
     let seen: Seen = Arc::new(Mutex::new(None));
-    let h = Hk { expected, seen: seen.clone() };
+    let h = Hk { expected: expected.clone(), seen: seen.clone() };
     let fut = client::connect(cfg(connect_s), (host, port), h);
     let res = timeout(Duration::from_secs(connect_s as u64), fut).await
         .map_err(|_| NetError::Timeout)?;
@@ -61,7 +61,11 @@ pub(crate) async fn connect(host: &str, port: u16, connect_s: u16, expected: Opt
     match res {
         Ok(s) => Ok((s, presented.expect("key seen on successful kex"))),
         // russh returns UnknownKey when check_server_key said false
-        Err(russh::Error::UnknownKey) => Err(UnlockError::HostKeyMismatch),
+        Err(russh::Error::UnknownKey) => {
+            let actual = presented.expect("key seen during kex");
+            let expected = expected.expect("expected key required for mismatch");
+            Err(UnlockError::HostKeyMismatch(HostKeyMismatchError { expected, actual }))
+        }
         Err(e) => Err(NetError::Connect(e.to_string()).into()),
     }
 }
@@ -198,7 +202,7 @@ pub async fn fetch_luks_info(
     mut verbose: Option<Box<dyn FnMut(&str) + Send>>,
 ) -> Result<Vec<FetchedLuksInfo>, UnlockError> {
     let p = vault.profile(uuid)?.clone();
-    let os_key = p.os_host_key.clone().ok_or(UnlockError::HostKeyMismatch)?;
+    let os_key = p.os_host_key.clone().ok_or(UnlockError::HostKeyNotPinned)?;
     let (mut s, _) = connect_and_auth(&p.host, p.port, access.connect_timeout_s, Some(os_key), &access.username, &access.auth).await?;
 
     let sudo = if access.use_sudo && access.username != "root" { "sudo -n " } else { "" };
@@ -290,15 +294,22 @@ pub async fn unlock(
     mut verbose: Option<Box<dyn FnMut(&str) + Send>>,
 ) -> Result<(), UnlockError> {
     let p = vault.profile(uuid)?.clone();
-    let expected = p.initramfs_host_key.clone().ok_or(UnlockError::HostKeyMismatch)?;
+    let expected = p.initramfs_host_key.clone().ok_or(UnlockError::HostKeyNotPinned)?;
     on(UnlockEvent::Connecting);
 
-    let (mut session, _) = match connect(&p.host, p.port, p.connect_timeout_s, Some(expected)).await {
-        Err(UnlockError::HostKeyMismatch) => {
+    let connect_result = connect(&p.host, p.port, p.connect_timeout_s, Some(expected)).await;
+    let (mut session, _) = match connect_result {
+        Ok(r) => r,
+        Err(UnlockError::HostKeyMismatch(e)) => {
             // distinguish "booted OS" from real mismatch via a probe (no verbose needed for this quick check)
-            return Err(match probe(&p, None).await { ProbeResult::BootedOs => UnlockError::StateBootedOs, _ => UnlockError::HostKeyMismatch });
+            let probe_result = probe(&p, None).await;
+            if matches!(probe_result, ProbeResult::BootedOs) {
+                return Err(UnlockError::StateBootedOs);
+            } else {
+                return Err(UnlockError::HostKeyMismatch(e));
+            }
         }
-        r => r?,
+        Err(e) => return Err(e),
     };
     on(UnlockEvent::HostKeyVerified);
 

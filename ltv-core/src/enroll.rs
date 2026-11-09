@@ -81,7 +81,7 @@ pub async fn enroll(
     mut verbose: Option<Box<dyn FnMut(&str) + Send>>,
 ) -> Result<Vec<EnrollResult>, UnlockError> {
     let p = vault.profile(uuid)?.clone();
-    let os_key = p.os_host_key.clone().ok_or(UnlockError::HostKeyMismatch)?;
+    let os_key = p.os_host_key.clone().ok_or(UnlockError::HostKeyNotPinned)?;
 
     // Connect and authenticate using the shared helper.
     let (mut s, _) = connect_and_auth(
