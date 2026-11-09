@@ -112,13 +112,13 @@ impl Vault {
         Ok(idx)
     }
 
-    pub fn add_profile(&mut self, name: &str, host: &str, port: u16, username: &str) -> Result<[u8; 16], VaultError> {
+    pub fn add_profile(&mut self, name: &str, host: &str, port: u16, username: &str, os_host: Option<String>, os_port: Option<u16>) -> Result<[u8; 16], VaultError> {
         let uuid = *uuid::Uuid::new_v4().as_bytes();
         let signing = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
         let pubblob = ssh_ed25519_blob(signing.verifying_key().as_bytes());
         let secrets = SecretPayload { client_private_seed: signing.to_bytes(), keyfiles: vec![] };
         let mut p = Profile {
-            uuid, name: name.into(), notes: String::new(), host: host.into(), port, username: username.into(),
+            uuid, name: name.into(), notes: String::new(), host: host.into(), port, os_host, os_port, username: username.into(),
             initramfs_host_key: None, os_host_key: None, host_key_pinned_at: 0,
             client_public_key: pubblob, targets_meta: vec![], resume: ResumePolicy::default(),
             connect_timeout_s: DEFAULT_CONNECT_TIMEOUT, exec_timeout_s: DEFAULT_EXEC_TIMEOUT, envelope_nonce: [0; NONCE_LEN], envelope_ciphertext: vec![],
@@ -261,7 +261,7 @@ mod tests {
 
     fn sample() -> (Vault, [u8; 16]) {
         let mut v = Vault::create(&pw("hunter2"), fast()).unwrap();
-        let u = v.add_profile("web01", "192.0.2.10", 22, "root").unwrap();
+        let u = v.add_profile("web01", "192.0.2.10", 22, "root", None, None).unwrap();
         v.add_target(&u, TargetMeta { luks_uuid: "aaaa-1".into(), fallback_path: Some("/dev/sda2".into()),
             mapped_name: "cryptroot".into(), order: 0, keyslot: None, token_id: None }, None).unwrap();
         (v, u)

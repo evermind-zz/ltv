@@ -47,10 +47,14 @@ fn resolve<'a>(v: &'a Vault, name: &str) -> Result<&'a Profile, String> {
 fn cmd_add(st: &mut State) -> Result<(), String> {
     let v = st.vault.as_mut().ok_or("no vault open")?;
     let name = ask("Profile name: ");
-    let host = ask("Host (IP/DNS): ");
-    let port: u16 = ask_or("Port", "22").parse().map_err(|_| "bad port")?;
+    let host = ask("Initramfs host (IP/DNS): ");
+    let port: u16 = ask_or("Initramfs port", "22").parse().map_err(|_| "bad port")?;
+    let os_host = ask("OS host (IP/DNS, blank = same as initramfs): ");
+    let os_port_str = ask("OS port (blank = same as initramfs): ");
+    let os_host = if os_host.is_empty() { None } else { Some(os_host) };
+    let os_port = if os_port_str.is_empty() { None } else { Some(os_port_str.parse().map_err(|_| "bad OS port")?) };
     let user = ask_or("Username", "root");
-    let uuid = v.add_profile(&name, &host, port, &user).map_err(|e| e.to_string())?;
+    let uuid = v.add_profile(&name, &host, port, &user, os_host, os_port).map_err(|e| e.to_string())?;
     loop {
         let luks_uuid = ask("LUKS UUID (blank = done): ");
         if luks_uuid.is_empty() { break; }
@@ -418,7 +422,12 @@ fn handle_status(st: &State) -> Result<(), String> {
 
 fn handle_ls(st: &State) -> Result<(), String> {
     for p in &st.vault.as_ref().ok_or("no vault open")?.inventory.profiles {
-        println!("{:<16} {:<24} targets={} hostkey={}", p.name, format!("{}:{}", p.host, p.port),
+        let os_note = match (&p.os_host, p.os_port) {
+            (Some(h), Some(pt)) => format!(" os={}:{}", h, pt),
+            (Some(h), None) => format!(" os={}", h),
+            _ => String::new(),
+        };
+        println!("{:<16} {:<24}{} targets={} hostkey={}", p.name, format!("{}:{}", p.host, p.port), os_note,
                  p.targets_meta.len(), if p.initramfs_host_key.is_some() { "pinned" } else { "MISSING" });
     }
     Ok(())
@@ -432,8 +441,14 @@ fn handle_show(st: &State, parts: &[&str]) -> Result<(), String> {
     if matches.free.is_empty() { return Err("Usage: show <profile>".into()); }
     let n = &matches.free[0];
     let v = st.vault.as_ref().ok_or("no vault open")?; let p = resolve(v, n)?;
-    println!("name: {}\nhost: {}:{} user {}\nuuid: {}", p.name, p.host, p.port, p.username, uuid::Uuid::from_bytes(p.uuid));
+    let os_addr = match (&p.os_host, p.os_port) {
+        (Some(h), Some(pt)) => format!("{}:{}", h, pt),
+        (Some(h), None) => format!("{}:{}", h, p.port),
+        _ => "same as initramfs".to_string(),
+    };
+    println!("name: {}\ninitramfs: {}:{} user {}\nos: {}\nuuid: {}", p.name, p.host, p.port, p.username, os_addr, uuid::Uuid::from_bytes(p.uuid));
     if let Some(k) = &p.initramfs_host_key { println!("initramfs hostkey: {} {}", k.key_type, fingerprint_sha256(&k.key_bytes)); }
+    if let Some(k) = &p.os_host_key { println!("os hostkey: {} {}", k.key_type, fingerprint_sha256(&k.key_bytes)); }
     for t in &p.targets_meta { 
         let fallback = t.fallback_path.as_deref().unwrap_or("none");
         println!("  target {} UUID={} fallback={} slot={:?}", t.mapped_name, t.luks_uuid, fallback, t.keyslot); 
@@ -473,6 +488,8 @@ fn handle_edit(st: &mut State, parts: &[&str]) -> Result<(), String> {
                 "name" => { p.name = v.into(); changed = true; }
                 "host" => { p.host = v.into(); changed = true; }
                 "port" => { p.port = v.parse().map_err(|_| "bad port")?; changed = true; }
+                "os_host" => { p.os_host = if v.is_empty() { None } else { Some(v.into()) }; changed = true; }
+                "os_port" => { p.os_port = if v.is_empty() { None } else { Some(v.parse().map_err(|_| "bad OS port")?) }; changed = true; }
                 "user" | "username" => { p.username = v.into(); changed = true; }
                 "notes" => { p.notes = v.into(); changed = true; }
                 "connect_timeout" => { p.connect_timeout_s = v.parse().map_err(|_| "bad timeout")?; changed = true; }
@@ -826,8 +843,8 @@ async fn handle_copy_profile(st: &mut State, parts: &[&str]) -> Result<(), Strin
         return Err(format!("profile '{}' already exists in destination vault", dest_name));
     }
     
-    // Add profile to destination vault
-    let new_uuid = v.add_profile(&dest_name, &src_profile.host, src_profile.port, &src_profile.username).map_err(|e| e.to_string())?;
+    // Add profile to destination vault (with same OS address as source)
+    let new_uuid = v.add_profile(&dest_name, &src_profile.host, src_profile.port, &src_profile.username, src_profile.os_host.clone(), src_profile.os_port).map_err(|e| e.to_string())?;
     
     if keep {
         // Keep client keypair and host keys - identical copy

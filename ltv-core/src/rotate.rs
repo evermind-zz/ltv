@@ -2,7 +2,7 @@ use std::time::Duration;
 use secrecy::{ExposeSecret, SecretString};
 use russh::client;
 use rand::RngCore;
-use crate::{constants::*, error::*, model::BootedAccess, model::BootedAuth, net::*, vault::Vault};
+use crate::{constants::*, error::*, model::BootedAccess, net::*, vault::Vault};
 use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
@@ -86,9 +86,13 @@ pub async fn rotate_key(
     let p = vault.profile(uuid)?.clone();
     let os_key = p.os_host_key.clone().ok_or(UnlockError::HostKeyNotPinned)?;
 
+    // Resolve OS address (fallback to initramfs address if not set)
+    let os_host = p.os_host.as_deref().unwrap_or(&p.host);
+    let os_port = p.os_port.unwrap_or(p.port);
+
     // Connect and authenticate using the shared helper.
     let (mut s, _) = connect_and_auth(
-        &p.host, p.port, access.connect_timeout_s,
+        os_host, os_port, access.connect_timeout_s,
         Some(os_key), &access.username, &access.auth,
     ).await?;
     on(RotateEvent::Connected);

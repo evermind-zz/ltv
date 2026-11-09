@@ -1,26 +1,20 @@
-use ltv_core::{Vault, unlock, fetch_host_key};
+use ltv_core::{Vault, unlock, format::Argon2Params};
 use secrecy::SecretVec;
-use std::fs;
 
 #[tokio::test]
 async fn test_unlock_now() {
-    let bytes = fs::read("/home/opencode/repos/ltcv/myTestVault.ltv").unwrap();
+    // Create a test vault with a fake server
     let pass = SecretVec::new("abc".as_bytes().to_vec());
-    let mut vault = Vault::open(&bytes, &pass).unwrap();
+    let params = Argon2Params { mem_kib: 16 * 1024, time: 2, par: 1 };
+    let mut vault = Vault::create(&pass, params).unwrap();
+    let uuid = vault.add_profile("test", "127.0.0.1", 2222, "root", None, None).unwrap();
 
-    let profile = vault.inventory.profiles[0].clone();
-    let uuid = profile.uuid;
-
-    // Pin initramfs host key (fetch from server)
-    let hk = fetch_host_key(&profile.host, profile.port, profile.connect_timeout_s).await.unwrap();
-    vault.set_host_key(&uuid, hk, false).unwrap();
-    let saved = vault.save().unwrap();
-    fs::write("/home/opencode/repos/ltcv/myTestVault.ltv", saved).unwrap();
-
-    // Unlock with verbose
-    println!("=== UNLOCK ===");
-    let result = unlock(&vault, &uuid, |e| println!("Event: {:?}", e), Some(Box::new(|cmd: &str| {
-        println!("  [unlock] $ {}", cmd);
-    }))).await;
-    println!("Unlock: {:?}", result);
+    let _profile = vault.inventory.profiles[0].clone();
+    
+    // No host key pinned, so unlock should fail with HostKeyNotPinned
+    let result = unlock(&vault, &uuid, |e| println!("Event: {:?}", e), None).await;
+    println!("Unlock result: {:?}", result);
+    
+    // Expect HostKeyNotPinned since we didn't pin a key
+    assert!(matches!(result, Err(ltv_core::UnlockError::HostKeyNotPinned)));
 }

@@ -10,7 +10,7 @@ fn test_local_commands() {
     println!("\n=== 1. CREATE ===");
     let pass = SecretVec::new("testpass".as_bytes().to_vec());
     let mut vault = Vault::create(&pass, Argon2Params::default()).unwrap();
-    let uuid = vault.add_profile("testprofile", "192.0.2.100", 22, "root").unwrap();
+    let uuid = vault.add_profile("testprofile", "192.0.2.100", 22, "root", None, None).unwrap();
     println!("Created vault with profile: {}", uuid::Uuid::from_bytes(uuid));
     
     // Add targets

@@ -204,7 +204,12 @@ pub async fn fetch_luks_info(
 ) -> Result<Vec<FetchedLuksInfo>, UnlockError> {
     let p = vault.profile(uuid)?.clone();
     let os_key = p.os_host_key.clone().ok_or(UnlockError::HostKeyNotPinned)?;
-    let (mut s, _) = connect_and_auth(&p.host, p.port, access.connect_timeout_s, Some(os_key), &access.username, &access.auth).await?;
+
+    // Resolve OS address (fallback to initramfs address if not set)
+    let os_host = p.os_host.as_deref().unwrap_or(&p.host);
+    let os_port = p.os_port.unwrap_or(p.port);
+
+    let (mut s, _) = connect_and_auth(os_host, os_port, access.connect_timeout_s, Some(os_key), &access.username, &access.auth).await?;
 
     let sudo = if access.use_sudo && access.username != "root" { "sudo -n " } else { "" };
     let t = Duration::from_secs(p.exec_timeout_s.max(30) as u64);

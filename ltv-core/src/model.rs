@@ -15,8 +15,12 @@ pub struct Profile {
     pub uuid: [u8; 16],
     pub name: String,
     pub notes: String,
+    /// Initramfs (Dropbear) SSH address
     pub host: String,
     pub port: u16,
+    /// Boote OS SSH address (falls back to `host`/`port` if None)
+    pub os_host: Option<String>,
+    pub os_port: Option<u16>,
     pub username: String,
     pub initramfs_host_key: Option<HostKey>,
     pub os_host_key: Option<HostKey>,
