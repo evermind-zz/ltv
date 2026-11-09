@@ -7,7 +7,7 @@ use std::collections::HashMap;
 #[derive(Debug, Clone)]
 pub enum EnrollEvent {
     Connected, Authenticated,
-    TargetStart(String), SlotChosen(String, u8), SlotAdded(String, u8), Verified(String),
+    TargetStart(String), SlotChosen(String, u8), SlotAdded(String, u8), SlotUpdated(String, u8), Verified(String),
     Skipped(String, String),
     Done,
 }
@@ -134,7 +134,7 @@ pub async fn enroll(
         // 1. Check if our key is already enrolled in any slot
         if let Some(existing_slot) = find_existing_slot(&mut s, &dev, &key.keyfile, sudo, t, &mut verbose).await? {
             on(EnrollEvent::SlotChosen(tm.mapped_name.clone(), existing_slot));
-            on(EnrollEvent::SlotAdded(tm.mapped_name.clone(), existing_slot));
+            on(EnrollEvent::SlotUpdated(tm.mapped_name.clone(), existing_slot));
             on(EnrollEvent::Verified(tm.mapped_name.clone()));
             results.push(EnrollResult { luks_uuid: tm.luks_uuid.clone(), keyslot: existing_slot });
             continue;

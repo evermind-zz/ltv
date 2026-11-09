@@ -74,7 +74,7 @@ error: KeyRejected: existing passphrase wrong
 - Verify passphrase with `cryptsetup open --test-passphrase /dev/sda2`
 - Check free slots: `cryptsetup luksDump /dev/sda2 | grep "Key Slot"`
 
-**Note:** `enroll` now pre-checks if your keyfile is already enrolled by testing each slot with `--test-passphrase`. If already enrolled, it will show `SlotChosen`/`SlotAdded`/`Verified` for that target without prompting for a passphrase.
+**Note:** `enroll` now pre-checks if your keyfile is already enrolled by testing each slot with `--test-passphrase`. If already enrolled, it will show `SlotChosen`/`SlotUpdated`/`Verified` for that target without prompting for a passphrase.
 
 ### 7. Unlock Fails: "TargetFailed"
 
