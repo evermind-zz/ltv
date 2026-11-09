@@ -620,9 +620,51 @@ async fn handle_enroll(st: &mut State, parts: &[&str]) -> Result<(), String> {
         }
     };
     let access = BootedAccess { use_sudo: username != "root", username, auth, connect_timeout_s: p.connect_timeout_s };
-    let luks_pass = SecretString::new(rpassword::prompt_password("Existing LUKS passphrase: ").unwrap_or_default());
 
-    let results = ltv_core::enroll(v, &p.uuid, &access, &luks_pass, only.as_deref(), |e| {
+    // Filter targets based on --target
+    let targets: Vec<_> = p.targets_meta.iter()
+        .filter(|tm| only.as_ref().map_or(true, |f| f == &tm.luks_uuid || f == &tm.mapped_name))
+        .cloned()
+        .collect();
+    
+    if targets.is_empty() {
+        return Err(format!("no targets match filter '{}'", only.unwrap()));
+    }
+
+    // Ask if all targets use the same LUKS passphrase
+    let same_passphrase = if targets.len() > 1 {
+        ask("Do all targets use the same LUKS passphrase? [Y/n]: ").to_lowercase() != "n"
+    } else {
+        true
+    };
+
+    // Collect passphrases
+    let mut passphrases: std::collections::HashMap<String, SecretString> = std::collections::HashMap::new();
+    
+    if same_passphrase {
+        let pass = loop {
+            let p = rpassword::prompt_password("Existing LUKS passphrase (for all targets): ").unwrap_or_default();
+            if !p.is_empty() { break SecretString::new(p); }
+            println!("Passphrase cannot be empty.");
+        };
+        for tm in &targets {
+            passphrases.insert(tm.luks_uuid.clone(), pass.clone());
+        }
+    } else {
+        for tm in &targets {
+            let pass = loop {
+                let prompt = format!("Existing LUKS passphrase for {} ({}): ", tm.mapped_name, tm.luks_uuid);
+                let p = rpassword::prompt_password(&prompt).unwrap_or_default();
+                if !p.is_empty() { break SecretString::new(p); }
+                println!("Passphrase cannot be empty.");
+            };
+            passphrases.insert(tm.luks_uuid.clone(), pass);
+        }
+    }
+
+    let results = ltv_core::enroll(v, &p.uuid, &access, |luks_uuid| {
+        passphrases.get(luks_uuid).cloned().ok_or_else(|| format!("no passphrase for {}", luks_uuid))
+    }, only.as_deref(), |e| {
         match e {
             EnrollEvent::Skipped(t, why) => println!(" ! {t}: skipped ({why})"),
             other if !verbose => println!(" ✓ {other:?}"),
