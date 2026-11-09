@@ -222,6 +222,15 @@ impl Vault {
         Ok(())
     }
 
+    /// Replace the sealed secrets for a profile (client key + keyfiles)
+    pub fn set_secrets(&mut self, uuid: &[u8; 16], secrets: &SecretPayload) -> Result<(), VaultError> {
+        let mut p = self.profile(uuid)?.clone();
+        self.seal_secrets(&mut p, secrets)?;
+        *self.profile_mut(uuid)? = p;
+        self.dirty = true;
+        Ok(())
+    }
+
     pub fn export_public_key(&self, p: &Profile) -> String {
         format!("ssh-ed25519 {} ltv:{}", base64::engine::general_purpose::STANDARD_NO_PAD.encode(&p.client_public_key), p.name)
     }

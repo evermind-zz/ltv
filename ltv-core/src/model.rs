@@ -57,7 +57,7 @@ pub struct SecretPayload {
     pub keyfiles: Vec<TargetKey>,
 }
 
-#[derive(Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
+#[derive(Serialize, Deserialize, Zeroize, ZeroizeOnDrop, Clone)]
 pub struct TargetKey { pub luks_uuid: String, pub keyfile: Vec<u8> }
 
 pub fn fingerprint_sha256(blob: &[u8]) -> String {

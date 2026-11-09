@@ -1,10 +1,11 @@
 use std::{fs, path::PathBuf};
-use ltv_core::{format::Argon2Params, model::{Profile, TargetMeta, ResumePolicy, BootedAccess, BootedAuth, fingerprint_sha256, HostKey}, net::{fetch_host_key, fetch_luks_info, probe, unlock}, vault::Vault, enroll::EnrollEvent, rotate::RotateEvent, scripts::{render_cmdline, render_deploy_sh, render_deploy_nopatch_sh, LTV_FILES, LTV_MODULES, LTV_PACKAGES, LTV_HOOK, LTV_COMMON, LTV_PATCH_INIT, LTV_COMMIT_HOOK}};
+use ltv_core::{format::Argon2Params, model::{Profile, TargetMeta, ResumePolicy, BootedAccess, BootedAuth, fingerprint_sha256, HostKey, SecretPayload}, net::{fetch_host_key, fetch_luks_info, probe, unlock}, vault::{Vault, ssh_ed25519_blob}, enroll::EnrollEvent, rotate::RotateEvent, scripts::{render_cmdline, render_deploy_sh, render_deploy_nopatch_sh, LTV_FILES, LTV_MODULES, LTV_PACKAGES, LTV_HOOK, LTV_COMMON, LTV_PATCH_INIT, LTV_COMMIT_HOOK}};
 use std::path::Path;
 use rustyline::{error::ReadlineError, DefaultEditor};
 use secrecy::{ExposeSecret, SecretString, SecretVec};
 use getopts::Options;
 use base64::Engine;
+use ed25519_dalek::SigningKey;
 
 struct State { 
     path: Option<PathBuf>, 
@@ -313,6 +314,7 @@ async fn handle_command(st: &mut State, parts: &[&str]) -> Result<bool, String> 
         "import-profile" => println!("import-profile: not yet implemented"),
         "export-profile" => println!("export-profile: not yet implemented"),
         "rotate-key" => handle_rotate(st, parts).await?,
+        "copy-profile" => handle_copy_profile(st, parts).await?,
         _ => return Err(format!("unknown command: {}. Type 'help' for list.", parts[0])),
     }
     Ok(false)
@@ -346,6 +348,8 @@ fn print_help() {
                                  Generate mkinitfs deployment artifacts for remote unlock
   passwd                         Change VAULT master passphrase (re-encrypts vault, not LUKS)
   backup <path>                  Create timestamped encrypted vault copy
+  copy-profile <src> <prof> [--name <n>]
+                                  Copy profile from another vault (new client key, same keyfiles)
   import-profile                 Import profile from another vault
   export-profile <profile> <dir> Export profile to directory
   verbose [on|off|toggle]        Toggle verbose output for enroll/fetch/unlock/probe
@@ -784,6 +788,71 @@ async fn handle_rotate(st: &mut State, parts: &[&str]) -> Result<(), String> {
     }, if verbose { Some(Box::new(|cmd: &str| println!("  [rotate] $ {cmd}")) as Box<dyn FnMut(&str) + Send>) } else { None }).await.map_err(|e| e.to_string())?;
 
     println!("rotated {} target(s); vault auto-saved.", results.len());
+    Ok(())
+}
+
+async fn handle_copy_profile(st: &mut State, parts: &[&str]) -> Result<(), String> {
+    let mut opts = Options::new();
+    opts.optopt("", "name", "new profile name", "NAME");
+    opts.optflag("h", "help", "show help");
+    let matches = opts.parse(&parts[1..]).map_err(|e| e.to_string())?;
+    
+    if matches.free.is_empty() { return Err("Usage: copy-profile <source-vault> <source-profile> [--name <new-name>]".into()); }
+    if matches.free.len() < 2 { return Err("Usage: copy-profile <source-vault> <source-profile> [--name <new-name>]".into()); }
+    
+    let src_vault_path = &matches.free[0];
+    let src_profile_name = &matches.free[1];
+    let new_name = matches.opt_str("name");
+    
+    // Open source vault
+    let src_pass = pass("Source vault passphrase: ");
+    let src_bytes = fs::read(src_vault_path).map_err(|e| e.to_string())?;
+    let src_vault = Vault::open(&src_bytes, &src_pass).map_err(|e| e.to_string())?;
+    
+    let src_profile = src_vault.find_by_name(src_profile_name).ok_or_else(|| format!("source profile '{}' not found", src_profile_name))?.clone();
+    let src_secrets = src_vault.open_secrets(&src_profile).map_err(|e| e.to_string())?;
+    
+    // Determine destination vault (current open vault or new)
+    let dest_name = new_name.unwrap_or_else(|| ask("New profile name: "));
+    if dest_name.is_empty() { return Err("profile name required".into()); }
+    
+    let v = st.vault.as_mut().ok_or("no destination vault open - open a vault first")?;
+    
+    // Check if name already exists in destination
+    if v.find_by_name(&dest_name).is_some() {
+        return Err(format!("profile '{}' already exists in destination vault", dest_name));
+    }
+    
+    // Generate new client keypair for destination
+    let signing = SigningKey::generate(&mut rand::rngs::OsRng);
+    let pubblob = ssh_ed25519_blob(signing.verifying_key().as_bytes());
+    
+    // Add profile to destination vault (generates its own keypair, we'll replace it)
+    v.add_profile(&dest_name, &src_profile.host, src_profile.port, &src_profile.username).map_err(|e| e.to_string())?;
+    
+    // Update the newly added profile with copied data
+    let new_uuid = v.find_by_name(&dest_name).unwrap().uuid;
+    v.update_profile(&new_uuid, |p| {
+        p.client_public_key = pubblob;
+        p.targets_meta = src_profile.targets_meta.clone();
+        p.resume = src_profile.resume.clone();
+        p.connect_timeout_s = src_profile.connect_timeout_s;
+        p.exec_timeout_s = src_profile.exec_timeout_s;
+        p.initramfs_host_key = None; // Don't copy host keys
+        p.os_host_key = None;
+        p.host_key_pinned_at = 0;
+        p.notes = format!("Copied from {} ({})", src_profile_name, src_profile.host);
+    }).map_err(|e| e.to_string())?;
+    
+    // Replace secrets with new client key + copied keyfiles
+    let dest_secrets = SecretPayload {
+        client_private_seed: signing.to_bytes(),
+        keyfiles: src_secrets.keyfiles.clone(),
+    };
+    v.set_secrets(&new_uuid, &dest_secrets).map_err(|e| e.to_string())?;
+    
+    println!("Profile '{}' copied to '{}' in current vault.", src_profile_name, dest_name);
+    println!("New client keypair generated. Remember to 'save' and deploy new authorized_keys.");
     Ok(())
 }
 
