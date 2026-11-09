@@ -348,8 +348,9 @@ fn print_help() {
                                  Generate mkinitfs deployment artifacts for remote unlock
   passwd                         Change VAULT master passphrase (re-encrypts vault, not LUKS)
   backup <path>                  Create timestamped encrypted vault copy
-  copy-profile <src> <prof> [--name <n>]
-                                  Copy profile from another vault (new client key, same keyfiles)
+  copy-profile <src> <prof> [--name <n>] [--keep]
+                                  Copy profile from another vault
+                                  --keep: identical copy (same client key + host keys)
   import-profile                 Import profile from another vault
   export-profile <profile> <dir> Export profile to directory
   verbose [on|off|toggle]        Toggle verbose output for enroll/fetch/unlock/probe
@@ -794,15 +795,17 @@ async fn handle_rotate(st: &mut State, parts: &[&str]) -> Result<(), String> {
 async fn handle_copy_profile(st: &mut State, parts: &[&str]) -> Result<(), String> {
     let mut opts = Options::new();
     opts.optopt("", "name", "new profile name", "NAME");
+    opts.optflag("k", "keep", "keep client keypair and host keys (identical copy)");
     opts.optflag("h", "help", "show help");
     let matches = opts.parse(&parts[1..]).map_err(|e| e.to_string())?;
     
-    if matches.free.is_empty() { return Err("Usage: copy-profile <source-vault> <source-profile> [--name <new-name>]".into()); }
-    if matches.free.len() < 2 { return Err("Usage: copy-profile <source-vault> <source-profile> [--name <new-name>]".into()); }
+    if matches.free.is_empty() { return Err("Usage: copy-profile <source-vault> <source-profile> [--name <new-name>] [--keep]".into()); }
+    if matches.free.len() < 2 { return Err("Usage: copy-profile <source-vault> <source-profile> [--name <new-name>] [--keep]".into()); }
     
     let src_vault_path = &matches.free[0];
     let src_profile_name = &matches.free[1];
     let new_name = matches.opt_str("name");
+    let keep = matches.opt_present("keep");
     
     // Open source vault
     let src_pass = pass("Source vault passphrase: ");
@@ -823,36 +826,59 @@ async fn handle_copy_profile(st: &mut State, parts: &[&str]) -> Result<(), Strin
         return Err(format!("profile '{}' already exists in destination vault", dest_name));
     }
     
-    // Generate new client keypair for destination
-    let signing = SigningKey::generate(&mut rand::rngs::OsRng);
-    let pubblob = ssh_ed25519_blob(signing.verifying_key().as_bytes());
+    // Add profile to destination vault
+    let new_uuid = v.add_profile(&dest_name, &src_profile.host, src_profile.port, &src_profile.username).map_err(|e| e.to_string())?;
     
-    // Add profile to destination vault (generates its own keypair, we'll replace it)
-    v.add_profile(&dest_name, &src_profile.host, src_profile.port, &src_profile.username).map_err(|e| e.to_string())?;
-    
-    // Update the newly added profile with copied data
-    let new_uuid = v.find_by_name(&dest_name).unwrap().uuid;
-    v.update_profile(&new_uuid, |p| {
-        p.client_public_key = pubblob;
-        p.targets_meta = src_profile.targets_meta.clone();
-        p.resume = src_profile.resume.clone();
-        p.connect_timeout_s = src_profile.connect_timeout_s;
-        p.exec_timeout_s = src_profile.exec_timeout_s;
-        p.initramfs_host_key = None; // Don't copy host keys
-        p.os_host_key = None;
-        p.host_key_pinned_at = 0;
-        p.notes = format!("Copied from {} ({})", src_profile_name, src_profile.host);
-    }).map_err(|e| e.to_string())?;
-    
-    // Replace secrets with new client key + copied keyfiles
-    let dest_secrets = SecretPayload {
-        client_private_seed: signing.to_bytes(),
-        keyfiles: src_secrets.keyfiles.clone(),
-    };
-    v.set_secrets(&new_uuid, &dest_secrets).map_err(|e| e.to_string())?;
-    
-    println!("Profile '{}' copied to '{}' in current vault.", src_profile_name, dest_name);
-    println!("New client keypair generated. Remember to 'save' and deploy new authorized_keys.");
+    if keep {
+        // Keep client keypair and host keys - identical copy
+        v.update_profile(&new_uuid, |p| {
+            p.client_public_key = src_profile.client_public_key.clone();
+            p.targets_meta = src_profile.targets_meta.clone();
+            p.resume = src_profile.resume.clone();
+            p.connect_timeout_s = src_profile.connect_timeout_s;
+            p.exec_timeout_s = src_profile.exec_timeout_s;
+            p.initramfs_host_key = src_profile.initramfs_host_key.clone();
+            p.os_host_key = src_profile.os_host_key.clone();
+            p.host_key_pinned_at = src_profile.host_key_pinned_at;
+            p.notes = format!("Copied from {} ({}) [kept]", src_profile_name, src_profile.host);
+        }).map_err(|e| e.to_string())?;
+        
+        // Use source secrets (same client key + keyfiles)
+        let dest_secrets = SecretPayload {
+            client_private_seed: src_secrets.client_private_seed,
+            keyfiles: src_secrets.keyfiles.clone(),
+        };
+        v.set_secrets(&new_uuid, &dest_secrets).map_err(|e| e.to_string())?;
+        
+        println!("Profile '{}' copied to '{}' in current vault (kept client key + host keys).", src_profile_name, dest_name);
+        println!("Same authorized_keys applies. Remember to 'save'.");
+    } else {
+        // Generate new client keypair for destination
+        let signing = SigningKey::generate(&mut rand::rngs::OsRng);
+        let pubblob = ssh_ed25519_blob(signing.verifying_key().as_bytes());
+        
+        v.update_profile(&new_uuid, |p| {
+            p.client_public_key = pubblob;
+            p.targets_meta = src_profile.targets_meta.clone();
+            p.resume = src_profile.resume.clone();
+            p.connect_timeout_s = src_profile.connect_timeout_s;
+            p.exec_timeout_s = src_profile.exec_timeout_s;
+            p.initramfs_host_key = None; // Don't copy host keys
+            p.os_host_key = None;
+            p.host_key_pinned_at = 0;
+            p.notes = format!("Copied from {} ({})", src_profile_name, src_profile.host);
+        }).map_err(|e| e.to_string())?;
+        
+        // Replace secrets with new client key + copied keyfiles
+        let dest_secrets = SecretPayload {
+            client_private_seed: signing.to_bytes(),
+            keyfiles: src_secrets.keyfiles.clone(),
+        };
+        v.set_secrets(&new_uuid, &dest_secrets).map_err(|e| e.to_string())?;
+        
+        println!("Profile '{}' copied to '{}' in current vault.", src_profile_name, dest_name);
+        println!("New client keypair generated. Remember to 'save' and deploy new authorized_keys.");
+    }
     Ok(())
 }
 
