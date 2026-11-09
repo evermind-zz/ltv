@@ -9,6 +9,7 @@ use base64::Engine;
 struct State { 
     path: Option<PathBuf>, 
     vault: Option<Vault>,
+    vault_name: Option<String>,
     verbose: bool,
 }
 
@@ -246,14 +247,19 @@ After deployment and reboot:
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut st = State { path: None, vault: None, verbose: false };
+    let mut st = State { path: None, vault: None, vault_name: None, verbose: false };
     let mut rl = DefaultEditor::new()?;
 
     println!("ltv-admin — LUKS SSH Unlock Admin");
     println!("Type 'help' for commands.");
 
     loop {
-        let line = match rl.readline("ltv-admin> ") {
+        let prompt = if let Some(name) = &st.vault_name {
+            format!("ltv-admin({name})> ")
+        } else {
+            "ltv-admin> ".to_string()
+        };
+        let line = match rl.readline(&prompt) {
             Ok(l) => l.trim().to_string(),
             Err(ReadlineError::Interrupted) => { println!("^C"); continue; }
             Err(ReadlineError::Eof) => break,
@@ -287,7 +293,7 @@ async fn handle_command(st: &mut State, parts: &[&str]) -> Result<bool, String> 
         "create" => handle_create(st, parts)?,
         "open" => handle_open(st, parts)?,
         "save" => { save_atomic(st)?; }
-        "close" => { st.vault = None; st.path = None; }
+        "close" => { st.vault = None; st.path = None; st.vault_name = None; }
         "status" => handle_status(st)?,
         "ls" => handle_ls(st)?,
         "show" => handle_show(st, parts)?,
@@ -327,7 +333,7 @@ fn print_help() {
                                  connect_timeout, exec_timeout, resume
   target add <profile>           Add target to profile interactively
   target rm <profile> <uuid>     Remove target from profile
-  pubkey <profile>               Print Ed25519 public key (restricted authorized_keys line)
+  pubkey <profile>               Print profile's Ed25519 client identity public key
   rotate-key <profile> [--target <uuid|mapper>] [--verbose]
                                   Rotate LUKS keyfiles: add new key, verify, kill old slot (auto-saves)
   hostkey fetch <profile> [--os] TOFU-fetch Dropbear/OS host key, confirm, store
@@ -338,7 +344,7 @@ fn print_help() {
   fetch <profile> [--verbose]    Discover LUKS volumes on booted OS, offer to add as targets
   server-setup <profile> [--out <dir>]
                                  Generate mkinitfs deployment artifacts for remote unlock
-  passwd                         Change master passphrase (re-derives, new salt)
+  passwd                         Change VAULT master passphrase (re-encrypts vault, not LUKS)
   backup <path>                  Create timestamped encrypted vault copy
   import-profile                 Import profile from another vault
   export-profile <profile> <dir> Export profile to directory
@@ -391,7 +397,9 @@ fn handle_open(st: &mut State, parts: &[&str]) -> Result<(), String> {
     let bytes = fs::read(&f).map_err(|e| e.to_string())?;
     let v = Vault::open(&bytes, &pass("Passphrase: ")).map_err(|e| e.to_string())?;
     println!("opened: {} profiles", v.inventory.profiles.len());
-    st.vault = Some(v); st.path = Some(PathBuf::from(f));
+    let path = PathBuf::from(f);
+    st.vault_name = path.file_stem().and_then(|s| s.to_str()).map(|s| s.to_string());
+    st.vault = Some(v); st.path = Some(path);
     Ok(())
 }
 
