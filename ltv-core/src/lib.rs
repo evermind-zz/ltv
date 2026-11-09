@@ -15,4 +15,4 @@ pub use model::{*, BootedAccess, BootedAuth};
 pub use vault::Vault;
 pub use net::{probe, unlock, fetch_host_key, fetch_luks_info, ProbeResult, UnlockEvent, FetchedLuksInfo};
 pub use enroll::{enroll, EnrollEvent, EnrollResult};
-pub use scripts::{render_cmdline, render_deploy_sh, render_deploy_nopatch_sh, LTV_FILES, LTV_MODULES, LTV_PACKAGES, LTV_HOOK, LTV_COMMON, INITRAMFS_PATCH, DEPLOY_SH, DEPLOY_NOPATCH_SH, CMDLINE_TMPL};
+pub use scripts::{render_cmdline, render_deploy_sh, render_deploy_nopatch_sh, LTV_FILES, LTV_MODULES, LTV_PACKAGES, LTV_HOOK, LTV_COMMON, LTV_PATCH_INIT, DEPLOY_SH, DEPLOY_NOPATCH_SH, CMDLINE_TMPL};
