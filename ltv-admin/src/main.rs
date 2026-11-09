@@ -1,5 +1,5 @@
 use std::{fs, path::PathBuf};
-use ltv_core::{format::Argon2Params, model::{Profile, TargetMeta, ResumePolicy, BootedAccess, BootedAuth, fingerprint_sha256, HostKey}, net::{fetch_host_key, fetch_luks_info, probe, unlock}, vault::Vault, enroll::EnrollEvent, scripts::{render_cmdline, render_deploy_sh, render_deploy_nopatch_sh, render_ltv_hook, LTV_FILES, LTV_MODULES, LTV_PACKAGES, LTV_HOOK, LTV_COMMON, LTV_PATCH_INIT, LTV_COMMIT_HOOK}};
+use ltv_core::{format::Argon2Params, model::{Profile, TargetMeta, ResumePolicy, BootedAccess, BootedAuth, fingerprint_sha256, HostKey}, net::{fetch_host_key, fetch_luks_info, probe, unlock}, vault::Vault, enroll::EnrollEvent, rotate::RotateEvent, scripts::{render_cmdline, render_deploy_sh, render_deploy_nopatch_sh, LTV_FILES, LTV_MODULES, LTV_PACKAGES, LTV_HOOK, LTV_COMMON, LTV_PATCH_INIT, LTV_COMMIT_HOOK}};
 use std::path::Path;
 use rustyline::{error::ReadlineError, DefaultEditor};
 use secrecy::{ExposeSecret, SecretString, SecretVec};
@@ -306,7 +306,7 @@ async fn handle_command(st: &mut State, parts: &[&str]) -> Result<bool, String> 
         "backup" => handle_backup(st, parts)?,
         "import-profile" => println!("import-profile: not yet implemented"),
         "export-profile" => println!("export-profile: not yet implemented"),
-        "rotate-key" => println!("rotate-key: not yet implemented"),
+        "rotate-key" => handle_rotate(st, parts).await?,
         _ => return Err(format!("unknown command: {}. Type 'help' for list.", parts[0])),
     }
     Ok(false)
@@ -328,7 +328,8 @@ fn print_help() {
   target add <profile>           Add target to profile interactively
   target rm <profile> <uuid>     Remove target from profile
   pubkey <profile>               Print Ed25519 public key (restricted authorized_keys line)
-  rotate-key <profile>           Generate new Ed25519 keypair for profile
+  rotate-key <profile> [--target <uuid|mapper>] [--verbose]
+                                  Rotate LUKS keyfiles: add new key, verify, kill old slot (auto-saves)
   hostkey fetch <profile> [--os] TOFU-fetch Dropbear/OS host key, confirm, store
   probe <profile>|--all [--verbose]  State detection: Unreachable/WaitingInInitramfs/BootedOs/UnknownHostKey
   unlock <profile> [--verbose]   Full push-unlock with live progress
@@ -674,6 +675,107 @@ async fn handle_enroll(st: &mut State, parts: &[&str]) -> Result<(), String> {
 
     for r in &results { v.set_keyslot(&p.uuid, &r.luks_uuid, r.keyslot).map_err(|e| e.to_string())?; }
     println!("enrolled {} target(s); keyslots recorded. Remember to 'save'.", results.len());
+    Ok(())
+}
+
+async fn handle_rotate(st: &mut State, parts: &[&str]) -> Result<(), String> {
+    let mut opts = Options::new();
+    opts.optopt("", "target", "filter by LUKS UUID or mapper name", "UUID|MAPPER");
+    opts.optflag("", "verbose", "show cryptsetup commands");
+    opts.optflag("h", "help", "show help");
+    let matches = opts.parse(&parts[1..]).map_err(|e| e.to_string())?;
+    
+    if matches.free.is_empty() { return Err("Usage: rotate-key <profile> [--target <uuid|mapper>] [--verbose]".into()); }
+    let n = &matches.free[0];
+    let only = matches.opt_str("target");
+    let verbose = matches.opt_present("verbose") || st.verbose;
+
+    let v = st.vault.as_mut().ok_or("no vault open")?;
+    let p = resolve(v, n)?.clone();
+
+    if p.os_host_key.is_none() {
+        println!("No OS host key pinned. Fetching from {}:{} ...", p.host, p.port);
+        let hk = fetch_host_key(&p.host, p.port, p.connect_timeout_s).await.map_err(|e| e.to_string())?;
+        println!("{} {}", hk.key_type, fingerprint_sha256(&hk.key_bytes));
+        if ask("Pin as OS host key? [y/N]: ").to_lowercase() != "y" { return Err("aborted".into()); }
+        v.set_host_key(&p.uuid, hk, true).map_err(|e| e.to_string())?;
+    }
+
+    let username = ask_or("OS SSH user", "root");
+    let auth = match ask_or("Auth: (p)assword / (k)ey file", "k").as_str() {
+        "p" => BootedAuth::Password(SecretString::new(rpassword::prompt_password("OS password: ").unwrap_or_default())),
+        _ => {
+            let path = ask_or("Key file", &format!("{}/.ssh/id_ed25519", std::env::var("HOME").unwrap_or_default()));
+            let kp = russh_keys::load_secret_key(&path, None)
+                .or_else(|_| russh_keys::load_secret_key(&path, Some(&rpassword::prompt_password("Key passphrase: ").unwrap_or_default())))
+                .map_err(|e| format!("load key: {e}"))?;
+            match kp {
+                russh_keys::key::KeyPair::Ed25519(sk) => BootedAuth::Ed25519Seed(sk.to_bytes()),
+                _ => return Err("only Ed25519 keys supported".into()),
+            }
+        }
+    };
+    let access = BootedAccess { use_sudo: username != "root", username, auth, connect_timeout_s: p.connect_timeout_s };
+
+    // Filter targets based on --target
+    let targets: Vec<_> = p.targets_meta.iter()
+        .filter(|tm| only.as_ref().map_or(true, |f| f == &tm.luks_uuid || f == &tm.mapped_name))
+        .cloned()
+        .collect();
+    
+    if targets.is_empty() {
+        return Err(format!("no targets match filter '{}'", only.unwrap()));
+    }
+
+    // Check that each target has a keyslot recorded
+    for tm in &targets {
+        if tm.keyslot.is_none() {
+            println!("Warning: target {} ({}) has no keyslot recorded. Run 'enroll' first.", tm.mapped_name, tm.luks_uuid);
+        }
+    }
+
+    // Ask if all targets use the same LUKS passphrase
+    let same_passphrase = if targets.len() > 1 {
+        ask("Do all targets use the same LUKS passphrase? [Y/n]: ").to_lowercase() != "n"
+    } else {
+        true
+    };
+
+    // Collect passphrases
+    let mut passphrases: std::collections::HashMap<String, SecretString> = std::collections::HashMap::new();
+    
+    if same_passphrase {
+        let pass = loop {
+            let p = rpassword::prompt_password("Existing LUKS passphrase (for all targets): ").unwrap_or_default();
+            if !p.is_empty() { break SecretString::new(p); }
+            println!("Passphrase cannot be empty.");
+        };
+        for tm in &targets {
+            passphrases.insert(tm.luks_uuid.clone(), pass.clone());
+        }
+    } else {
+        for tm in &targets {
+            let pass = loop {
+                let prompt = format!("Existing LUKS passphrase for {} ({}): ", tm.mapped_name, tm.luks_uuid);
+                let p = rpassword::prompt_password(&prompt).unwrap_or_default();
+                if !p.is_empty() { break SecretString::new(p); }
+                println!("Passphrase cannot be empty.");
+            };
+            passphrases.insert(tm.luks_uuid.clone(), pass);
+        }
+    }
+
+    let results = ltv_core::rotate_key(v, &p.uuid, &access, |luks_uuid| {
+        passphrases.get(luks_uuid).cloned().ok_or_else(|| format!("no passphrase for {}", luks_uuid))
+    }, only.as_deref(), |e| {
+        match e {
+            RotateEvent::Skipped(t, why) => println!(" ! {t}: skipped ({why})"),
+            other if !verbose => println!(" ✓ {other:?}"),
+            _ => {}
+        }
+    }, if verbose { Some(Box::new(|cmd: &str| println!("  [rotate] $ {cmd}")) as Box<dyn FnMut(&str) + Send>) } else { None }).await.map_err(|e| e.to_string())?;
+
+    println!("rotated {} target(s); vault auto-saved.", results.len());
     Ok(())
 }
 

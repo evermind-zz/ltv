@@ -187,6 +187,26 @@ impl Vault {
         Ok(())
     }
 
+    /// Rotate the keyfile for a target and update its keyslot.
+    /// Caller must save() after this to persist.
+    pub fn rotate_keyfile(&mut self, uuid: &[u8; 16], luks_uuid: &str, new_keyfile: Vec<u8>, new_slot: u8) -> Result<(), VaultError> {
+        let p = self.profile(uuid)?.clone();
+        let mut s = self.open_secrets(&p)?;
+        if let Some(key_entry) = s.keyfiles.iter_mut().find(|k| k.luks_uuid == luks_uuid) {
+            key_entry.keyfile = new_keyfile;
+        } else {
+            return Err(VaultError::NoTarget);
+        }
+        let mut p2 = p;
+        if let Some(t) = p2.targets_meta.iter_mut().find(|t| t.luks_uuid == luks_uuid) {
+            t.keyslot = Some(new_slot);
+        }
+        self.seal_secrets(&mut p2, &s)?;
+        *self.profile_mut(uuid)? = p2;
+        self.dirty = true;
+        Ok(())
+    }
+
     pub fn remove_profile(&mut self, uuid: &[u8; 16]) -> Result<(), VaultError> {
         let n = self.inventory.profiles.len();
         self.inventory.profiles.retain(|p| &p.uuid != uuid);
