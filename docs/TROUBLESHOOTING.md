@@ -61,6 +61,7 @@ error: initramfs host key not pinned. Run 'hostkey fetch <profile>' first.
 
 ```bash
  ✓ TargetStart("aaaa-bbbb-cccc-dddd")
+ ✓ SlotChosen("aaaa-bbbb-cccc-dddd", 1)
 error: KeyRejected: existing passphrase wrong
 ```
 
@@ -72,6 +73,8 @@ error: KeyRejected: existing passphrase wrong
 **Fix:**
 - Verify passphrase with `cryptsetup open --test-passphrase /dev/sda2`
 - Check free slots: `cryptsetup luksDump /dev/sda2 | grep "Key Slot"`
+
+**Note:** `enroll` now pre-checks if your keyfile is already enrolled by testing each slot with `--test-passphrase`. If already enrolled, it will show `SlotChosen`/`SlotAdded`/`Verified` for that target without prompting for a passphrase.
 
 ### 7. Unlock Fails: "TargetFailed"
 

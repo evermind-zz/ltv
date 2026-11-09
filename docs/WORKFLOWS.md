@@ -100,23 +100,35 @@ Pin as OS host key? [y/N]: y
 OS SSH user [root]: root
 Auth: (p)assword / (k)ey file [k]: k
 Key file [/home/user/.ssh/id_ed25519]: 
-Existing LUKS passphrase: ********
+Do all targets use the same LUKS passphrase? [Y/n]: y
+Existing LUKS passphrase (for all targets): ********
 
- ✓ TargetStart("aaaa-bbbb-cccc-dddd")
- ✓ SlotAdded("aaaa-bbbb-cccc-dddd", 1)
- ✓ Verified("aaaa-bbbb-cccc-dddd")
+ ✓ TargetStart("cryptroot")
+ ✓ SlotChosen("cryptroot", 1)
+ ✓ SlotAdded("cryptroot", 1)
+ ✓ Verified("cryptroot")
 
 enrolled 1 target(s); keyslots recorded. Remember to 'save'.
 ```
 
 **What happens:**
 1. Connects to **booted OS** via SSH
-2. Stages existing LUKS passphrase in `/run/ltv/pass` (tmpfs)
-3. Stages new keyfile in `/run/ltv/newkey` (tmpfs)
-4. Runs `cryptsetup luksAddKey --key-file=/run/ltv/pass --new-keyfile=/run/ltv/newkey --key-slot N <dev>`
-5. Verifies with `cryptsetup open --test-passphrase --key-file=- --key-slot N <dev>`
-6. Records keyslot in vault
-7. Cleans up tmpfs files
+2. Asks if all targets share the same LUKS passphrase (default: yes)
+3. Prompts for passphrase(s) — empty not allowed
+4. For each target: checks if our key is already enrolled (tests each slot with `--test-passphrase`)
+5. If already enrolled: records existing slot, skips to verification
+6. Otherwise: picks free slot, stages passphrase + new key in tmpfs (`/run/ltv/pass`, `/run/ltv/newkey`)
+7. Runs `cryptsetup luksAddKey --key-file=/run/ltv/pass --new-keyfile=/run/ltv/newkey --key-slot N <dev>`
+8. Verifies with `cryptsetup open --test-passphrase --key-file=- --key-slot N <dev>`
+9. Records keyslot in vault
+10. Cleans up tmpfs files
+
+**If targets have different passphrases:**
+```
+Do all targets use the same LUKS passphrase? [Y/n]: n
+Existing LUKS passphrase for cryptroot (aaaa-bbbb-cccc-dddd): ********
+Existing LUKS passphrase for cryptdata (eeee-ffff-gggg-hhhh): ********
+```
 
 ## 5. Remote Unlock (Boot Time)
 

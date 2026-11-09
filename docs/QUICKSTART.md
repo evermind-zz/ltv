@@ -79,9 +79,11 @@ ltv-admin> enroll myserver
 OS SSH user [root]: root
 Auth: (p)assword / (k)ey file [k]: k
 Key file [/home/user/.ssh/id_ed25519]: 
-Existing LUKS passphrase: ********
+Do all targets use the same LUKS passphrase? [Y/n]: y
+Existing LUKS passphrase (for all targets): ********
 
   ✓ TargetStart("aaaa-bbbb-cccc-dddd")
+  ✓ SlotChosen("aaaa-bbbb-cccc-dddd", 1)
   ✓ SlotAdded("aaaa-bbbb-cccc-dddd", 1)
   ✓ Verified("aaaa-bbbb-cccc-dddd")
 enrolled 1 target(s); keyslots recorded. Remember to 'save'.
