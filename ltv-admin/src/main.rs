@@ -266,8 +266,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Type 'help' for commands.");
 
     loop {
+        let dirty = st.vault.as_ref().map_or(false, |v| v.is_dirty());
         let prompt = if let Some(name) = &st.vault_name {
-            format!("ltv-admin({name})> ")
+            format!("ltv-admin({}{name})> ", if dirty { "*" } else { "" })
         } else {
             "ltv-admin> ".to_string()
         };
@@ -408,6 +409,7 @@ fn handle_create(st: &mut State, parts: &[&str]) -> Result<(), String> {
     if p1.expose_secret() != p2.expose_secret() { return Err("passphrases differ".into()); }
     st.vault = Some(Vault::create(&p1, Argon2Params::default()).map_err(|e| e.to_string())?);
     st.path = Some(path);
+    st.vault_name = st.path.as_ref().and_then(|p| p.file_stem()).and_then(|s| s.to_str()).map(|s| s.to_string());
     save_atomic(st)?;
     Ok(())
 }
