@@ -6,11 +6,36 @@ pub const DEFAULT_CONNECT_TIMEOUT: u16 = 10;
 pub const DEFAULT_EXEC_TIMEOUT: u16 = 30;
 pub const HOOK_TIMEOUT_SECS: u32 = 300;
 
+/// Maximum number of targets processed concurrently in parallel mode.
+/// Kept low so we don't overwhelm the initramfs SSH daemon.
+pub const MAX_CONCURRENT_TARGETS: usize = 4;
+
 // ---------- tmpfs staging (initramfs side) ----------
 pub const TMPFS_BASE: &str = "/run/ltv";
 pub const TMPFS_KEYFILE: &str = "/run/ltv/key";
 pub const TMPFS_PASSFILE: &str = "/run/ltv/pass";
 pub const TMPFS_NEWKEYFILE: &str = "/run/ltv/newkey";
+
+/// Returns a per-target staging directory (e.g., /run/ltv/0, /run/ltv/1, etc.)
+/// Index ensures unique paths for parallel execution.
+pub fn target_tmpfs_dir(index: usize) -> String {
+    format!("{}/{}", TMPFS_BASE, index)
+}
+
+/// Returns the keyfile path within a target's staging directory.
+pub fn target_keyfile(index: usize) -> String {
+    format!("{}/key", target_tmpfs_dir(index))
+}
+
+/// Returns the passphrase file path within a target's staging directory.
+pub fn target_passfile(index: usize) -> String {
+    format!("{}/pass", target_tmpfs_dir(index))
+}
+
+/// Returns the new keyfile path within a target's staging directory (for rotate).
+pub fn target_newkeyfile(index: usize) -> String {
+    format!("{}/newkey", target_tmpfs_dir(index))
+}
 
 // ---------- shell ----------
 pub const SSH_KEY_TYPE: &str = "ssh-ed25519";

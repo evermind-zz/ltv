@@ -1,4 +1,4 @@
-use ltv_core::{Vault, unlock, format::Argon2Params};
+use ltv_core::{Vault, unlock, model::ExecutionMode, format::Argon2Params};
 use secrecy::SecretVec;
 
 #[tokio::test]
@@ -12,7 +12,7 @@ async fn test_unlock_now() {
     let _profile = vault.inventory.profiles[0].clone();
     
     // No host key pinned, so unlock should fail with HostKeyNotPinned
-    let result = unlock(&vault, &uuid, |e| println!("Event: {:?}", e), None).await;
+    let result = unlock(&vault, &uuid, ExecutionMode::Sequential, |e| println!("Event: {:?}", e), None).await;
     println!("Unlock result: {:?}", result);
     
     // Expect HostKeyNotPinned since we didn't pin a key

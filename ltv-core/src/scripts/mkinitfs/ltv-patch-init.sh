@@ -57,6 +57,22 @@ content=$(printf '%s\n' "$content" | awk -v anchor="$anchor" '
     { print }
 ')
 
+# --- 3. Replace nlplug-findfs call with ltv-luks-wrapper ---
+# Find the line with: $MOCK nlplug-findfs $cryptopts -p /sbin/mdev ...
+# and replace it with the wrapper call
+content=$(printf '%s\n' "$content" | awk '
+    /^\s*\$MOCK nlplug-findfs \$cryptopts -p \/sbin\/mdev/ && !done {
+        print "\t# LTV: replace nlplug-findfs with ltv-luks-wrapper"
+        print "\tltv-luks-wrapper $cryptopts -p /sbin/mdev ${KOPT_debug_init:+-d} \\"
+        print "\t\t${KOPT_usbdelay:+-t $((KOPT_usbdelay*1000))} \\"
+        print "\t\t${KOPT_uevent_buf_size:+-U $KOPT_uevent_buf_size} \\"
+        print "\t\t\"$KOPT_root\""
+        done=1
+        next
+    }
+    { print }
+')
+
 # write back
 printf '%s\n' "$content" > "$INIT_PATH"
 echo "[$INIT_PATH] Patch applied successfully"

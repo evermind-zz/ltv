@@ -54,6 +54,19 @@ impl Default for ResumePolicy {
     fn default() -> Self { ResumePolicy::Command("".into()) }
 }
 
+/// Execution mode for multi-target operations (unlock, enroll, rotate).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ExecutionMode {
+    /// Process targets sequentially (one at a time)
+    Sequential,
+    /// Process targets in parallel (concurrent SSH channels)
+    Parallel,
+}
+
+impl Default for ExecutionMode {
+    fn default() -> Self { ExecutionMode::Parallel }
+}
+
 // ---------- JIT-decrypted, zeroized ----------
 #[derive(Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 pub struct SecretPayload {

@@ -6,7 +6,7 @@
 pub const LTV_FILES: &str = include_str!("scripts/mkinitfs/ltv.files");
 pub const LTV_MODULES: &str = include_str!("scripts/mkinitfs/ltv.modules");
 pub const LTV_PACKAGES: &str = include_str!("scripts/mkinitfs/ltv.packages");
-pub const LTV_HOOK: &str = include_str!("scripts/mkinitfs/ltv-hook.sh");
+pub const LTV_LUKS_WRAPPER: &str = include_str!("scripts/mkinitfs/ltv-luks-wrapper.sh");
 pub const LTV_COMMON: &str = include_str!("scripts/mkinitfs/ltv-common.sh");
 pub const LTV_PATCH_INIT: &str = include_str!("scripts/mkinitfs/ltv-patch-init.sh");
 pub const LTV_COMMIT_HOOK: &str = include_str!("scripts/deploy/ltv-commit-hook.sh");
@@ -39,12 +39,6 @@ pub fn render_deploy_sh(kernel_version: &str) -> String {
 /// Render deploy_nopatch.sh with kernel version.
 pub fn render_deploy_nopatch_sh(kernel_version: &str) -> String {
     DEPLOY_NOPATCH_SH.replace("{kernel_version}", kernel_version)
-}
-
-/// Render ltv-hook.sh with the SSH port for dropbear.
-/// Uses the profile's `port` field (defaults to 22).
-pub fn render_ltv_hook(p: &Profile) -> String {
-    LTV_HOOK.replace("{port}", &p.port.to_string())
 }
 
 #[cfg(test)]
@@ -118,10 +112,11 @@ mod tests {
     }
 
     #[test]
-    fn test_render_ltv_hook() {
+    fn test_render_ltv_luks_wrapper() {
         let p = test_profile();
-        let out = render_ltv_hook(&p);
-        assert!(out.contains("-p 22"));
-        assert!(!out.contains("{port}"));
+        let out = LTV_LUKS_WRAPPER;
+        assert!(out.contains("ltv-luks-wrapper"));
+        assert!(out.contains("dropbear"));
+        assert!(out.contains("/run/ltv/resume"));
     }
 }

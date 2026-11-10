@@ -1,5 +1,5 @@
 use std::{fs, path::PathBuf};
-use ltv_core::{format::Argon2Params, model::{Profile, TargetMeta, ResumePolicy, BootedAccess, BootedAuth, fingerprint_sha256, HostKey, SecretPayload}, net::{fetch_host_key, fetch_luks_info, probe, unlock}, vault::{Vault, ssh_ed25519_blob}, enroll::EnrollEvent, rotate::RotateEvent, scripts::{render_cmdline, render_deploy_sh, render_deploy_nopatch_sh, LTV_FILES, LTV_MODULES, LTV_PACKAGES, LTV_HOOK, LTV_COMMON, LTV_PATCH_INIT, LTV_COMMIT_HOOK}};
+use ltv_core::{format::Argon2Params, model::{Profile, TargetMeta, ResumePolicy, BootedAccess, BootedAuth, fingerprint_sha256, HostKey, SecretPayload, ExecutionMode}, net::{fetch_host_key, fetch_luks_info, probe, unlock}, vault::{Vault, ssh_ed25519_blob}, enroll::EnrollEvent, rotate::RotateEvent, scripts::{render_cmdline, render_deploy_sh, render_deploy_nopatch_sh, LTV_FILES, LTV_MODULES, LTV_PACKAGES, LTV_LUKS_WRAPPER, LTV_COMMON, LTV_PATCH_INIT, LTV_COMMIT_HOOK}};
 use std::path::Path;
 use rustyline::{error::ReadlineError, DefaultEditor};
 use secrecy::{ExposeSecret, SecretString, SecretVec};
@@ -15,7 +15,11 @@ struct State {
 }
 
 fn pass(prompt: &str) -> SecretVec<u8> {
-    SecretVec::new(rpassword::prompt_password(prompt).unwrap_or_default().into_bytes())
+    loop {
+        let p = rpassword::prompt_password(prompt).unwrap_or_default();
+        if !p.is_empty() { return SecretVec::new(p.into_bytes()); }
+        println!("Passphrase cannot be empty.");
+    }
 }
 
 fn ask(prompt: &str) -> String {
@@ -162,8 +166,11 @@ async fn cmd_server_setup(st: &mut State, name: &str, args: &[&str]) -> Result<(
     fs::write(deploy_dir.join("ltv.modules"), LTV_MODULES).map_err(|e| e.to_string())?;
     fs::write(deploy_dir.join("ltv.packages"), LTV_PACKAGES).map_err(|e| e.to_string())?;
 
-    // 2. hook & common lib
-    fs::write(deploy_dir.join("ltv-hook.sh"), LTV_HOOK).map_err(|e| e.to_string())?;
+    // 2. luks wrapper & common lib
+    fs::write(deploy_dir.join("ltv-luks-wrapper.sh"), LTV_LUKS_WRAPPER).map_err(|e| e.to_string())?;
+    let mut perms = fs::metadata(deploy_dir.join("ltv-luks-wrapper.sh")).map_err(|e| e.to_string())?.permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(deploy_dir.join("ltv-luks-wrapper.sh"), perms).map_err(|e| e.to_string())?;
     fs::write(deploy_dir.join("ltv-common.sh"), LTV_COMMON).map_err(|e| e.to_string())?;
 
     // 3. patch script + commit hook (idempotent re-patch after mkinitfs upgrade)
@@ -211,9 +218,9 @@ async fn cmd_server_setup(st: &mut State, name: &str, args: &[&str]) -> Result<(
 - `ltv.files` - Feature file list for mkinitfs
 - `ltv.modules` - Kernel modules (empty)
 - `ltv.packages` - APK packages: dropbear
-- `ltv-hook.sh` - Initramfs hook script (starts Dropbear)
-- `ltv-common.sh` - Shared functions for hooks
-- `initramfs-init.patch` - Sed script to patch initramfs-init
+- `ltv-luks-wrapper.sh` - Luks wrapper (replaces nlplug-findfs, starts Dropbear, waits for resume)
+- `ltv-common.sh` - Shared functions
+- `ltv-patch-init.sh` - Script to patch initramfs-init (idempotent)
 - `authorized_keys` - Client public key for initramfs SSH (no forced commands)
 - `dropbear_ed25519_host_key` - Dropbear host private key (pre-generated)
 - `dropbear_ed25519_host_key.pub` - Dropbear host public key
@@ -340,12 +347,13 @@ fn print_help() {
   target add <profile>           Add target to profile interactively
   target rm <profile> <uuid>     Remove target from profile
   pubkey <profile>               Print profile's Ed25519 client identity public key
-  rotate-key <profile> [--target <uuid|mapper>] [--verbose]
+  rotate-key <profile> [--target <uuid|mapper>] [--verbose] [--sequential]
                                   Rotate LUKS keyfiles: add new key, verify, kill old slot (auto-saves)
-  hostkey fetch <profile> [--os] TOFU-fetch Dropbear/OS host key, confirm, store
+  hostkey fetch <profile> [--os]    TOFU-fetch Dropbear/OS host key, confirm, store
+  hostkey repin <profile>           Re-pin initramfs host key (fix mismatch after redeploy)
   probe <profile>|--all [--verbose]  State detection: Unreachable/WaitingInInitramfs/BootedOs/UnknownHostKey
-  unlock <profile> [--verbose]   Full push-unlock with live progress
-  enroll <profile> [--target <uuid|mapper>] [--verbose]
+  unlock <profile> [--verbose] [--sequential]   Full push-unlock with live progress
+  enroll <profile> [--target <uuid|mapper>] [--verbose] [--sequential]
                                  Enroll keyfiles into LUKS headers over booted OS
   fetch <profile> [--verbose]    Discover LUKS volumes on booted OS, offer to add as targets
   server-setup <profile> [--out <dir>]
@@ -388,10 +396,18 @@ fn handle_create(st: &mut State, parts: &[&str]) -> Result<(), String> {
     
     if matches.free.is_empty() { return Err("Usage: create <file>".into()); }
     let f = matches.free[0].clone();
+    let path = PathBuf::from(&f);
+    
+    // Check if file already exists
+    if path.exists() {
+        let confirm = ask(&format!("File '{}' already exists. Overwrite? [y/N]: ", f));
+        if confirm.to_lowercase() != "y" { return Err("aborted".into()); }
+    }
+    
     let p1 = pass("New passphrase: "); let p2 = pass("Repeat: ");
     if p1.expose_secret() != p2.expose_secret() { return Err("passphrases differ".into()); }
     st.vault = Some(Vault::create(&p1, Argon2Params::default()).map_err(|e| e.to_string())?);
-    st.path = Some(PathBuf::from(f));
+    st.path = Some(path);
     save_atomic(st)?;
     Ok(())
 }
@@ -559,15 +575,54 @@ async fn handle_hostkey(st: &mut State, parts: &[&str]) -> Result<(), String> {
     opts.optflag("h", "help", "show help");
     let matches = opts.parse(&parts[1..]).map_err(|e| e.to_string())?;
     
-    if matches.free.len() < 2 || matches.free[0] != "fetch" { return Err("Usage: hostkey fetch <profile> [--os]".into()); }
-    let n = &matches.free[1];
+    if matches.free.is_empty() { return Err("Usage: hostkey <fetch|repin> <profile> [--os]".into()); }
+    let subcmd = &matches.free[0];
+    let n = matches.free.get(1).ok_or("Usage: hostkey <fetch|repin> <profile> [--os]")?;
     let is_os = matches.opt_present("os");
     let v = st.vault.as_mut().ok_or("no vault open")?;
     let p = resolve(v, n)?.clone();
-    let hk = fetch_host_key(&p.host, p.port, p.connect_timeout_s).await.map_err(|e| e.to_string())?;
-    println!("{} {}", hk.key_type, fingerprint_sha256(&hk.key_bytes));
-    if ask("Pin this key? [y/N]: ").to_lowercase() == "y" {
-        v.set_host_key(&p.uuid, hk, is_os).map_err(|e| e.to_string())?;
+
+    match subcmd.as_str() {
+        "fetch" => {
+            println!("Fetching host key from {}:{} ...", p.host, p.port);
+            let hk = match fetch_host_key(&p.host, p.port, p.connect_timeout_s).await {
+                Ok(hk) => hk,
+                Err(e) => {
+                    let msg = e.to_string();
+                    if msg.contains("Connection refused") || msg.contains("Connection timed out") {
+                        let svc = if is_os { "OS SSH" } else { "initramfs dropbear" };
+                        return Err(format!("Failed to connect to {}:{}. Is {} running?", p.host, p.port, svc));
+                    }
+                    return Err(msg);
+                }
+            };
+            println!("{} {}", hk.key_type, fingerprint_sha256(&hk.key_bytes));
+            if ask("Pin this key? [y/N]: ").to_lowercase() == "y" {
+                v.set_host_key(&p.uuid, hk, is_os).map_err(|e| e.to_string())?;
+            }
+        }
+        "repin" => {
+            if is_os {
+                return Err("--os flag not supported for repin (use 'hostkey fetch --os' for OS key)".into());
+            }
+            println!("Re-pinning initramfs host key from {}:{} ...", p.host, p.port);
+            let hk = match fetch_host_key(&p.host, p.port, p.connect_timeout_s).await {
+                Ok(hk) => hk,
+                Err(e) => {
+                    let msg = e.to_string();
+                    if msg.contains("Connection refused") || msg.contains("Connection timed out") {
+                        return Err(format!("Failed to connect to {}:{}. Is the initramfs dropbear running (target booted with ltv=yes)?", p.host, p.port));
+                    }
+                    return Err(msg);
+                }
+            };
+            println!("{} {}", hk.key_type, fingerprint_sha256(&hk.key_bytes));
+            if ask("Replace pinned initramfs host key? [y/N]: ").to_lowercase() == "y" {
+                v.set_host_key(&p.uuid, hk, false).map_err(|e| e.to_string())?;
+                println!("Initramfs host key updated.");
+            }
+        }
+        _ => return Err("Usage: hostkey <fetch|repin> <profile> [--os]".into()),
     }
     Ok(())
 }
@@ -596,16 +651,19 @@ async fn handle_probe(st: &State, parts: &[&str]) -> Result<(), String> {
 async fn handle_unlock(st: &State, parts: &[&str]) -> Result<(), String> {
     let mut opts = Options::new();
     opts.optflag("", "verbose", "show cryptsetup commands");
+    opts.optflag("", "sequential", "process targets sequentially (default: parallel)");
     opts.optflag("h", "help", "show help");
     let matches = opts.parse(&parts[1..]).map_err(|e| e.to_string())?;
     
-    if matches.free.is_empty() { return Err("Usage: unlock <profile> [--verbose]".into()); }
+    if matches.free.is_empty() { return Err("Usage: unlock <profile> [--verbose] [--sequential]".into()); }
     let n = &matches.free[0];
     let verbose = matches.opt_present("verbose") || st.verbose;
+    let sequential = matches.opt_present("sequential");
+    let mode = if sequential { ExecutionMode::Sequential } else { ExecutionMode::Parallel };
     let v = st.vault.as_ref().ok_or("no vault open")?;
     let uuid = resolve(v, n)?.uuid;
     let verbose_fn = if verbose { Some(Box::new(|cmd: &str| println!("  [unlock] $ {cmd}")) as Box<dyn FnMut(&str) + Send>) } else { None };
-    unlock(v, &uuid, |e| {
+    unlock(v, &uuid, mode, |e| {
         if !verbose {
             println!(" ✓ {e:?}");
         }
@@ -617,13 +675,16 @@ async fn handle_enroll(st: &mut State, parts: &[&str]) -> Result<(), String> {
     let mut opts = Options::new();
     opts.optopt("", "target", "filter by LUKS UUID or mapper name", "UUID|MAPPER");
     opts.optflag("", "verbose", "show cryptsetup commands");
+    opts.optflag("", "sequential", "process targets sequentially (default: parallel)");
     opts.optflag("h", "help", "show help");
     let matches = opts.parse(&parts[1..]).map_err(|e| e.to_string())?;
     
-    if matches.free.is_empty() { return Err("Usage: enroll <profile> [--target <uuid|mapper>] [--verbose]".into()); }
+    if matches.free.is_empty() { return Err("Usage: enroll <profile> [--target <uuid|mapper>] [--verbose] [--sequential]".into()); }
     let n = &matches.free[0];
     let only = matches.opt_str("target");
     let verbose = matches.opt_present("verbose") || st.verbose;
+    let sequential = matches.opt_present("sequential");
+    let mode = if sequential { ExecutionMode::Sequential } else { ExecutionMode::Parallel };
 
     let v = st.vault.as_mut().ok_or("no vault open")?;
     let p = resolve(v, n)?.clone();
@@ -693,7 +754,7 @@ async fn handle_enroll(st: &mut State, parts: &[&str]) -> Result<(), String> {
         }
     }
 
-    let results = ltv_core::enroll(v, &p.uuid, &access, |luks_uuid| {
+    let results = ltv_core::enroll(v, &p.uuid, &access, mode, |luks_uuid| {
         passphrases.get(luks_uuid).cloned().ok_or_else(|| format!("no passphrase for {}", luks_uuid))
     }, only.as_deref(), |e| {
         match e {
@@ -712,13 +773,16 @@ async fn handle_rotate(st: &mut State, parts: &[&str]) -> Result<(), String> {
     let mut opts = Options::new();
     opts.optopt("", "target", "filter by LUKS UUID or mapper name", "UUID|MAPPER");
     opts.optflag("", "verbose", "show cryptsetup commands");
+    opts.optflag("", "sequential", "process targets sequentially (default: parallel)");
     opts.optflag("h", "help", "show help");
     let matches = opts.parse(&parts[1..]).map_err(|e| e.to_string())?;
     
-    if matches.free.is_empty() { return Err("Usage: rotate-key <profile> [--target <uuid|mapper>] [--verbose]".into()); }
+    if matches.free.is_empty() { return Err("Usage: rotate-key <profile> [--target <uuid|mapper>] [--verbose] [--sequential]".into()); }
     let n = &matches.free[0];
     let only = matches.opt_str("target");
     let verbose = matches.opt_present("verbose") || st.verbose;
+    let sequential = matches.opt_present("sequential");
+    let mode = if sequential { ExecutionMode::Sequential } else { ExecutionMode::Parallel };
 
     let v = st.vault.as_mut().ok_or("no vault open")?;
     let p = resolve(v, n)?.clone();
@@ -795,7 +859,7 @@ async fn handle_rotate(st: &mut State, parts: &[&str]) -> Result<(), String> {
         }
     }
 
-    let results = ltv_core::rotate_key(v, &p.uuid, &access, |luks_uuid| {
+    let results = ltv_core::rotate_key(v, &p.uuid, &access, mode, |luks_uuid| {
         passphrases.get(luks_uuid).cloned().ok_or_else(|| format!("no passphrase for {}", luks_uuid))
     }, only.as_deref(), |e| {
         match e {
@@ -912,9 +976,19 @@ async fn handle_fetch(st: &mut State, parts: &[&str]) -> Result<(), String> {
     let v = st.vault.as_mut().ok_or("no vault open")?;
     let p = resolve(v, n)?.clone();
 
+    // Fetch OS host key (for enroll/rotate against booted OS)
     if p.os_host_key.is_none() {
         println!("No OS host key pinned. Fetching from {}:{} ...", p.host, p.port);
-        let hk = fetch_host_key(&p.host, p.port, p.connect_timeout_s).await.map_err(|e| e.to_string())?;
+        let hk = match fetch_host_key(&p.host, p.port, p.connect_timeout_s).await {
+            Ok(hk) => hk,
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("Connection refused") || msg.contains("Connection timed out") {
+                    return Err(format!("Failed to connect to {}:{}. Is the OS booted and SSH running?", p.host, p.port));
+                }
+                return Err(msg);
+            }
+        };
         println!("{} {}", hk.key_type, fingerprint_sha256(&hk.key_bytes));
         if ask("Pin as OS host key? [y/N]: ").to_lowercase() != "y" { return Err("aborted".into()); }
         v.set_host_key(&p.uuid, hk, true).map_err(|e| e.to_string())?;

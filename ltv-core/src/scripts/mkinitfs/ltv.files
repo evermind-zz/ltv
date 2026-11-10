@@ -1,4 +1,4 @@
-/usr/share/mkinitfs/ltv-hook.sh
+/usr/share/mkinitfs/ltv-luks-wrapper.sh
 /usr/share/mkinitfs/ltv-common.sh
 /usr/sbin/dropbear
 /etc/mkinitfs/ltv-stuff/etc/dropbear/dropbear_ed25519_host_key

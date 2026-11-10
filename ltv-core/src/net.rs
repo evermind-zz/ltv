@@ -98,7 +98,7 @@ pub async fn probe(p: &Profile, mut verbose: Option<Box<dyn FnMut(&str) + Send>>
 
 pub(crate) struct ExecResult { pub code: u32, pub stdout: String, pub stderr: String }
 
-pub(crate) async fn exec(session: &mut client::Handle<Hk>, cmd: &str, stdin: Option<&[u8]>, t: Duration)
+pub(crate) async fn exec(session: &client::Handle<Hk>, cmd: &str, stdin: Option<&[u8]>, t: Duration)
     -> Result<ExecResult, NetError>
 {
     let mut ch = session.channel_open_session().await.map_err(|e| NetError::Ssh(e.to_string()))?;
@@ -133,13 +133,19 @@ pub(crate) fn keypair_from_seed(seed: &[u8; 32]) -> Arc<KeyPair> {
 /// Stage binary data to a tmpfs file on the remote (umask 077, mkdir -p).
 /// `sudo` prefix (e.g. "sudo -n ") can be empty. Returns Ok(()) or NetError.
 pub(crate) async fn tmpfs_stage(
-    session: &mut client::Handle<Hk>,
+    session: &client::Handle<Hk>,
     path: &str,
     data: &[u8],
     sudo: &str,
     timeout: Duration,
 ) -> Result<(), NetError> {
-    let cmd = format!("{}sh -c 'umask {UMASK_TMPFS} && mkdir -p {TMPFS_BASE} && cat > {path}'", sudo, path=path);
+    // Create the parent directory so per-target paths like /run/ltv/0/key work.
+    let dir = std::path::Path::new(path)
+        .parent()
+        .and_then(|p| p.to_str())
+        .filter(|d| !d.is_empty())
+        .unwrap_or(TMPFS_BASE);
+    let cmd = format!("{}sh -c 'umask {UMASK_TMPFS} && mkdir -p {dir} && cat > {path}'", sudo);
     let r = exec(session, &cmd, Some(data), timeout).await?;
     if r.code != 0 {
         return Err(NetError::Ssh(format!(
@@ -152,7 +158,7 @@ pub(crate) async fn tmpfs_stage(
 /// Remove tmpfs files on the remote.
 /// `sudo` prefix (e.g. "sudo -n ") can be empty. Best-effort, errors ignored.
 pub(crate) async fn tmpfs_cleanup(
-    session: &mut client::Handle<Hk>,
+    session: &client::Handle<Hk>,
     paths: &[&str],
     sudo: &str,
     timeout: Duration,
@@ -316,9 +322,10 @@ pub async fn fetch_luks_info(
     let _ = s.disconnect(russh::Disconnect::ByApplication, "done", "en").await;
     Ok(results)
 }
-
+ 
 pub async fn unlock(
-    vault: &Vault, uuid: &[u8; 16], mut on: impl FnMut(UnlockEvent),
+    vault: &Vault, uuid: &[u8; 16], mode: ExecutionMode,
+    mut on: impl FnMut(UnlockEvent),
     mut verbose: Option<Box<dyn FnMut(&str) + Send>>,
 ) -> Result<(), UnlockError> {
     let p = vault.profile(uuid)?.clone();
@@ -329,7 +336,6 @@ pub async fn unlock(
     let (mut session, _) = match connect_result {
         Ok(r) => r,
         Err(UnlockError::HostKeyMismatch(e)) => {
-            // distinguish "booted OS" from real mismatch via a probe (no verbose needed for this quick check)
             let probe_result = probe(&p, None).await;
             if matches!(probe_result, ProbeResult::BootedOs) {
                 return Err(UnlockError::StateBootedOs);
@@ -351,59 +357,206 @@ pub async fn unlock(
     let sudo = ""; // initramfs runs as root, no sudo needed
     let mut targets = p.targets_meta.clone();
     targets.sort_by_key(|x| x.order);
-    for tm in &targets {
-        on(UnlockEvent::TargetStart(tm.mapped_name.clone()));
-        let key = secrets.keyfiles.iter().find(|k| k.luks_uuid == tm.luks_uuid)
-            .ok_or(VaultError::Invariant("missing keyfile"))?;
 
-        // Stage keyfile in tmpfs (binary safe, avoids stdin newline truncation)
-        let stage_cmd = format!("sh -c 'umask {UMASK_TMPFS} && mkdir -p {TMPFS_BASE} && cat > {TMPFS_KEYFILE}'");
-        if let Some(v) = verbose.as_mut() { v(&format!("  [unlock] $ {stage_cmd}")); }
-        tmpfs_stage(&mut session, TMPFS_KEYFILE, &key.keyfile, sudo, t).await?;
-
-        // Use tmpfs file for unlock
-        let cmd = format!("cryptsetup luksOpen --key-file={} UUID={} {}", TMPFS_KEYFILE, tm.luks_uuid, tm.mapped_name);
-        if let Some(v) = verbose.as_mut() { v(&cmd); }
-        let mut r = exec(&mut session, &cmd, None, t).await?;
-        if r.code != 0 && r.stderr.to_lowercase().contains("not exist") {
-            if let Some(fp) = &tm.fallback_path {
-                let cmd = format!("cryptsetup luksOpen --key-file={} {} {}", TMPFS_KEYFILE, fp, tm.mapped_name);
-                if let Some(v) = verbose.as_mut() { v(&cmd); }
-                r = exec(&mut session, &cmd, None, t).await?;
+    match mode {
+        ExecutionMode::Sequential => {
+            for (idx, tm) in targets.iter().enumerate() {
+                process_unlock_target(idx, &mut session, tm, &secrets, sudo, t, &mut on, &mut verbose).await?;
             }
         }
-        if r.code != 0 {
-            if let Some(v) = verbose.as_mut() { v(&format!("  [unlock] ! cmd={} exit={} stderr: {}", &cmd, r.code, r.stderr.trim())); }
+        ExecutionMode::Parallel => {
+            process_unlock_targets_parallel(&targets, &session, &secrets, sudo, t, &mut on, &mut verbose).await?;
         }
-        match r.code {
-            0 => on(UnlockEvent::TargetDone(tm.mapped_name.clone())),
-            2 => return Err(UnlockError::KeyRejected(tm.mapped_name.clone())),
-            5 => on(UnlockEvent::TargetAlreadyOpen(tm.mapped_name.clone())),
-            c => return Err(UnlockError::CryptsetupFailed { target: tm.mapped_name.clone(), code: c, stderr: r.stderr }),
-        }
-
-        // Cleanup keyfile
-        tmpfs_cleanup(&mut session, &[TMPFS_KEYFILE], sudo, t).await?;
     }
 
-    if let ResumePolicy::Command(c) = &p.resume {
-        if let Some(v) = &mut verbose { v(c); }
-        let r = exec(&mut session, c, None, t).await?;
-        if r.code != 0 {
-            if let Some(v) = verbose.as_mut() { v(&format!("  [unlock] ! cmd={} exit={} stderr: {}", c, r.code, r.stderr.trim())); }
-            return Err(UnlockError::ResumeFailed(r.stderr));
-        }
-        on(UnlockEvent::ResumeSent);
+    // Signal completion to ltv-luks-wrapper on initramfs
+    let resume_cmd = "touch /run/ltv/resume";
+    if let Some(v) = verbose.as_mut() { v(&format!("  [unlock] $ {}", resume_cmd)); }
+    let r = exec(&mut session, resume_cmd, None, t).await?;
+    if r.code != 0 {
+        if let Some(v) = verbose.as_mut() { v(&format!("  [unlock] ! cmd={} exit={} stderr: {}", resume_cmd, r.code, r.stderr.trim())); }
+        return Err(UnlockError::ResumeFailed(r.stderr));
     }
-
-    // Kill dropbear and any remaining cryptsetup processes waiting for passphrase
-    // This allows the initramfs boot to continue cleanly
-    let kill_cmd = KILL_CMD;
-    if let Some(v) = verbose.as_mut() { v(&format!("  [unlock] $ {}", kill_cmd)); }
-    let _ = exec(&mut session, kill_cmd, None, t).await;
+    on(UnlockEvent::ResumeSent);
 
     let _ = session.disconnect(russh::Disconnect::ByApplication, "done", "en").await;
     drop(secrets);
     on(UnlockEvent::Disconnected);
     Ok(())
+}
+
+
+/// Sequential helper: processes one target on the given session.
+async fn process_unlock_target(
+    idx: usize,
+    session: &client::Handle<Hk>,
+    tm: &TargetMeta,
+    secrets: &SecretPayload,
+    sudo: &str,
+    t: Duration,
+    on: &mut dyn FnMut(UnlockEvent),
+    verbose: &mut Option<Box<dyn FnMut(&str) + Send>>,
+) -> Result<(), UnlockError> {
+    on(UnlockEvent::TargetStart(tm.mapped_name.clone()));
+    let key = secrets.keyfiles.iter().find(|k| k.luks_uuid == tm.luks_uuid)
+        .ok_or(VaultError::Invariant("missing keyfile"))?;
+
+    let keyfile = target_keyfile(idx);
+
+    // Stage keyfile in tmpfs (binary safe, avoids stdin newline truncation)
+    if let Some(v) = verbose.as_mut() {
+        v(&format!("  [unlock] $ sh -c 'umask {UMASK_TMPFS} && mkdir -p {} && cat > {}'", target_tmpfs_dir(idx), keyfile));
+    }
+    tmpfs_stage(session, &keyfile, &key.keyfile, sudo, t).await?;
+
+    // Stage metadata for ltv-luks-wrapper (mapper name, uuid, order)
+    let mapper_file = format!("{}/mapper", target_tmpfs_dir(idx));
+    let uuid_file = format!("{}/uuid", target_tmpfs_dir(idx));
+    let order_file = format!("{}/order", target_tmpfs_dir(idx));
+    tmpfs_stage(session, &mapper_file, tm.mapped_name.as_bytes(), sudo, t).await?;
+    tmpfs_stage(session, &uuid_file, tm.luks_uuid.as_bytes(), sudo, t).await?;
+    tmpfs_stage(session, &order_file, idx.to_string().as_bytes(), sudo, t).await?;
+
+    // Use tmpfs file for unlock
+    let mut cmd = format!("cryptsetup luksOpen --key-file={} UUID={} {}", keyfile, tm.luks_uuid, tm.mapped_name);
+    if let Some(v) = verbose.as_mut() { v(&cmd); }
+    let mut r = exec(session, &cmd, None, t).await?;
+    if r.code != 0 && r.stderr.to_lowercase().contains("not exist") {
+        if let Some(fp) = &tm.fallback_path {
+            cmd = format!("cryptsetup luksOpen --key-file={} {} {}", keyfile, fp, tm.mapped_name);
+            if let Some(v) = verbose.as_mut() { v(&cmd); }
+            r = exec(session, &cmd, None, t).await?;
+        }
+    }
+    if r.code != 0 {
+        if let Some(v) = verbose.as_mut() { v(&format!("  [unlock] ! cmd={} exit={} stderr: {}", &cmd, r.code, r.stderr.trim())); }
+    }
+
+    // Cleanup keyfile and metadata files
+    let mapper_file = format!("{}/mapper", target_tmpfs_dir(idx));
+    let uuid_file = format!("{}/uuid", target_tmpfs_dir(idx));
+    let order_file = format!("{}/order", target_tmpfs_dir(idx));
+    tmpfs_cleanup(session, &[&keyfile, &mapper_file, &uuid_file, &order_file], sudo, t).await?;
+
+    match r.code {
+        0 => on(UnlockEvent::TargetDone(tm.mapped_name.clone())),
+        2 => return Err(UnlockError::KeyRejected(tm.mapped_name.clone())),
+        5 => on(UnlockEvent::TargetAlreadyOpen(tm.mapped_name.clone())),
+        c => return Err(UnlockError::CryptsetupFailed { target: tm.mapped_name.clone(), code: c, stderr: r.stderr }),
+    }
+    Ok(())
+}
+
+/// Message emitted from a parallel unlock task back to the driver loop.
+enum UnlockMsg {
+    Event(UnlockEvent),
+    Verbose(String),
+}
+
+/// Unlocks every target concurrently on independent SSH channels of one
+/// authenticated session. Concurrency is bounded so we don't overwhelm the
+/// initramfs SSH daemon.
+async fn process_unlock_targets_parallel(
+    targets: &[TargetMeta],
+    session: &client::Handle<Hk>,
+    secrets: &SecretPayload,
+    sudo: &str,
+    t: Duration,
+    on: &mut dyn FnMut(UnlockEvent),
+    verbose: &mut Option<Box<dyn FnMut(&str) + Send>>,
+) -> Result<(), UnlockError> {
+    use futures::stream::{FuturesUnordered, StreamExt};
+    use tokio::sync::{mpsc, Semaphore};
+
+    if let Some(v) = verbose.as_mut() { v(&format!("running {} target(s) in parallel", targets.len())); }
+
+    let semaphore = Semaphore::new(MAX_CONCURRENT_TARGETS);
+    let (tx, mut rx) = mpsc::unbounded_channel::<UnlockMsg>();
+
+    let mut futs: FuturesUnordered<_> = targets.iter().enumerate().map(|(idx, tm)| {
+        let tx = tx.clone();
+        let sem = &semaphore;
+        async move {
+            let _permit = sem.acquire().await;
+            let res: Result<(), UnlockError> = async {
+                let key = secrets.keyfiles.iter().find(|k| k.luks_uuid == tm.luks_uuid)
+                    .ok_or(VaultError::Invariant("missing keyfile"))?;
+                let keyfile = target_keyfile(idx);
+
+                let stage_cmd = format!(
+                    "sh -c 'umask {UMASK_TMPFS} && mkdir -p {} && cat > {}'",
+                    target_tmpfs_dir(idx), keyfile);
+                let _ = tx.send(UnlockMsg::Verbose(stage_cmd));
+                let _ = tx.send(UnlockMsg::Event(UnlockEvent::TargetStart(tm.mapped_name.clone())));
+                tmpfs_stage(session, &keyfile, &key.keyfile, sudo, t).await?;
+
+                // Stage metadata for ltv-luks-wrapper (mapper name, uuid, order)
+                let mapper_file = format!("{}/mapper", target_tmpfs_dir(idx));
+                let uuid_file = format!("{}/uuid", target_tmpfs_dir(idx));
+                let order_file = format!("{}/order", target_tmpfs_dir(idx));
+                tmpfs_stage(session, &mapper_file, tm.mapped_name.as_bytes(), sudo, t).await?;
+                tmpfs_stage(session, &uuid_file, tm.luks_uuid.as_bytes(), sudo, t).await?;
+                tmpfs_stage(session, &order_file, idx.to_string().as_bytes(), sudo, t).await?;
+
+                let mut cmd = format!("cryptsetup luksOpen --key-file={} UUID={} {}", keyfile, tm.luks_uuid, tm.mapped_name);
+                let _ = tx.send(UnlockMsg::Verbose(cmd.clone()));
+                let mut r = exec(session, &cmd, None, t).await?;
+                if r.code != 0 && r.stderr.to_lowercase().contains("not exist") {
+                    if let Some(fp) = &tm.fallback_path {
+                        cmd = format!("cryptsetup luksOpen --key-file={} {} {}", keyfile, fp, tm.mapped_name);
+                        let _ = tx.send(UnlockMsg::Verbose(cmd.clone()));
+                        r = exec(session, &cmd, None, t).await?;
+                    }
+                }
+                if r.code != 0 {
+                    let _ = tx.send(UnlockMsg::Verbose(format!(
+                        "! cmd={} exit={} stderr: {}", &cmd, r.code, r.stderr.trim())));
+                }
+                let mapper_file = format!("{}/mapper", target_tmpfs_dir(idx));
+                let uuid_file = format!("{}/uuid", target_tmpfs_dir(idx));
+                let order_file = format!("{}/order", target_tmpfs_dir(idx));
+                let _ = tmpfs_cleanup(session, &[&keyfile, &mapper_file, &uuid_file, &order_file], sudo, t).await;
+
+                match r.code {
+                    0 => { let _ = tx.send(UnlockMsg::Event(UnlockEvent::TargetDone(tm.mapped_name.clone()))); Ok(()) }
+                    2 => Err(UnlockError::KeyRejected(tm.mapped_name.clone())),
+                    5 => { let _ = tx.send(UnlockMsg::Event(UnlockEvent::TargetAlreadyOpen(tm.mapped_name.clone()))); Ok(()) }
+                    c => Err(UnlockError::CryptsetupFailed { target: tm.mapped_name.clone(), code: c, stderr: r.stderr }),
+                }
+            }.await;
+            res
+        }
+    }).collect();
+
+    let mut first_err: Option<UnlockError> = None;
+    let mut pending = targets.len();
+
+    while pending > 0 {
+        tokio::select! {
+            biased;
+            Some(msg) = rx.recv() => match msg {
+                UnlockMsg::Event(e) => on(e),
+                UnlockMsg::Verbose(s) => { if let Some(v) = verbose.as_mut() { v(&s); } }
+            },
+            Some(res) = futs.next() => {
+                pending -= 1;
+                if let Err(e) = res {
+                    if first_err.is_none() { first_err = Some(e); }
+                }
+            }
+        }
+    }
+
+    // Drain any buffered messages.
+    while let Ok(msg) = rx.try_recv() {
+        match msg {
+            UnlockMsg::Event(e) => on(e),
+            UnlockMsg::Verbose(s) => { if let Some(v) = verbose.as_mut() { v(&s); } }
+        }
+    }
+
+    match first_err {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
 }
