@@ -10,7 +10,7 @@ INIT_PATH="${1:-/usr/share/mkinitfs/initramfs-init}"
 content=$(cat "$INIT_PATH")
 
 # --- Idempotency check ---
-if echo "$content" | grep -q '### LTV PATCH START: network setup + dropbear for remote LUKS unlock ###'; then
+if echo "$content" | grep -q '### LTV PATCH START: network setup for remote LUKS unlock ###'; then
     echo "[$INIT_PATH] Already patched"
     exit 0
 fi
@@ -32,7 +32,7 @@ if ! printf '%s\n' "$content" | grep -q '^[[:space:]]*ltv$'; then
     exit 1
 fi
 
-# --- 2. Insert LTV hook before the zpool/ntab anchor line ---
+# --- 2. Insert LTV network setup before the zpool/ntab anchor line ---
 anchor="# zpool reports /dev/zfs missing if it can.t read /etc/mtab"
 # The anchor in file has a literal single quote. Match with regex.
 if ! printf '%s\n' "$content" | grep -q "$anchor"; then
@@ -40,17 +40,16 @@ if ! printf '%s\n' "$content" | grep -q "$anchor"; then
     exit 1
 fi
 
-# Use awk to insert hook before the anchor line
+# Use awk to insert network setup before the anchor line
 content=$(printf '%s\n' "$content" | awk -v anchor="$anchor" '
     BEGIN { done=0 }
     $0 ~ anchor && !done {
-        print "### LTV PATCH START: network setup + dropbear for remote LUKS unlock ###"
+        print "### LTV PATCH START: network setup for remote LUKS unlock ###"
         print "### inserted after other network boot setups (e.g. KOPT_nbd, wireguard) ###"
         print "if [ -n \"$KOPT_ltv\" ] && $do_networking; then"
         print "\tconfigure_ip"
-        print "\t. /usr/share/mkinitfs/ltv-hook.sh"
         print "fi"
-        print "### LTV PATCH END: network setup + dropbear for remote LUKS unlock ###"
+        print "### LTV PATCH END: network setup for remote LUKS unlock ###"
         print ""
         done=1
     }
@@ -63,7 +62,8 @@ content=$(printf '%s\n' "$content" | awk -v anchor="$anchor" '
 content=$(printf '%s\n' "$content" | awk '
     /^\s*\$MOCK nlplug-findfs \$cryptopts -p \/sbin\/mdev/ && !done {
         print "\t# LTV: replace nlplug-findfs with ltv-luks-wrapper"
-        print "\tltv-luks-wrapper $cryptopts -p /sbin/mdev ${KOPT_debug_init:+-d} \\"
+        print "\texport LTV_PORT=\"${KOPT_ltv_port:-22}\""
+        print "\t/usr/share/mkinitfs/ltv-luks-wrapper.sh $cryptopts -p /sbin/mdev ${KOPT_debug_init:+-d} \\"
         print "\t\t${KOPT_usbdelay:+-t $((KOPT_usbdelay*1000))} \\"
         print "\t\t${KOPT_uevent_buf_size:+-U $KOPT_uevent_buf_size} \\"
         print "\t\t\"$KOPT_root\""
