@@ -343,8 +343,8 @@ fn print_help() {
   show <profile>                 Show full profile details (public parts)
   add                            Add new profile interactively (wizard)
   rm <profile>                   Remove profile (requires confirmation)
-  edit <profile> [field=val...]  Edit scalar fields: name, host, port, user, notes,
-                                 connect_timeout, exec_timeout, resume
+  edit <profile> [field=val...]  Edit fields: name, host, port, os_host, os_port, user, notes,
+                                 connect_timeout, exec_timeout, resume (run 'edit --help' for details)
   target add <profile>           Add target to profile interactively
   target rm <profile> <uuid>     Remove target from profile
   pubkey <profile>               Print profile's Ed25519 client identity public key
@@ -493,7 +493,32 @@ fn handle_edit(st: &mut State, parts: &[&str]) -> Result<(), String> {
     opts.optflag("h", "help", "show help");
     let matches = opts.parse(&parts[1..]).map_err(|e| e.to_string())?;
     
-    if matches.free.is_empty() { return Err("Usage: edit <profile> [field=value ...]".into()); }
+    // Show help if no profile given or --help flag
+    if matches.free.is_empty() || matches.opt_present("h") {
+        println!("Usage: edit <profile> [field=value ...]");
+        println!();
+        println!("Editable fields:");
+        println!("  name                Profile name");
+        println!("  host                Initramfs SSH host (IP/DNS)");
+        println!("  port                Initramfs SSH port (default 22)");
+        println!("  os_host             Boote OS SSH host (blank = same as initramfs)");
+        println!("  os_port             Boote OS SSH port (blank = same as initramfs)");
+        println!("  user | username     SSH username (default root)");
+        println!("  notes               Free-form notes");
+        println!("  connect_timeout     SSH connect timeout seconds (default 10)");
+        println!("  exec_timeout        Command execution timeout seconds (default 60)");
+        println!("  resume              poll | <command>");
+        println!("                        poll  = wait for /dev/mapper devices");
+        println!("                        cmd   = shell command to run after unlock");
+        println!();
+        println!("Examples:");
+        println!("  edit myvault host=10.0.0.5 port=2222");
+        println!("  edit myvault os_host=10.0.0.5 os_port=22 user=admin");
+        println!("  edit myvault resume=poll");
+        println!("  edit myvault 'resume=systemctl start myservice'");
+        return Ok(());
+    }
+    
     let n = &matches.free[0];
     let rest = &matches.free[1..];
     let v = st.vault.as_mut().ok_or("no vault open")?;
@@ -517,7 +542,7 @@ fn handle_edit(st: &mut State, parts: &[&str]) -> Result<(), String> {
                     else { p.resume = ResumePolicy::Command(v.into()); }
                     changed = true;
                 }
-                _ => return Err(format!("unknown field: {k}")),
+                _ => return Err(format!("unknown field: {k}. Run 'edit --help' for available fields.")),
             }
         }
     }
