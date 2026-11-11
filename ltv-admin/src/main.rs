@@ -329,7 +329,7 @@ async fn handle_command(st: &mut State, parts: &[&str]) -> Result<bool, String> 
         "create" => handle_create(st, parts)?,
         "open" => handle_open(st, parts)?,
         "save" => { save_atomic(st)?; }
-        "close" => { st.vault = None; st.path = None; st.vault_name = None; }
+        "close" => { close_vault(st)?; }
         "status" => handle_status(st)?,
         "ls" => handle_ls(st)?,
         "show" => handle_show(st, parts)?,
@@ -430,6 +430,11 @@ fn handle_create(st: &mut State, parts: &[&str]) -> Result<(), String> {
     let f = matches.free[0].clone();
     let path = PathBuf::from(&f);
     
+    // Close current vault if open (with dirty check)
+    if st.vault.is_some() {
+        close_vault(st)?;
+    }
+    
     // Check if file already exists
     if path.exists() {
         let confirm = ask(&format!("File '{}' already exists. Overwrite? [y/N]: ", f));
@@ -452,12 +457,36 @@ fn handle_open(st: &mut State, parts: &[&str]) -> Result<(), String> {
     
     if matches.free.is_empty() { return Err("Usage: open <file>".into()); }
     let f = matches.free[0].clone();
+    
+    // Close current vault if open (with dirty check)
+    if st.vault.is_some() {
+        close_vault(st)?;
+    }
+    
     let bytes = fs::read(&f).map_err(|e| e.to_string())?;
     let v = Vault::open(&bytes, &pass("Passphrase: ")).map_err(|e| e.to_string())?;
     println!("opened: {} profiles", v.inventory.profiles.len());
     let path = PathBuf::from(f);
     st.vault_name = path.file_stem().and_then(|s| s.to_str()).map(|s| s.to_string());
     st.vault = Some(v); st.path = Some(path);
+    Ok(())
+}
+
+fn close_vault(st: &mut State) -> Result<(), String> {
+    if let Some(v) = &st.vault {
+        if v.is_dirty() {
+            let choice = ask("Unsaved changes. Save before closing? [Y/n/d]: ").to_lowercase();
+            match choice.as_str() {
+                "n" | "no" => {}, // discard changes
+                "d" | "discard" => {}, // explicit discard
+                _ => { save_atomic(st)?; } // default: save
+            }
+        }
+    }
+    st.vault = None;
+    st.path = None;
+    st.vault_name = None;
+    println!("Vault closed.");
     Ok(())
 }
 
