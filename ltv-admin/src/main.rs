@@ -167,7 +167,9 @@ async fn cmd_server_setup(st: &mut State, name: &str, args: &[&str]) -> Result<(
     fs::write(deploy_dir.join("ltv.packages"), LTV_PACKAGES).map_err(|e| e.to_string())?;
 
     // 2. luks wrapper & common lib
-    fs::write(deploy_dir.join("ltv-luks-wrapper.sh"), LTV_LUKS_WRAPPER).map_err(|e| e.to_string())?;
+    // Template the port into the wrapper (replaces ${LTV_PORT:-22} with actual port)
+    let wrapper = LTV_LUKS_WRAPPER.replace("${LTV_PORT:-22}", &p.port.to_string());
+    fs::write(deploy_dir.join("ltv-luks-wrapper.sh"), wrapper).map_err(|e| e.to_string())?;
     let mut perms = fs::metadata(deploy_dir.join("ltv-luks-wrapper.sh")).map_err(|e| e.to_string())?.permissions();
     perms.set_mode(0o755);
     fs::set_permissions(deploy_dir.join("ltv-luks-wrapper.sh"), perms).map_err(|e| e.to_string())?;

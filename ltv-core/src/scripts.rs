@@ -29,7 +29,6 @@ pub fn render_cmdline(p: &Profile) -> String {
     CMDLINE_TMPL
         .replace("{mappers}", &mappers)
         .replace("{ltv_uuids}", &ltv_uuids)
-        .replace("{port}", &p.port.to_string())
 }
 
 /// Render deploy.sh with kernel version.
@@ -95,7 +94,7 @@ mod tests {
         assert!(out.contains("ltv_mappers=cryptroot,cryptdata"));
         assert!(out.contains("ltv_cryptroot=111832b4-5029-4439-8713-d5b928f44412"));
         assert!(out.contains("ltv_cryptdata=ac302374-1b08-4511-944b-ef1658dd909b"));
-        assert!(out.contains("ltv_port=22"));
+        assert!(!out.contains("ltv_port="));
         assert!(out.contains("ip=dhcp"));
     }
 

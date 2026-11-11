@@ -62,7 +62,6 @@ content=$(printf '%s\n' "$content" | awk -v anchor="$anchor" '
 content=$(printf '%s\n' "$content" | awk '
     /^\s*\$MOCK nlplug-findfs \$cryptopts -p \/sbin\/mdev/ && !done {
         print "\t# LTV: replace nlplug-findfs with ltv-luks-wrapper"
-        print "\texport LTV_PORT=\"${KOPT_ltv_port:-22}\""
         print "\t/usr/share/mkinitfs/ltv-luks-wrapper.sh $cryptopts -p /sbin/mdev ${KOPT_debug_init:+-d} \\"
         print "\t\t${KOPT_usbdelay:+-t $((KOPT_usbdelay*1000))} \\"
         print "\t\t${KOPT_uevent_buf_size:+-U $KOPT_uevent_buf_size} \\"
