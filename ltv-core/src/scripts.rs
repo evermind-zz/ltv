@@ -44,7 +44,7 @@ pub fn render_deploy_nopatch_sh(kernel_version: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{constants::*, model::{Profile, TargetMeta, ResumePolicy}};
+    use crate::{constants::*, model::{Profile, TargetMeta}};
     use uuid::Uuid;
 
     fn test_profile() -> Profile {
@@ -79,7 +79,6 @@ mod tests {
                 token_id: None,
             },
         ],
-        resume: ResumePolicy::default(),
         connect_timeout_s: 10,
         exec_timeout_s: 30,
         envelope_nonce: [0u8; NONCE_LEN],

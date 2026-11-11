@@ -1,5 +1,5 @@
 use std::{fs, path::PathBuf, env};
-use ltv_core::{format::Argon2Params, model::{Profile, TargetMeta, ResumePolicy, BootedAccess, BootedAuth, fingerprint_sha256, HostKey, SecretPayload, ExecutionMode}, net::{fetch_host_key, fetch_luks_info, probe, unlock, ProbeResult}, vault::{Vault, ssh_ed25519_blob}, enroll::EnrollEvent, rotate::RotateEvent, scripts::{render_cmdline, render_deploy_sh, render_deploy_nopatch_sh, LTV_FILES, LTV_MODULES, LTV_PACKAGES, LTV_LUKS_WRAPPER, LTV_COMMON, LTV_PATCH_INIT, LTV_COMMIT_HOOK}};
+use ltv_core::{format::Argon2Params, model::{Profile, TargetMeta, BootedAccess, BootedAuth, fingerprint_sha256, HostKey, SecretPayload, ExecutionMode}, net::{fetch_host_key, fetch_luks_info, probe, unlock, ProbeResult}, vault::{Vault, ssh_ed25519_blob}, enroll::EnrollEvent, rotate::RotateEvent, scripts::{render_cmdline, render_deploy_sh, render_deploy_nopatch_sh, LTV_FILES, LTV_MODULES, LTV_PACKAGES, LTV_LUKS_WRAPPER, LTV_COMMON, LTV_PATCH_INIT, LTV_COMMIT_HOOK}};
 use std::path::Path;
 use rustyline::{error::ReadlineError, DefaultEditor};
 use secrecy::{ExposeSecret, SecretString, SecretVec};
@@ -91,7 +91,11 @@ fn cmd_add(st: &mut State) -> Result<(), String> {
     let os_host = if os_host.is_empty() { None } else { Some(os_host) };
     let os_port = if os_port_str.is_empty() { None } else { Some(os_port_str.parse().map_err(|_| "bad OS port")?) };
     let user = ask_or("Username", "root");
+    let notes = ask("Notes (optional): ");
     let uuid = v.add_profile(&name, &unlock_host, unlock_port, &user, os_host, os_port).map_err(|e| e.to_string())?;
+    if !notes.is_empty() {
+        v.update_profile(&uuid, |p| p.notes = notes.clone()).map_err(|e| e.to_string())?;
+    }
     loop {
         let luks_uuid = ask("LUKS UUID (blank = done): ");
         if luks_uuid.is_empty() { break; }
@@ -397,7 +401,7 @@ fn print_help() {
   add                            Add new profile interactively (wizard)
   rm <profile>                   Remove profile (requires confirmation)
   edit <profile> [field=val...]  Edit fields: name, unlock_host, unlock_port, os_host, os_port, user, notes,
-                                 connect_timeout, exec_timeout, resume (run 'edit --help' for details)
+                                 connect_timeout, exec_timeout (run 'edit --help' for details)
   target add <profile>           Add target to profile interactively
   target rm <profile> <uuid>     Remove target from profile
   pubkey <profile>               Print profile's Ed25519 client identity public key
@@ -560,6 +564,7 @@ fn handle_show(st: &State, parts: &[&str]) -> Result<(), String> {
         _ => "same as unlock SSH".to_string(),
     };
     println!("name: {}\nunlock SSH: {}:{} user {}\nOS SSH: {}\nuuid: {}", p.name, p.unlock_host, p.unlock_port, p.username, os_addr, uuid::Uuid::from_bytes(p.uuid));
+    println!("notes: {}", if p.notes.is_empty() { "(none)" } else { &p.notes });
     if let Some(k) = &p.unlock_host_key { println!("unlock SSH hostkey: {} {}", k.key_type, fingerprint_sha256(&k.key_bytes)); }
     if let Some(k) = &p.os_host_key { println!("OS SSH hostkey: {} {}", k.key_type, fingerprint_sha256(&k.key_bytes)); }
     for t in &p.targets_meta { 
@@ -598,18 +603,14 @@ fn handle_edit(st: &mut State, parts: &[&str]) -> Result<(), String> {
         println!("  os_host             OS SSH host (blank = same as unlock SSH)");
         println!("  os_port             OS SSH port (blank = same as unlock SSH)");
         println!("  user | username     SSH username (default root)");
-        println!("  notes               Free-form notes");
+        println!("  notes               Free-form notes (shown in 'show')");
         println!("  connect_timeout     SSH connect timeout seconds (default 10)");
         println!("  exec_timeout        Command execution timeout seconds (default 60)");
-        println!("  resume              poll | <command>");
-        println!("                        poll  = wait for /dev/mapper devices");
-        println!("                        cmd   = shell command to run after unlock");
         println!();
         println!("Examples:");
         println!("  edit myvault unlock_host=10.0.0.5 unlock_port=2222");
         println!("  edit myvault os_host=10.0.0.5 os_port=22 user=admin");
-        println!("  edit myvault resume=poll");
-        println!("  edit myvault 'resume=systemctl start myservice'");
+        println!("  edit myvault notes=rack4");
         return Ok(());
     }
     
@@ -630,11 +631,6 @@ fn handle_edit(st: &mut State, parts: &[&str]) -> Result<(), String> {
                 "notes" => { p.notes = v.into(); changed = true; }
                 "connect_timeout" => { p.connect_timeout_s = v.parse().map_err(|_| "bad timeout")?; changed = true; }
                 "exec_timeout" => { p.exec_timeout_s = v.parse().map_err(|_| "bad timeout")?; changed = true; }
-                "resume" => {
-                    if v == "poll" { p.resume = ResumePolicy::DeviceMapperPoll; }
-                    else { p.resume = ResumePolicy::Command(v.into()); }
-                    changed = true;
-                }
                 _ => return Err(format!("unknown field: {k}. Run 'edit --help' for available fields.")),
             }
         }
@@ -1046,7 +1042,6 @@ async fn handle_copy_profile(st: &mut State, parts: &[&str]) -> Result<(), Strin
         v.update_profile(&new_uuid, |p| {
             p.client_public_key = src_profile.client_public_key.clone();
             p.targets_meta = src_profile.targets_meta.clone();
-            p.resume = src_profile.resume.clone();
             p.connect_timeout_s = src_profile.connect_timeout_s;
             p.exec_timeout_s = src_profile.exec_timeout_s;
             p.unlock_host_key = src_profile.unlock_host_key.clone();
@@ -1072,7 +1067,6 @@ async fn handle_copy_profile(st: &mut State, parts: &[&str]) -> Result<(), Strin
         v.update_profile(&new_uuid, |p| {
             p.client_public_key = pubblob;
             p.targets_meta = src_profile.targets_meta.clone();
-            p.resume = src_profile.resume.clone();
             p.connect_timeout_s = src_profile.connect_timeout_s;
             p.exec_timeout_s = src_profile.exec_timeout_s;
             p.unlock_host_key = None; // Don't copy host keys

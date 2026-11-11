@@ -120,7 +120,7 @@ impl Vault {
         let mut p = Profile {
             uuid, name: name.into(), notes: String::new(), unlock_host: unlock_host.into(), unlock_port, os_host, os_port, username: username.into(),
             unlock_host_key: None, os_host_key: None, host_key_pinned_at: 0,
-            client_public_key: pubblob, targets_meta: vec![], resume: ResumePolicy::default(),
+            client_public_key: pubblob, targets_meta: vec![],
             connect_timeout_s: DEFAULT_CONNECT_TIMEOUT, exec_timeout_s: DEFAULT_EXEC_TIMEOUT, envelope_nonce: [0; NONCE_LEN], envelope_ciphertext: vec![],
         };
         self.seal_secrets(&mut p, &secrets)?;

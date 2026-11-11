@@ -28,7 +28,6 @@ pub struct Profile {
     pub host_key_pinned_at: u64,
     pub client_public_key: Vec<u8>,          // ssh wire blob
     pub targets_meta: Vec<TargetMeta>,
-    pub resume: ResumePolicy,
     pub connect_timeout_s: u16,
     pub exec_timeout_s: u16,
     pub envelope_nonce: [u8; 24],
@@ -53,13 +52,6 @@ pub struct TargetMeta {
     pub order: u8,
     pub keyslot: Option<u8>,
     pub token_id: Option<u32>,
-}
-
-#[derive(Serialize, Deserialize, Clone)]
-pub enum ResumePolicy { DeviceMapperPoll, Command(String) }
-
-impl Default for ResumePolicy {
-    fn default() -> Self { ResumePolicy::Command("".into()) }
 }
 
 /// Execution mode for multi-target operations (unlock, enroll, rotate).
