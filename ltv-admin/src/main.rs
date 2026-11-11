@@ -1,4 +1,4 @@
-use std::{fs, path::PathBuf};
+use std::{fs, path::PathBuf, env};
 use ltv_core::{format::Argon2Params, model::{Profile, TargetMeta, ResumePolicy, BootedAccess, BootedAuth, fingerprint_sha256, HostKey, SecretPayload, ExecutionMode}, net::{fetch_host_key, fetch_luks_info, probe, unlock}, vault::{Vault, ssh_ed25519_blob}, enroll::EnrollEvent, rotate::RotateEvent, scripts::{render_cmdline, render_deploy_sh, render_deploy_nopatch_sh, LTV_FILES, LTV_MODULES, LTV_PACKAGES, LTV_LUKS_WRAPPER, LTV_COMMON, LTV_PATCH_INIT, LTV_COMMIT_HOOK}};
 use std::path::Path;
 use rustyline::{error::ReadlineError, DefaultEditor};
@@ -6,6 +6,8 @@ use secrecy::{ExposeSecret, SecretString, SecretVec};
 use getopts::Options;
 use base64::Engine;
 use ed25519_dalek::SigningKey;
+
+const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 struct State { 
     path: Option<PathBuf>, 
@@ -261,10 +263,29 @@ After deployment and reboot:
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Parse CLI arguments
+    let args: Vec<String> = env::args().collect();
+    let mut opts = Options::new();
+    opts.optflag("h", "help", "Show usage information");
+    opts.optflag("v", "version", "Show version");
+    let matches = match opts.parse(&args[1..]) {
+        Ok(m) => m,
+        Err(e) => { eprintln!("{}", e); std::process::exit(1); }
+    };
+
+    if matches.opt_present("h") {
+        print_usage(&args[0]);
+        return Ok(());
+    }
+    if matches.opt_present("v") {
+        println!("ltv-admin {}", VERSION);
+        return Ok(());
+    }
+
     let mut st = State { path: None, vault: None, vault_name: None, verbose: false };
     let mut rl = DefaultEditor::new()?;
 
-    println!("ltv-admin — LUKS SSH Unlock Admin");
+    println!("ltv-admin — LUKS SSH Unlock Admin v{}", VERSION);
     println!("Type 'help' for commands.");
 
     loop {
@@ -367,6 +388,18 @@ fn print_help() {
   verbose [on|off|toggle]        Toggle verbose output for enroll/fetch/unlock/probe
   quit | exit                    Exit (prompts to save if dirty)
 "#);
+}
+
+fn print_usage(program: &str) {
+    println!("ltv-admin {} — LUKS SSH Unlock Admin", VERSION);
+    println!();
+    println!("Usage: {} [OPTIONS]", program);
+    println!();
+    println!("Options:");
+    println!("  -h, --help     Show this usage information");
+    println!("  -v, --version  Show version");
+    println!();
+    println!("Without options, starts interactive shell. Type 'help' for commands.");
 }
 
 fn handle_verbose(st: &mut State, parts: &[&str]) -> Result<(), String> {
