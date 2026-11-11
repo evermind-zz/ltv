@@ -325,8 +325,6 @@ async fn handle_command(st: &mut State, parts: &[&str]) -> Result<bool, String> 
         "server-setup" => handle_server_setup(st, parts).await?,
         "passwd" => handle_passwd(st, parts)?,
         "backup" => handle_backup(st, parts)?,
-        "import-profile" => println!("import-profile: not yet implemented"),
-        "export-profile" => println!("export-profile: not yet implemented"),
         "rotate-key" => handle_rotate(st, parts).await?,
         "copy-profile" => handle_copy_profile(st, parts).await?,
         _ => return Err(format!("unknown command: {}. Type 'help' for list.", parts[0])),
@@ -366,8 +364,6 @@ fn print_help() {
   copy-profile <src> <prof> [--name <n>] [--keep]
                                   Copy profile from another vault
                                   --keep: identical copy (same client key + host keys)
-  import-profile                 Import profile from another vault
-  export-profile <profile> <dir> Export profile to directory
   verbose [on|off|toggle]        Toggle verbose output for enroll/fetch/unlock/probe
   quit | exit                    Exit (prompts to save if dirty)
 "#);
@@ -1109,9 +1105,18 @@ fn handle_passwd(st: &mut State, parts: &[&str]) -> Result<(), String> {
     let _matches = opts.parse(&parts[1..]).map_err(|e| e.to_string())?;
     
     let v = st.vault.as_mut().ok_or("no vault open")?;
+    let path = st.path.clone().ok_or("no vault path")?;
+    
+    // Ask for old passphrase and verify
+    let old_pass = pass("Old passphrase: ");
+    let bytes = fs::read(&path).map_err(|e| e.to_string())?;
+    Vault::open(&bytes, &old_pass).map_err(|_| "old passphrase incorrect")?;
+    
+    // Ask for new passphrase twice
     let p1 = pass("New passphrase: "); let p2 = pass("Repeat: ");
     if p1.expose_secret() != p2.expose_secret() { return Err("passphrases differ".into()); }
     v.change_passphrase(0, &p1, Argon2Params::default()).map_err(|e| e.to_string())?;
+    println!("Passphrase changed successfully.");
     Ok(())
 }
 
