@@ -82,14 +82,14 @@ pub async fn fetch_host_key(host: &str, port: u16, connect_s: u16) -> Result<Hos
 /// Steps 1–2 only. No authentication, no secrets.
 /// If `verbose` is provided, it will be called with connection details.
 pub async fn probe(p: &Profile, mut verbose: Option<Box<dyn FnMut(&str) + Send>>) -> ProbeResult {
-    if let Some(v) = verbose.as_mut() { v(&format!("Connecting to {}:{} (timeout {}s)", p.host, p.port, p.connect_timeout_s)); }
-    match connect(&p.host, p.port, p.connect_timeout_s, None).await {
+    if let Some(v) = verbose.as_mut() { v(&format!("Connecting to {}:{} (timeout {}s)", p.unlock_host, p.unlock_port, p.connect_timeout_s)); }
+    match connect(&p.unlock_host, p.unlock_port, p.connect_timeout_s, None).await {
         Err(UnlockError::Net(NetError::Timeout)) => ProbeResult::Unreachable("timeout".into()),
         Err(e) => ProbeResult::Unreachable(e.to_string()),
         Ok((s, k)) => {
             if let Some(v) = verbose.as_mut() { v(&format!("SSH host key: {} {}", k.key_type, fingerprint_sha256(&k.key_bytes))); }
             let _ = s.disconnect(russh::Disconnect::ByApplication, "", "en").await;
-            if p.initramfs_host_key.as_ref() == Some(&k) { ProbeResult::WaitingInInitramfs }
+            if p.unlock_host_key.as_ref() == Some(&k) { ProbeResult::WaitingInInitramfs }
             else if p.os_host_key.as_ref() == Some(&k) { ProbeResult::BootedOs }
             else { ProbeResult::UnknownHostKey(k) }
         }
@@ -211,9 +211,9 @@ pub async fn fetch_luks_info(
     let p = vault.profile(uuid)?.clone();
     let os_key = p.os_host_key.clone().ok_or(UnlockError::HostKeyNotPinned)?;
 
-    // Resolve OS address (fallback to initramfs address if not set)
-    let os_host = p.os_host.as_deref().unwrap_or(&p.host);
-    let os_port = p.os_port.unwrap_or(p.port);
+    // Resolve OS address (fallback to unlock SSH address if not set)
+    let os_host = p.os_host.as_deref().unwrap_or(&p.unlock_host);
+    let os_port = p.os_port.unwrap_or(p.unlock_port);
 
     let (mut s, _) = connect_and_auth(os_host, os_port, access.connect_timeout_s, Some(os_key), &access.username, &access.auth).await?;
 
@@ -329,10 +329,10 @@ pub async fn unlock(
     mut verbose: Option<Box<dyn FnMut(&str) + Send>>,
 ) -> Result<(), UnlockError> {
     let p = vault.profile(uuid)?.clone();
-    let expected = p.initramfs_host_key.clone().ok_or(UnlockError::HostKeyNotPinned)?;
+    let expected = p.unlock_host_key.clone().ok_or(UnlockError::HostKeyNotPinned)?;
     on(UnlockEvent::Connecting);
 
-    let connect_result = connect(&p.host, p.port, p.connect_timeout_s, Some(expected)).await;
+    let connect_result = connect(&p.unlock_host, p.unlock_port, p.connect_timeout_s, Some(expected)).await;
     let (mut session, _) = match connect_result {
         Ok(r) => r,
         Err(UnlockError::HostKeyMismatch(e)) => {

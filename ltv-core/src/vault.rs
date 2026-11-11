@@ -112,14 +112,14 @@ impl Vault {
         Ok(idx)
     }
 
-    pub fn add_profile(&mut self, name: &str, host: &str, port: u16, username: &str, os_host: Option<String>, os_port: Option<u16>) -> Result<[u8; 16], VaultError> {
+    pub fn add_profile(&mut self, name: &str, unlock_host: &str, unlock_port: u16, username: &str, os_host: Option<String>, os_port: Option<u16>) -> Result<[u8; 16], VaultError> {
         let uuid = *uuid::Uuid::new_v4().as_bytes();
         let signing = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
         let pubblob = ssh_ed25519_blob(signing.verifying_key().as_bytes());
         let secrets = SecretPayload { client_private_seed: signing.to_bytes(), keyfiles: vec![] };
         let mut p = Profile {
-            uuid, name: name.into(), notes: String::new(), host: host.into(), port, os_host, os_port, username: username.into(),
-            initramfs_host_key: None, os_host_key: None, host_key_pinned_at: 0,
+            uuid, name: name.into(), notes: String::new(), unlock_host: unlock_host.into(), unlock_port, os_host, os_port, username: username.into(),
+            unlock_host_key: None, os_host_key: None, host_key_pinned_at: 0,
             client_public_key: pubblob, targets_meta: vec![], resume: ResumePolicy::default(),
             connect_timeout_s: DEFAULT_CONNECT_TIMEOUT, exec_timeout_s: DEFAULT_EXEC_TIMEOUT, envelope_nonce: [0; NONCE_LEN], envelope_ciphertext: vec![],
         };
@@ -174,7 +174,7 @@ impl Vault {
 
     pub fn set_host_key(&mut self, uuid: &[u8; 16], key: HostKey, os: bool) -> Result<(), VaultError> {
         let p = self.profile_mut(uuid)?;
-        if os { p.os_host_key = Some(key) } else { p.initramfs_host_key = Some(key); p.host_key_pinned_at = now(); }
+        if os { p.os_host_key = Some(key) } else { p.unlock_host_key = Some(key); p.host_key_pinned_at = now(); }
         self.dirty = true;
         Ok(())
     }

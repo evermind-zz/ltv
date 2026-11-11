@@ -84,14 +84,14 @@ fn resolve<'a>(v: &'a Vault, name: &str) -> Result<&'a Profile, String> {
 fn cmd_add(st: &mut State) -> Result<(), String> {
     let v = st.vault.as_mut().ok_or("no vault open")?;
     let name = ask("Profile name: ");
-    let host = ask("Initramfs host (IP/DNS): ");
-    let port: u16 = ask_or("Initramfs port", "22").parse().map_err(|_| "bad port")?;
-    let os_host = ask("OS host (IP/DNS, blank = same as initramfs): ");
-    let os_port_str = ask("OS port (blank = same as initramfs): ");
+    let unlock_host = ask("Unlock SSH host (IP/DNS): ");
+    let unlock_port: u16 = ask_or("Unlock SSH port", "22").parse().map_err(|_| "bad port")?;
+    let os_host = ask("OS SSH host (IP/DNS, blank = same as unlock SSH): ");
+    let os_port_str = ask("OS SSH port (blank = same as unlock SSH): ");
     let os_host = if os_host.is_empty() { None } else { Some(os_host) };
     let os_port = if os_port_str.is_empty() { None } else { Some(os_port_str.parse().map_err(|_| "bad OS port")?) };
     let user = ask_or("Username", "root");
-    let uuid = v.add_profile(&name, &host, port, &user, os_host, os_port).map_err(|e| e.to_string())?;
+    let uuid = v.add_profile(&name, &unlock_host, unlock_port, &user, os_host, os_port).map_err(|e| e.to_string())?;
     loop {
         let luks_uuid = ask("LUKS UUID (blank = done): ");
         if luks_uuid.is_empty() { break; }
@@ -167,7 +167,7 @@ async fn cmd_server_setup(st: &mut State, name: &str, args: &[&str]) -> Result<(
 
     // Compute fingerprint on FULL 51-byte blob (matches dropbearkey output)
     let fp = fingerprint_sha256(&host_key_public_bytes_full);
-    println!("Pin initramfs_host_key fingerprint: {}", fp);
+    println!("Pin unlock SSH host key fingerprint: {}", fp);
 
     use std::os::unix::fs::PermissionsExt;
     let mut perms = fs::metadata(&key_path).map_err(|e| e.to_string())?.permissions();
@@ -183,7 +183,7 @@ async fn cmd_server_setup(st: &mut State, name: &str, args: &[&str]) -> Result<(
     // Store FULL 51-byte SSH wire format in vault (matches russh presented key)
     let host_key_public_bytes = host_key_public_bytes_full;
 
-    // Always pin the freshly generated initramfs host key (overwrite any stale value)
+    // Always pin the freshly generated unlock SSH host key (overwrite any stale value)
     v.set_host_key(&p.uuid, HostKey {
         key_type: "ssh-ed25519".into(),
         key_bytes: host_key_public_bytes,
@@ -193,7 +193,7 @@ async fn cmd_server_setup(st: &mut State, name: &str, args: &[&str]) -> Result<(
         let bytes = v.save().map_err(|e| e.to_string())?;
         fs::write(path, bytes).map_err(|e| e.to_string())?;
     }
-    println!("Pinned initramfs_host_key in vault (fingerprint: {})", fp);
+    println!("Pinned unlock SSH host key in vault (fingerprint: {})", fp);
 
     // 1. mkinitfs feature files (from embedded scripts)
     fs::write(deploy_dir.join("ltv.files"), LTV_FILES).map_err(|e| e.to_string())?;
@@ -202,7 +202,7 @@ async fn cmd_server_setup(st: &mut State, name: &str, args: &[&str]) -> Result<(
 
     // 2. luks wrapper & common lib
     // Template the port into the wrapper (replaces ${LTV_PORT:-22} with actual port)
-    let wrapper = LTV_LUKS_WRAPPER.replace("${LTV_PORT:-22}", &p.port.to_string());
+    let wrapper = LTV_LUKS_WRAPPER.replace("${LTV_PORT:-22}", &p.unlock_port.to_string());
     fs::write(deploy_dir.join("ltv-luks-wrapper.sh"), wrapper).map_err(|e| e.to_string())?;
     let mut perms = fs::metadata(deploy_dir.join("ltv-luks-wrapper.sh")).map_err(|e| e.to_string())?.permissions();
     perms.set_mode(0o755);
@@ -392,19 +392,19 @@ fn print_help() {
   save                           Save changes to vault file (atomic write)
   close                          Close current vault
   status                         Show vault status (file, profile count, dirty flag)
-  ls                             List profiles: name, host, target count, hostkey status
+  ls                             List profiles: name, unlock SSH, target count, unlock hostkey status
   show <profile>                 Show full profile details (public parts)
   add                            Add new profile interactively (wizard)
   rm <profile>                   Remove profile (requires confirmation)
-  edit <profile> [field=val...]  Edit fields: name, host, port, os_host, os_port, user, notes,
+  edit <profile> [field=val...]  Edit fields: name, unlock_host, unlock_port, os_host, os_port, user, notes,
                                  connect_timeout, exec_timeout, resume (run 'edit --help' for details)
   target add <profile>           Add target to profile interactively
   target rm <profile> <uuid>     Remove target from profile
   pubkey <profile>               Print profile's Ed25519 client identity public key
   rotate-key <profile> [--target <uuid|mapper>] [--verbose] [--sequential]
                                   Rotate LUKS keyfiles: add new key, verify, kill old slot (auto-saves)
-  hostkey fetch <profile> [--os]    TOFU-fetch Dropbear/OS host key, confirm, store
-  hostkey repin <profile>           Re-pin initramfs host key (fix mismatch after redeploy)
+  hostkey fetch <profile> [--os]    TOFU-fetch unlock SSH/OS host key, confirm, store
+  hostkey repin <profile>           Re-pin unlock SSH host key (fix mismatch after redeploy)
   probe <profile>|--all [--verbose]  State detection: Unreachable/WaitingInInitramfs/BootedOs/UnknownHostKey
   unlock <profile> [--verbose] [--sequential]   Full push-unlock with live progress
   enroll <profile> [--target <uuid|mapper>] [--verbose] [--sequential]
@@ -538,8 +538,8 @@ fn handle_ls(st: &State) -> Result<(), String> {
             (Some(h), None) => format!(" os={}", h),
             _ => String::new(),
         };
-        println!("{:<16} {:<24}{} targets={} hostkey={}", p.name, format!("{}:{}", p.host, p.port), os_note,
-                 p.targets_meta.len(), if p.initramfs_host_key.is_some() { "pinned" } else { "MISSING" });
+        println!("{:<16} {:<24}{} targets={} unlock_hostkey={}", p.name, format!("{}:{}", p.unlock_host, p.unlock_port), os_note,
+                 p.targets_meta.len(), if p.unlock_host_key.is_some() { "pinned" } else { "MISSING" });
     }
     Ok(())
 }
@@ -554,12 +554,12 @@ fn handle_show(st: &State, parts: &[&str]) -> Result<(), String> {
     let (v, p) = st.vault_and_profile_ref(n)?;
     let os_addr = match (&p.os_host, p.os_port) {
         (Some(h), Some(pt)) => format!("{}:{}", h, pt),
-        (Some(h), None) => format!("{}:{}", h, p.port),
-        _ => "same as initramfs".to_string(),
+        (Some(h), None) => format!("{}:{}", h, p.unlock_port),
+        _ => "same as unlock SSH".to_string(),
     };
-    println!("name: {}\ninitramfs: {}:{} user {}\nos: {}\nuuid: {}", p.name, p.host, p.port, p.username, os_addr, uuid::Uuid::from_bytes(p.uuid));
-    if let Some(k) = &p.initramfs_host_key { println!("initramfs hostkey: {} {}", k.key_type, fingerprint_sha256(&k.key_bytes)); }
-    if let Some(k) = &p.os_host_key { println!("os hostkey: {} {}", k.key_type, fingerprint_sha256(&k.key_bytes)); }
+    println!("name: {}\nunlock SSH: {}:{} user {}\nOS SSH: {}\nuuid: {}", p.name, p.unlock_host, p.unlock_port, p.username, os_addr, uuid::Uuid::from_bytes(p.uuid));
+    if let Some(k) = &p.unlock_host_key { println!("unlock SSH hostkey: {} {}", k.key_type, fingerprint_sha256(&k.key_bytes)); }
+    if let Some(k) = &p.os_host_key { println!("OS SSH hostkey: {} {}", k.key_type, fingerprint_sha256(&k.key_bytes)); }
     for t in &p.targets_meta { 
         let fallback = t.fallback_path.as_deref().unwrap_or("none");
         println!("  target {} UUID={} fallback={} slot={:?}", t.mapped_name, t.luks_uuid, fallback, t.keyslot); 
@@ -591,10 +591,10 @@ fn handle_edit(st: &mut State, parts: &[&str]) -> Result<(), String> {
         println!();
         println!("Editable fields:");
         println!("  name                Profile name");
-        println!("  host                Initramfs SSH host (IP/DNS)");
-        println!("  port                Initramfs SSH port (default 22)");
-        println!("  os_host             Boote OS SSH host (blank = same as initramfs)");
-        println!("  os_port             Boote OS SSH port (blank = same as initramfs)");
+        println!("  unlock_host         Unlock SSH host (IP/DNS)");
+        println!("  unlock_port         Unlock SSH port (default 22)");
+        println!("  os_host             OS SSH host (blank = same as unlock SSH)");
+        println!("  os_port             OS SSH port (blank = same as unlock SSH)");
         println!("  user | username     SSH username (default root)");
         println!("  notes               Free-form notes");
         println!("  connect_timeout     SSH connect timeout seconds (default 10)");
@@ -604,7 +604,7 @@ fn handle_edit(st: &mut State, parts: &[&str]) -> Result<(), String> {
         println!("                        cmd   = shell command to run after unlock");
         println!();
         println!("Examples:");
-        println!("  edit myvault host=10.0.0.5 port=2222");
+        println!("  edit myvault unlock_host=10.0.0.5 unlock_port=2222");
         println!("  edit myvault os_host=10.0.0.5 os_port=22 user=admin");
         println!("  edit myvault resume=poll");
         println!("  edit myvault 'resume=systemctl start myservice'");
@@ -620,8 +620,8 @@ fn handle_edit(st: &mut State, parts: &[&str]) -> Result<(), String> {
         if let Some((k, v)) = arg.split_once('=') {
             match k {
                 "name" => { p.name = v.into(); changed = true; }
-                "host" => { p.host = v.into(); changed = true; }
-                "port" => { p.port = v.parse().map_err(|_| "bad port")?; changed = true; }
+                "unlock_host" => { p.unlock_host = v.into(); changed = true; }
+                "unlock_port" => { p.unlock_port = v.parse().map_err(|_| "bad port")?; changed = true; }
                 "os_host" => { p.os_host = if v.is_empty() { None } else { Some(v.into()) }; changed = true; }
                 "os_port" => { p.os_port = if v.is_empty() { None } else { Some(v.parse().map_err(|_| "bad OS port")?) }; changed = true; }
                 "user" | "username" => { p.username = v.into(); changed = true; }
@@ -689,7 +689,7 @@ fn handle_pubkey(st: &State, parts: &[&str]) -> Result<(), String> {
 
 async fn handle_hostkey(st: &mut State, parts: &[&str]) -> Result<(), String> {
     let mut opts = Options::new();
-    opts.optflag("", "os", "pin as OS host key instead of initramfs");
+    opts.optflag("", "os", "pin as OS host key instead of unlock SSH");
     opts.optflag("h", "help", "show help");
     let matches = opts.parse(&parts[1..]).map_err(|e| e.to_string())?;
     
@@ -702,14 +702,14 @@ async fn handle_hostkey(st: &mut State, parts: &[&str]) -> Result<(), String> {
 
     match subcmd.as_str() {
         "fetch" => {
-            println!("Fetching host key from {}:{} ...", p.host, p.port);
-            let hk = match fetch_host_key(&p.host, p.port, p.connect_timeout_s).await {
+            println!("Fetching host key from {}:{} ...", p.unlock_host, p.unlock_port);
+            let hk = match fetch_host_key(&p.unlock_host, p.unlock_port, p.connect_timeout_s).await {
                 Ok(hk) => hk,
                 Err(e) => {
                     let msg = e.to_string();
                     if msg.contains("Connection refused") || msg.contains("Connection timed out") {
-                        let svc = if is_os { "OS SSH" } else { "initramfs dropbear" };
-                        return Err(format!("Failed to connect to {}:{}. Is {} running?", p.host, p.port, svc));
+                        let svc = if is_os { "OS SSH" } else { "unlock SSH" };
+                        return Err(format!("Failed to connect to {}:{}. Is {} running?", p.unlock_host, p.unlock_port, svc));
                     }
                     return Err(msg);
                 }
@@ -723,21 +723,21 @@ async fn handle_hostkey(st: &mut State, parts: &[&str]) -> Result<(), String> {
             if is_os {
                 return Err("--os flag not supported for repin (use 'hostkey fetch --os' for OS key)".into());
             }
-            println!("Re-pinning initramfs host key from {}:{} ...", p.host, p.port);
-            let hk = match fetch_host_key(&p.host, p.port, p.connect_timeout_s).await {
+            println!("Re-pinning unlock SSH host key from {}:{} ...", p.unlock_host, p.unlock_port);
+            let hk = match fetch_host_key(&p.unlock_host, p.unlock_port, p.connect_timeout_s).await {
                 Ok(hk) => hk,
                 Err(e) => {
                     let msg = e.to_string();
                     if msg.contains("Connection refused") || msg.contains("Connection timed out") {
-                        return Err(format!("Failed to connect to {}:{}. Is the initramfs dropbear running (target booted with ltv=yes)?", p.host, p.port));
+                        return Err(format!("Failed to connect to {}:{}. Is the unlock SSH running (target booted with ltv=yes)?", p.unlock_host, p.unlock_port));
                     }
                     return Err(msg);
                 }
             };
             println!("{} {}", hk.key_type, fingerprint_sha256(&hk.key_bytes));
-            if ask("Replace pinned initramfs host key? [y/N]: ").to_lowercase() == "y" {
+            if ask("Replace pinned unlock SSH host key? [y/N]: ").to_lowercase() == "y" {
                 v.set_host_key(&p.uuid, hk, false).map_err(|e| e.to_string())?;
-                println!("Initramfs host key updated.");
+                println!("Unlock SSH host key updated.");
             }
         }
         _ => return Err("Usage: hostkey <fetch|repin> <profile> [--os]".into()),
@@ -808,8 +808,8 @@ async fn handle_enroll(st: &mut State, parts: &[&str]) -> Result<(), String> {
     let p = resolve(v, n)?.clone();
 
     if p.os_host_key.is_none() {
-        println!("No OS host key pinned. Fetching from {}:{} ...", p.host, p.port);
-        let hk = fetch_host_key(&p.host, p.port, p.connect_timeout_s).await.map_err(|e| e.to_string())?;
+        println!("No OS host key pinned. Fetching from {}:{} ...", p.unlock_host, p.unlock_port);
+        let hk = fetch_host_key(&p.unlock_host, p.unlock_port, p.connect_timeout_s).await.map_err(|e| e.to_string())?;
         println!("{} {}", hk.key_type, fingerprint_sha256(&hk.key_bytes));
         if ask("Pin as OS host key? [y/N]: ").to_lowercase() != "y" { return Err("aborted".into()); }
         v.set_host_key(&p.uuid, hk, true).map_err(|e| e.to_string())?;
@@ -907,8 +907,8 @@ async fn handle_rotate(st: &mut State, parts: &[&str]) -> Result<(), String> {
     let p = resolve(v, n)?.clone();
 
     if p.os_host_key.is_none() {
-        println!("No OS host key pinned. Fetching from {}:{} ...", p.host, p.port);
-        let hk = fetch_host_key(&p.host, p.port, p.connect_timeout_s).await.map_err(|e| e.to_string())?;
+        println!("No OS host key pinned. Fetching from {}:{} ...", p.unlock_host, p.unlock_port);
+        let hk = fetch_host_key(&p.unlock_host, p.unlock_port, p.connect_timeout_s).await.map_err(|e| e.to_string())?;
         println!("{} {}", hk.key_type, fingerprint_sha256(&hk.key_bytes));
         if ask("Pin as OS host key? [y/N]: ").to_lowercase() != "y" { return Err("aborted".into()); }
         v.set_host_key(&p.uuid, hk, true).map_err(|e| e.to_string())?;
@@ -1028,7 +1028,7 @@ async fn handle_copy_profile(st: &mut State, parts: &[&str]) -> Result<(), Strin
     }
     
     // Add profile to destination vault (with same OS address as source)
-    let new_uuid = v.add_profile(&dest_name, &src_profile.host, src_profile.port, &src_profile.username, src_profile.os_host.clone(), src_profile.os_port).map_err(|e| e.to_string())?;
+    let new_uuid = v.add_profile(&dest_name, &src_profile.unlock_host, src_profile.unlock_port, &src_profile.username, src_profile.os_host.clone(), src_profile.os_port).map_err(|e| e.to_string())?;
     
     if keep {
         // Keep client keypair and host keys - identical copy
@@ -1038,10 +1038,10 @@ async fn handle_copy_profile(st: &mut State, parts: &[&str]) -> Result<(), Strin
             p.resume = src_profile.resume.clone();
             p.connect_timeout_s = src_profile.connect_timeout_s;
             p.exec_timeout_s = src_profile.exec_timeout_s;
-            p.initramfs_host_key = src_profile.initramfs_host_key.clone();
+            p.unlock_host_key = src_profile.unlock_host_key.clone();
             p.os_host_key = src_profile.os_host_key.clone();
             p.host_key_pinned_at = src_profile.host_key_pinned_at;
-            p.notes = format!("Copied from {} ({}) [kept]", src_profile_name, src_profile.host);
+            p.notes = format!("Copied from {} ({}) [kept]", src_profile_name, src_profile.unlock_host);
         }).map_err(|e| e.to_string())?;
         
         // Use source secrets (same client key + keyfiles)
@@ -1064,10 +1064,10 @@ async fn handle_copy_profile(st: &mut State, parts: &[&str]) -> Result<(), Strin
             p.resume = src_profile.resume.clone();
             p.connect_timeout_s = src_profile.connect_timeout_s;
             p.exec_timeout_s = src_profile.exec_timeout_s;
-            p.initramfs_host_key = None; // Don't copy host keys
+            p.unlock_host_key = None; // Don't copy host keys
             p.os_host_key = None;
             p.host_key_pinned_at = 0;
-            p.notes = format!("Copied from {} ({})", src_profile_name, src_profile.host);
+            p.notes = format!("Copied from {} ({})", src_profile_name, src_profile.unlock_host);
         }).map_err(|e| e.to_string())?;
         
         // Replace secrets with new client key + copied keyfiles
@@ -1098,13 +1098,13 @@ async fn handle_fetch(st: &mut State, parts: &[&str]) -> Result<(), String> {
 
     // Fetch OS host key (for enroll/rotate against booted OS)
     if p.os_host_key.is_none() {
-        println!("No OS host key pinned. Fetching from {}:{} ...", p.host, p.port);
-        let hk = match fetch_host_key(&p.host, p.port, p.connect_timeout_s).await {
+        println!("No OS host key pinned. Fetching from {}:{} ...", p.unlock_host, p.unlock_port);
+        let hk = match fetch_host_key(&p.unlock_host, p.unlock_port, p.connect_timeout_s).await {
             Ok(hk) => hk,
             Err(e) => {
                 let msg = e.to_string();
                 if msg.contains("Connection refused") || msg.contains("Connection timed out") {
-                    return Err(format!("Failed to connect to {}:{}. Is the OS booted and SSH running?", p.host, p.port));
+                    return Err(format!("Failed to connect to {}:{}. Is the OS booted and SSH running?", p.unlock_host, p.unlock_port));
                 }
                 return Err(msg);
             }

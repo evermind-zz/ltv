@@ -16,14 +16,14 @@ pub struct Profile {
     pub uuid: [u8; 16],
     pub name: String,
     pub notes: String,
-    /// Initramfs (Dropbear) SSH address
-    pub host: String,
-    pub port: u16,
-    /// Boote OS SSH address (falls back to `host`/`port` if None)
+    /// Unlock SSH (initramfs Dropbear) address for LUKS unlock
+    pub unlock_host: String,
+    pub unlock_port: u16,
+    /// OS SSH address (falls back to `unlock_host`/`unlock_port` if None)
     pub os_host: Option<String>,
     pub os_port: Option<u16>,
     pub username: String,
-    pub initramfs_host_key: Option<HostKey>,
+    pub unlock_host_key: Option<HostKey>,
     pub os_host_key: Option<HostKey>,
     pub host_key_pinned_at: u64,
     pub client_public_key: Vec<u8>,          // ssh wire blob

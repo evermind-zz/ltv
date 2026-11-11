@@ -14,9 +14,8 @@ fn test_open() {
     println!("Opened: {} profiles", v2.inventory.profiles.len());
     for p in &v2.inventory.profiles {
         println!("  Profile: {}", p.name);
-        println!("  Host: {:?}", p.host);
-        println!("  OS host: {:?}", p.os_host);
-        println!("  OS port: {:?}", p.os_port);
+        println!("  Unlock SSH: {}:{}", p.unlock_host, p.unlock_port);
+        println!("  OS SSH: {:?}:{:?}", p.os_host, p.os_port);
         println!("  Targets meta: {}", p.targets_meta.len());
     }
 }

@@ -54,15 +54,15 @@ fn test_local_commands() {
     println!("\n=== 5. LS ===");
     for p in &opened.inventory.profiles {
         println!("  {} @ {}:{} targets={} hostkey={}", 
-            p.name, p.host, p.port, p.targets_meta.len(),
-            if p.initramfs_host_key.is_some() { "pinned" } else { "MISSING" });
+            p.name, p.unlock_host, p.unlock_port, p.targets_meta.len(),
+            if p.unlock_host_key.is_some() { "pinned" } else { "MISSING" });
     }
     
     // 6. SHOW
     println!("\n=== 6. SHOW ===");
     let p = &opened.inventory.profiles[0];
     println!("  name: {}", p.name);
-    println!("  host: {}:{} user {}", p.host, p.port, p.username);
+    println!("  unlock SSH: {}:{} user {}", p.unlock_host, p.unlock_port, p.username);
     println!("  uuid: {}", uuid::Uuid::from_bytes(p.uuid));
     for t in &p.targets_meta {
         let fallback = t.fallback_path.as_deref().unwrap_or("none");

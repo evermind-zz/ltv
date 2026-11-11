@@ -239,9 +239,9 @@ pub async fn rotate_key(
     let p = vault.profile(uuid)?.clone();
     let os_key = p.os_host_key.clone().ok_or(UnlockError::HostKeyNotPinned)?;
 
-    // Resolve OS address (fallback to initramfs address if not set)
-    let os_host = p.os_host.as_deref().unwrap_or(&p.host);
-    let os_port = p.os_port.unwrap_or(p.port);
+    // Resolve OS address (fallback to unlock SSH address if not set)
+    let os_host = p.os_host.as_deref().unwrap_or(&p.unlock_host);
+    let os_port = p.os_port.unwrap_or(p.unlock_port);
 
     // Connect and authenticate using the shared helper.
     let (s, _) = connect_and_auth(
