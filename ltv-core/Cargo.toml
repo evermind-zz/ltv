@@ -27,6 +27,7 @@ russh-keys.workspace = true
 async-trait.workspace = true
 base64.workspace = true
 futures.workspace = true
+subtle.workspace = true
 
 [dev-dependencies]
 tempfile = "3"

@@ -50,6 +50,11 @@ fn pass(prompt: &str) -> SecretVec<u8> {
     }
 }
 
+/// Prompt for optional passphrase (allows empty) returning String
+fn pass_optional_str(prompt: &str) -> String {
+    rpassword::prompt_password(prompt).unwrap_or_default()
+}
+
 fn ask(prompt: &str) -> String {
     use std::io::{self, Write};
     print!("{prompt}"); io::stdout().flush().ok();
@@ -120,8 +125,9 @@ async fn cmd_server_setup(st: &mut State, name: &str, args: &[&str]) -> Result<(
     // Generate Dropbear host keypair LOCALLY using dropbearkey binary
     // Native dropbear format (83 bytes) with correct magic ensures russh connects
     println!("Generating dropbear host key locally using dropbearkey...");
+    let key_path_str = key_path.to_str().ok_or("invalid key path: not valid UTF-8")?;
     let output = std::process::Command::new("dropbearkey")
-        .args(["-t", "ed25519", "-f", key_path.to_str().unwrap()])
+        .args(["-t", "ed25519", "-f", key_path_str])
         .output()
         .map_err(|e| format!("dropbearkey failed: {}", e))?;
 
@@ -135,7 +141,7 @@ async fn cmd_server_setup(st: &mut State, name: &str, args: &[&str]) -> Result<(
 
     // Extract public key locally
     let output = std::process::Command::new("dropbearkey")
-        .args(["-y", "-f", key_path.to_str().unwrap()])
+        .args(["-y", "-f", key_path_str])
         .output()
         .map_err(|e| format!("dropbearkey -y failed: {}", e))?;
 
@@ -811,11 +817,12 @@ async fn handle_enroll(st: &mut State, parts: &[&str]) -> Result<(), String> {
 
     let username = ask_or("OS SSH user", "root");
     let auth = match ask_or("Auth: (p)assword / (k)ey file", "k").as_str() {
-        "p" => BootedAuth::Password(SecretString::new(rpassword::prompt_password("OS password: ").unwrap_or_default())),
+        "p" => BootedAuth::Password(SecretString::new(pass_optional_str("OS password: "))),
         _ => {
-            let path = ask_or("Key file", &format!("{}/.ssh/id_ed25519", std::env::var("HOME").unwrap_or_default()));
+            let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+            let path = ask_or("Key file", &format!("{}/.ssh/id_ed25519", home));
             let kp = russh_keys::load_secret_key(&path, None)
-                .or_else(|_| russh_keys::load_secret_key(&path, Some(&rpassword::prompt_password("Key passphrase: ").unwrap_or_default())))
+                .or_else(|_| russh_keys::load_secret_key(&path, Some(&pass_optional_str("Key passphrase: "))))
                 .map_err(|e| format!("load key: {e}"))?;
             match kp {
                 russh_keys::key::KeyPair::Ed25519(sk) => BootedAuth::Ed25519Seed(sk.to_bytes()),
@@ -909,11 +916,12 @@ async fn handle_rotate(st: &mut State, parts: &[&str]) -> Result<(), String> {
 
     let username = ask_or("OS SSH user", "root");
     let auth = match ask_or("Auth: (p)assword / (k)ey file", "k").as_str() {
-        "p" => BootedAuth::Password(SecretString::new(rpassword::prompt_password("OS password: ").unwrap_or_default())),
+        "p" => BootedAuth::Password(SecretString::new(pass_optional_str("OS password: "))),
         _ => {
-            let path = ask_or("Key file", &format!("{}/.ssh/id_ed25519", std::env::var("HOME").unwrap_or_default()));
+            let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+            let path = ask_or("Key file", &format!("{}/.ssh/id_ed25519", home));
             let kp = russh_keys::load_secret_key(&path, None)
-                .or_else(|_| russh_keys::load_secret_key(&path, Some(&rpassword::prompt_password("Key passphrase: ").unwrap_or_default())))
+                .or_else(|_| russh_keys::load_secret_key(&path, Some(&pass_optional_str("Key passphrase: "))))
                 .map_err(|e| format!("load key: {e}"))?;
             match kp {
                 russh_keys::key::KeyPair::Ed25519(sk) => BootedAuth::Ed25519Seed(sk.to_bytes()),
@@ -1108,11 +1116,12 @@ async fn handle_fetch(st: &mut State, parts: &[&str]) -> Result<(), String> {
 
     let username = ask_or("OS SSH user", "root");
     let auth = match ask_or("Auth: (p)assword / (k)ey file", "k").as_str() {
-        "p" => BootedAuth::Password(SecretString::new(rpassword::prompt_password("OS password: ").unwrap_or_default())),
+        "p" => BootedAuth::Password(SecretString::new(pass_optional_str("OS password: "))),
         _ => {
-            let path = ask_or("Key file", &format!("{}/.ssh/id_ed25519", std::env::var("HOME").unwrap_or_default()));
+            let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+            let path = ask_or("Key file", &format!("{}/.ssh/id_ed25519", home));
             let kp = russh_keys::load_secret_key(&path, None)
-                .or_else(|_| russh_keys::load_secret_key(&path, Some(&rpassword::prompt_password("Key passphrase: ").unwrap_or_default())))
+                .or_else(|_| russh_keys::load_secret_key(&path, Some(&pass_optional_str("Key passphrase: "))))
                 .map_err(|e| format!("load key: {e}"))?;
             match kp {
                 russh_keys::key::KeyPair::Ed25519(sk) => BootedAuth::Ed25519Seed(sk.to_bytes()),

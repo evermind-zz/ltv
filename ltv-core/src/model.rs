@@ -1,5 +1,6 @@
 use base64::Engine;
 use serde::{Deserialize, Serialize};
+use subtle::ConstantTimeEq;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 #[derive(Serialize, Deserialize, Default)]
@@ -34,8 +35,15 @@ pub struct Profile {
     pub envelope_ciphertext: Vec<u8>,
 }
 
-#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct HostKey { pub key_type: String, pub key_bytes: Vec<u8> }
+
+impl PartialEq for HostKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.key_type == other.key_type && self.key_bytes.ct_eq(&other.key_bytes).into()
+    }
+}
+impl Eq for HostKey {}
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct TargetMeta {
