@@ -25,6 +25,21 @@ pub enum UnlockEvent {
     ResumeSent, Disconnected,
 }
 
+impl std::fmt::Display for UnlockEvent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            UnlockEvent::Connecting => write!(f, "connecting to unlock SSH"),
+            UnlockEvent::HostKeyVerified => write!(f, "unlock SSH host key verified"),
+            UnlockEvent::Authenticated => write!(f, "authenticated"),
+            UnlockEvent::TargetStart(t) => write!(f, "{t}: unlocking"),
+            UnlockEvent::TargetDone(t) => write!(f, "{t}: unlocked"),
+            UnlockEvent::TargetAlreadyOpen(t) => write!(f, "{t}: already open"),
+            UnlockEvent::ResumeSent => write!(f, "signaled initramfs to resume boot"),
+            UnlockEvent::Disconnected => write!(f, "disconnected"),
+        }
+    }
+}
+
 pub(crate) type Seen = Arc<Mutex<Option<HostKey>>>;
 
 /// Captures the presented host key. If `expected` is Some, only that key is accepted.

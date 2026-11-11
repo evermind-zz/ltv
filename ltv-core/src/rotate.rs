@@ -19,6 +19,22 @@ pub enum RotateEvent {
     Done,
 }
 
+impl std::fmt::Display for RotateEvent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RotateEvent::Connected => write!(f, "connected to OS SSH"),
+            RotateEvent::Authenticated => write!(f, "authenticated"),
+            RotateEvent::TargetStart(t) => write!(f, "{t}: rotating keyfile"),
+            RotateEvent::SlotChosen(uuid, slot) => write!(f, "{uuid}: chosen new slot {slot}"),
+            RotateEvent::SlotAdded(uuid, slot) => write!(f, "{uuid}: added new key to slot {slot}"),
+            RotateEvent::Verified(uuid) => write!(f, "{uuid}: verified new key"),
+            RotateEvent::OldSlotKilled(uuid, slot) => write!(f, "{uuid}: removed old key from slot {slot}"),
+            RotateEvent::Skipped(uuid, why) => write!(f, "{uuid}: skipped ({why})"),
+            RotateEvent::Done => write!(f, "rotation complete"),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct RotateResult {
     pub luks_uuid: String,

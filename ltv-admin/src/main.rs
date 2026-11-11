@@ -1,5 +1,5 @@
 use std::{fs, path::PathBuf, env};
-use ltv_core::{format::Argon2Params, model::{Profile, TargetMeta, ResumePolicy, BootedAccess, BootedAuth, fingerprint_sha256, HostKey, SecretPayload, ExecutionMode}, net::{fetch_host_key, fetch_luks_info, probe, unlock}, vault::{Vault, ssh_ed25519_blob}, enroll::EnrollEvent, rotate::RotateEvent, scripts::{render_cmdline, render_deploy_sh, render_deploy_nopatch_sh, LTV_FILES, LTV_MODULES, LTV_PACKAGES, LTV_LUKS_WRAPPER, LTV_COMMON, LTV_PATCH_INIT, LTV_COMMIT_HOOK}};
+use ltv_core::{format::Argon2Params, model::{Profile, TargetMeta, ResumePolicy, BootedAccess, BootedAuth, fingerprint_sha256, HostKey, SecretPayload, ExecutionMode}, net::{fetch_host_key, fetch_luks_info, probe, unlock, ProbeResult}, vault::{Vault, ssh_ed25519_blob}, enroll::EnrollEvent, rotate::RotateEvent, scripts::{render_cmdline, render_deploy_sh, render_deploy_nopatch_sh, LTV_FILES, LTV_MODULES, LTV_PACKAGES, LTV_LUKS_WRAPPER, LTV_COMMON, LTV_PATCH_INIT, LTV_COMMIT_HOOK}};
 use std::path::Path;
 use rustyline::{error::ReadlineError, DefaultEditor};
 use secrecy::{ExposeSecret, SecretString, SecretVec};
@@ -405,7 +405,7 @@ fn print_help() {
                                   Rotate LUKS keyfiles: add new key, verify, kill old slot (auto-saves)
   hostkey fetch <profile> [--os]    TOFU-fetch unlock SSH/OS host key, confirm, store
   hostkey repin <profile>           Re-pin unlock SSH host key (fix mismatch after redeploy)
-  probe <profile>|--all [--verbose]  State detection: Unreachable/WaitingInInitramfs/BootedOs/UnknownHostKey
+  probe <profile>|--all [--verbose]  Check state: unreachable / waiting in initramfs / booted OS / unknown host key
   unlock <profile> [--verbose] [--sequential]   Full push-unlock with live progress
   enroll <profile> [--target <uuid|mapper>] [--verbose] [--sequential]
                                  Enroll keyfiles into LUKS headers over booted OS
@@ -532,14 +532,16 @@ fn handle_status(st: &State) -> Result<(), String> {
 
 fn handle_ls(st: &State) -> Result<(), String> {
     let v = st.vault_ref()?;
+    println!("{:<16} {:<21} {:<21} {:>7}  {}", "NAME", "UNLOCK SSH", "OS SSH", "TARGETS", "HOSTKEY");
     for p in &v.inventory.profiles {
-        let os_note = match (&p.os_host, p.os_port) {
-            (Some(h), Some(pt)) => format!(" os={}:{}", h, pt),
-            (Some(h), None) => format!(" os={}", h),
-            _ => String::new(),
+        let os_ssh = match (&p.os_host, p.os_port) {
+            (Some(h), Some(pt)) => format!("{}:{}", h, pt),
+            (Some(h), None) => format!("{}:{}", h, p.unlock_port),
+            _ => "same as unlock".to_string(),
         };
-        println!("{:<16} {:<24}{} targets={} unlock_hostkey={}", p.name, format!("{}:{}", p.unlock_host, p.unlock_port), os_note,
-                 p.targets_meta.len(), if p.unlock_host_key.is_some() { "pinned" } else { "MISSING" });
+        let unlock_ssh = format!("{}:{}", p.unlock_host, p.unlock_port);
+        let hostkey = if p.unlock_host_key.is_some() { "pinned" } else { "MISSING" };
+        println!("{:<16} {:<21} {:<21} {:>7}  {}", p.name, unlock_ssh, os_ssh, p.targets_meta.len(), hostkey);
     }
     Ok(())
 }
@@ -745,6 +747,15 @@ async fn handle_hostkey(st: &mut State, parts: &[&str]) -> Result<(), String> {
     Ok(())
 }
 
+fn fmt_probe_result(r: &ProbeResult) -> String {
+    match r {
+        ProbeResult::Unreachable(reason) => format!("unreachable ({})", reason),
+        ProbeResult::WaitingInInitramfs => "waiting in initramfs (unlock SSH)".into(),
+        ProbeResult::BootedOs => "booted OS".into(),
+        ProbeResult::UnknownHostKey(k) => format!("unknown host key ({})", fingerprint_sha256(&k.key_bytes)),
+    }
+}
+
 async fn handle_probe(st: &State, parts: &[&str]) -> Result<(), String> {
     let mut opts = Options::new();
     opts.optflag("", "verbose", "show SSH commands");
@@ -760,7 +771,7 @@ async fn handle_probe(st: &State, parts: &[&str]) -> Result<(), String> {
         let verbose_fn = if verbose { Some(Box::new(|msg: &str| println!("  [probe] {msg}")) as Box<dyn FnMut(&str) + Send>) } else { None };
         let result = probe(&p, verbose_fn).await;
         if !verbose {
-            println!("{:<16} {:?}", p.name, result);
+            println!("{:<16} {}", p.name, fmt_probe_result(&result));
         }
     }
     Ok(())
@@ -783,7 +794,7 @@ async fn handle_unlock(st: &State, parts: &[&str]) -> Result<(), String> {
     let verbose_fn = if verbose { Some(Box::new(|cmd: &str| println!("  [unlock] $ {cmd}")) as Box<dyn FnMut(&str) + Send>) } else { None };
     unlock(v, &uuid, mode, |e| {
         if !verbose {
-            println!(" ✓ {e:?}");
+            println!(" ✓ {e}");
         }
     }, verbose_fn).await.map_err(|e| e.to_string())?;
     Ok(())
@@ -878,7 +889,7 @@ async fn handle_enroll(st: &mut State, parts: &[&str]) -> Result<(), String> {
     }, only.as_deref(), |e| {
         match e {
             EnrollEvent::Skipped(t, why) => println!(" ! {t}: skipped ({why})"),
-            other if !verbose => println!(" ✓ {other:?}"),
+            other if !verbose => println!(" ✓ {other}"),
             _ => {}
         }
     }, if verbose { Some(Box::new(|cmd: &str| println!("  [enroll] $ {cmd}")) as Box<dyn FnMut(&str) + Send>) } else { None }).await.map_err(|e| e.to_string())?;
@@ -984,7 +995,7 @@ async fn handle_rotate(st: &mut State, parts: &[&str]) -> Result<(), String> {
     }, only.as_deref(), |e| {
         match e {
             RotateEvent::Skipped(t, why) => println!(" ! {t}: skipped ({why})"),
-            other if !verbose => println!(" ✓ {other:?}"),
+            other if !verbose => println!(" ✓ {other}"),
             _ => {}
         }
     }, if verbose { Some(Box::new(|cmd: &str| println!("  [rotate] $ {cmd}")) as Box<dyn FnMut(&str) + Send>) } else { None }).await.map_err(|e| e.to_string())?;

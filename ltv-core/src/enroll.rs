@@ -14,6 +14,22 @@ pub enum EnrollEvent {
     Done,
 }
 
+impl std::fmt::Display for EnrollEvent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EnrollEvent::Connected => write!(f, "connected to OS SSH"),
+            EnrollEvent::Authenticated => write!(f, "authenticated"),
+            EnrollEvent::TargetStart(t) => write!(f, "{t}: enrolling keyfile"),
+            EnrollEvent::SlotChosen(uuid, slot) => write!(f, "{uuid}: chosen slot {slot}"),
+            EnrollEvent::SlotAdded(uuid, slot) => write!(f, "{uuid}: added key to slot {slot}"),
+            EnrollEvent::SlotUpdated(uuid, slot) => write!(f, "{uuid}: updated key in slot {slot}"),
+            EnrollEvent::Verified(uuid) => write!(f, "{uuid}: verified new key"),
+            EnrollEvent::Skipped(uuid, why) => write!(f, "{uuid}: skipped ({why})"),
+            EnrollEvent::Done => write!(f, "enrollment complete"),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct EnrollResult { pub luks_uuid: String, pub keyslot: u8 }
 
