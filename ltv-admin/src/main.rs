@@ -566,7 +566,7 @@ fn handle_show(st: &State, parts: &[&str]) -> Result<(), String> {
         let fallback = t.fallback_path.as_deref().unwrap_or("none");
         println!("  target {} UUID={} fallback={} slot={:?}", t.mapped_name, t.luks_uuid, fallback, t.keyslot); 
     }
-    println!("pubkey: {}", v.export_public_key(p));
+    println!("client public key: {}", v.export_public_key(p));
     Ok(())
 }
 
