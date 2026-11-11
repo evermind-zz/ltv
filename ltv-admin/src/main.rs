@@ -16,6 +16,32 @@ struct State {
     verbose: bool,
 }
 
+impl State {
+    /// Get mutable reference to vault, or error if not open
+    fn vault_mut(&mut self) -> Result<&mut Vault, String> {
+        self.vault.as_mut().ok_or("no vault open".into())
+    }
+
+    /// Get immutable reference to vault, or error if not open
+    fn vault_ref(&self) -> Result<&Vault, String> {
+        self.vault.as_ref().ok_or("no vault open".into())
+    }
+
+    /// Resolve profile name and return (vault_mut, profile_uuid)
+    fn vault_and_profile(&mut self, name: &str) -> Result<(&mut Vault, [u8; 16]), String> {
+        let v = self.vault_mut()?;
+        let uuid = resolve(v, name)?.uuid;
+        Ok((v, uuid))
+    }
+
+    /// Resolve profile name and return (vault_ref, profile_ref)
+    fn vault_and_profile_ref(&self, name: &str) -> Result<(&Vault, &Profile), String> {
+        let v = self.vault_ref()?;
+        let p = resolve(v, name)?;
+        Ok((v, p))
+    }
+}
+
 fn pass(prompt: &str) -> SecretVec<u8> {
     loop {
         let p = rpassword::prompt_password(prompt).unwrap_or_default();
@@ -499,7 +525,8 @@ fn handle_status(st: &State) -> Result<(), String> {
 }
 
 fn handle_ls(st: &State) -> Result<(), String> {
-    for p in &st.vault.as_ref().ok_or("no vault open")?.inventory.profiles {
+    let v = st.vault_ref()?;
+    for p in &v.inventory.profiles {
         let os_note = match (&p.os_host, p.os_port) {
             (Some(h), Some(pt)) => format!(" os={}:{}", h, pt),
             (Some(h), None) => format!(" os={}", h),
@@ -518,7 +545,7 @@ fn handle_show(st: &State, parts: &[&str]) -> Result<(), String> {
     
     if matches.free.is_empty() { return Err("Usage: show <profile>".into()); }
     let n = &matches.free[0];
-    let v = st.vault.as_ref().ok_or("no vault open")?; let p = resolve(v, n)?;
+    let (v, p) = st.vault_and_profile_ref(n)?;
     let os_addr = match (&p.os_host, p.os_port) {
         (Some(h), Some(pt)) => format!("{}:{}", h, pt),
         (Some(h), None) => format!("{}:{}", h, p.port),
@@ -542,8 +569,7 @@ fn handle_rm(st: &mut State, parts: &[&str]) -> Result<(), String> {
     
     if matches.free.is_empty() { return Err("Usage: rm <profile>".into()); }
     let n = &matches.free[0];
-    let v = st.vault.as_mut().ok_or("no vault open")?;
-    let uuid = resolve(v, n)?.uuid;
+    let (v, uuid) = st.vault_and_profile(n)?;
     if ask(&format!("Remove '{}'? type YES: ", n)) == "YES" { v.remove_profile(&uuid).map_err(|e| e.to_string())?; }
     Ok(())
 }
@@ -581,8 +607,7 @@ fn handle_edit(st: &mut State, parts: &[&str]) -> Result<(), String> {
     
     let n = &matches.free[0];
     let rest = &matches.free[1..];
-    let v = st.vault.as_mut().ok_or("no vault open")?;
-    let uuid = resolve(v, n)?.uuid;
+    let (v, uuid) = st.vault_and_profile(n)?;
     let mut p = v.profile(&uuid).map_err(|e| e.to_string())?.clone();
     let mut changed = false;
     for arg in rest {
