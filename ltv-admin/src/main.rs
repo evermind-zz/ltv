@@ -111,6 +111,43 @@ fn parse_selection(input: &str, max: usize) -> Result<Vec<usize>, String> {
     }
 }
 
+/// Metadata difference detected when re-running `fetch` for an already configured
+/// target (identity is the LUKS UUID; only mapper/device metadata can drift).
+#[derive(Debug)]
+struct TargetDiff {
+    idx: usize,
+    luks_uuid: String,
+    /// (old, new)
+    mapper: Option<(String, String)>,
+    /// (old, new)
+    device: Option<(Option<String>, String)>,
+}
+
+/// Compare a stored target with what `fetch` discovered live. A missing live
+/// mapper name (volume not currently decrypted) is not treated as a rename.
+fn target_diff(
+    idx: usize,
+    luks_uuid: &str,
+    existing: &TargetMeta,
+    live_mapper: Option<&str>,
+    live_device: &str,
+) -> Option<TargetDiff> {
+    let mapper = match live_mapper {
+        Some(new) if new != existing.mapped_name => Some((existing.mapped_name.clone(), new.to_string())),
+        _ => None,
+    };
+    let device = if existing.fallback_path.as_deref() != Some(live_device) {
+        Some((existing.fallback_path.clone(), live_device.to_string()))
+    } else {
+        None
+    };
+    if mapper.is_none() && device.is_none() {
+        None
+    } else {
+        Some(TargetDiff { idx, luks_uuid: luks_uuid.to_string(), mapper, device })
+    }
+}
+
 fn cmd_add(st: &mut State) -> Result<(), String> {
     let v = st.vault.as_mut().ok_or("no vault open")?;
     let name = ask("Profile name: ");
@@ -443,7 +480,7 @@ fn print_help() {
   unlock <profile> [--verbose] [--sequential]   Full push-unlock with live progress
   enroll <profile> [--target <uuid|mapper>] [--verbose] [--sequential]
                                  Enroll keyfiles into LUKS headers over booted OS
-  fetch <profile> [--verbose]    Discover LUKS volumes on booted OS, choose targets to add
+  fetch <profile> [--verbose]    Discover LUKS volumes on booted OS, add/refresh targets
   server-setup <profile> [--out <dir>]
                                  Generate mkinitfs deployment artifacts for remote unlock
   passwd                         Change VAULT master passphrase (re-encrypts vault, not LUKS)
@@ -1194,19 +1231,35 @@ async fn handle_fetch(st: &mut State, parts: &[&str]) -> Result<(), String> {
         }
     }
 
-    let selection = parse_selection(&ask("\nAdd targets? [all/none/numbers, e.g. 0,2]: "), results.len())?;
+    let selection = parse_selection(&ask("\nTargets to add or refresh? [all/none/numbers, e.g. 0,2]: "), results.len())?;
     if selection.is_empty() {
         println!("No targets added.");
         return Ok(());
     }
-    let mut added = 0;
+
+    // Partition the selection: new targets vs. already configured ones whose
+    // live mapper/device metadata has changed since they were added.
+    let mut new_indices = Vec::new();
+    let mut diffs: Vec<TargetDiff> = Vec::new();
     for i in selection {
         let info = &results[i];
-        if p.targets_meta.iter().any(|t| t.luks_uuid == info.luks_uuid) {
-            println!("  skipped {} (already a target)", info.luks_uuid);
+        let Some(existing) = p.targets_meta.iter().find(|t| t.luks_uuid == info.luks_uuid) else {
+            new_indices.push(i);
             continue;
+        };
+        match target_diff(i, &info.luks_uuid, existing, info.mapper_name.as_deref(), &info.device_path) {
+            Some(d) => diffs.push(d),
+            None => println!("  already configured, unchanged: {}", existing.mapped_name),
         }
-        // Use existing mapper name if available, otherwise ask user
+    }
+
+    // Resolve mapper names for new targets and validate all names before
+    // mutating the vault, so a late collision cannot leave a partial update.
+    let mut used_mappers: Vec<String> = p.targets_meta.iter().map(|t| t.mapped_name.clone()).collect();
+    let mut new_targets: Vec<(usize, String)> = Vec::new();
+    for i in new_indices {
+        let info = &results[i];
+        // Use the live mapper name if available, otherwise ask the user
         let mapped = match &info.mapper_name {
             Some(mapper) => mapper.clone(),
             None => {
@@ -1214,6 +1267,40 @@ async fn handle_fetch(st: &mut State, parts: &[&str]) -> Result<(), String> {
                 ask_or(&format!("Mapper name for {}", info.luks_uuid), &default)
             }
         };
+        if used_mappers.contains(&mapped) {
+            return Err(format!(
+                "mapper name '{mapped}' is already used by another target; rename that target first"
+            ));
+        }
+        used_mappers.push(mapped.clone());
+        new_targets.push((i, mapped));
+    }
+    for d in &diffs {
+        if let Some((_, new)) = &d.mapper {
+            if used_mappers.iter().any(|m| m == new) {
+                return Err(format!("mapper name '{new}' is already used by another target"));
+            }
+        }
+    }
+
+    let mut do_update = false;
+    if !diffs.is_empty() {
+        println!("\nAlready configured, but the live metadata differs:");
+        for d in &diffs {
+            println!("  [{}] {}", d.idx, d.luks_uuid);
+            if let Some((old, new)) = &d.mapper {
+                println!("       mapper: {} -> {}", old, new);
+            }
+            if let Some((old, new)) = &d.device {
+                println!("       device: {} -> {}", old.as_deref().unwrap_or("(none)"), new);
+            }
+        }
+        do_update = ask(&format!("Update these {} target(s)? [y/N]: ", diffs.len())).to_lowercase() == "y";
+    }
+
+    let added = new_targets.len();
+    for (i, mapped) in new_targets {
+        let info = &results[i];
         let meta = TargetMeta {
             luks_uuid: info.luks_uuid.clone(),
             fallback_path: Some(info.device_path.clone()),
@@ -1224,10 +1311,36 @@ async fn handle_fetch(st: &mut State, parts: &[&str]) -> Result<(), String> {
         };
         v.add_target(&p.uuid, meta, None).map_err(|e| e.to_string())?;
         println!("  added target {}", mapped);
-        added += 1;
     }
+
+    let mut mapper_changed = false;
+    if do_update {
+        for d in &diffs {
+            v.update_profile(&p.uuid, |prof| {
+                if let Some(t) = prof.targets_meta.iter_mut().find(|t| t.luks_uuid == d.luks_uuid) {
+                    if let Some((_, new)) = &d.mapper {
+                        t.mapped_name = new.clone();
+                    }
+                    if let Some((_, new)) = &d.device {
+                        t.fallback_path = Some(new.clone());
+                    }
+                }
+            }).map_err(|e| e.to_string())?;
+            mapper_changed |= d.mapper.is_some();
+            println!("  updated {}", d.luks_uuid);
+        }
+        if mapper_changed {
+            println!("note: mapper names changed; re-run 'server-setup' and redeploy so the initramfs cmdline matches.");
+        }
+    } else if !diffs.is_empty() {
+        println!("kept existing target metadata unchanged.");
+    }
+
     if added > 0 {
-        println!("targets added. Remember to 'save'.");
+        println!("targets added.");
+    }
+    if added > 0 || do_update {
+        println!("Remember to 'save'.");
     }
     Ok(())
 }
@@ -1283,7 +1396,18 @@ fn handle_backup(st: &mut State, parts: &[&str]) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_selection;
+    use super::{parse_selection, target_diff, TargetMeta};
+
+    fn meta() -> TargetMeta {
+        TargetMeta {
+            luks_uuid: "uuid-1".into(),
+            fallback_path: Some("/dev/vda4".into()),
+            mapped_name: "cryptroot".into(),
+            order: 0,
+            keyslot: Some(3),
+            token_id: None,
+        }
+    }
 
     #[test]
     fn selection_keywords() {
@@ -1305,5 +1429,38 @@ mod tests {
     fn selection_rejects_bad_input() {
         assert!(parse_selection("3", 3).is_err());
         assert!(parse_selection("abc", 3).is_err());
+    }
+
+    #[test]
+    fn exact_target_has_no_diff() {
+        assert!(target_diff(0, "uuid-1", &meta(), Some("cryptroot"), "/dev/vda4").is_none());
+    }
+
+    #[test]
+    fn mapper_rename_is_reported() {
+        let d = target_diff(1, "uuid-1", &meta(), Some("crypt-root"), "/dev/vda4").unwrap();
+        assert_eq!(d.idx, 1);
+        assert_eq!(d.mapper, Some(("cryptroot".into(), "crypt-root".into())));
+        assert!(d.device.is_none());
+    }
+
+    #[test]
+    fn device_change_is_reported() {
+        let d = target_diff(0, "uuid-1", &meta(), Some("cryptroot"), "/dev/nvme0n1p4").unwrap();
+        assert!(d.mapper.is_none());
+        assert_eq!(d.device, Some((Some("/dev/vda4".into()), "/dev/nvme0n1p4".into())));
+    }
+
+    #[test]
+    fn missing_live_mapper_is_not_a_rename() {
+        assert!(target_diff(0, "uuid-1", &meta(), None, "/dev/vda4").is_none());
+    }
+
+    #[test]
+    fn missing_stored_fallback_is_reported() {
+        let mut m = meta();
+        m.fallback_path = None;
+        let d = target_diff(0, "uuid-1", &m, Some("cryptroot"), "/dev/vda4").unwrap();
+        assert_eq!(d.device, Some((None, "/dev/vda4".into())));
     }
 }
