@@ -81,12 +81,21 @@ fn resolve<'a>(v: &'a Vault, name: &str) -> Result<&'a Profile, String> {
     v.find_by_name(name).ok_or_else(|| format!("profile '{name}' not found"))
 }
 
+/// Effective OS SSH endpoint. Host falls back to the unlock host and port to the
+/// unlock port independently, matching how enroll/rotate/fetch resolve it.
+fn os_ssh_addr(p: &Profile) -> (String, u16) {
+    (
+        p.os_host.clone().unwrap_or_else(|| p.unlock_host.clone()),
+        p.os_port.unwrap_or(p.unlock_port),
+    )
+}
+
 fn cmd_add(st: &mut State) -> Result<(), String> {
     let v = st.vault.as_mut().ok_or("no vault open")?;
     let name = ask("Profile name: ");
-    let unlock_host = ask("Unlock SSH host (IP/DNS): ");
+    let unlock_host = ask("Unlock SSH host (IP/hostname): ");
     let unlock_port: u16 = ask_or("Unlock SSH port", "22").parse().map_err(|_| "bad port")?;
-    let os_host = ask("OS SSH host (IP/DNS, blank = same as unlock SSH): ");
+    let os_host = ask("OS SSH host (IP/hostname, blank = same as unlock SSH): ");
     let os_port_str = ask("OS SSH port (blank = same as unlock SSH): ");
     let os_host = if os_host.is_empty() { None } else { Some(os_host) };
     let os_port = if os_port_str.is_empty() { None } else { Some(os_port_str.parse().map_err(|_| "bad OS port")?) };
@@ -538,12 +547,9 @@ fn handle_ls(st: &State) -> Result<(), String> {
     let v = st.vault_ref()?;
     println!("{:<16} {:<21} {:<21} {:>7}  {}", "NAME", "UNLOCK SSH", "OS SSH", "TARGETS", "HOSTKEY");
     for p in &v.inventory.profiles {
-        let os_ssh = match (&p.os_host, p.os_port) {
-            (Some(h), Some(pt)) => format!("{}:{}", h, pt),
-            (Some(h), None) => format!("{}:{}", h, p.unlock_port),
-            _ => "same as unlock".to_string(),
-        };
         let unlock_ssh = format!("{}:{}", p.unlock_host, p.unlock_port);
+        let (os_h, os_p) = os_ssh_addr(p);
+        let os_ssh = format!("{}:{}", os_h, os_p);
         let hostkey = if p.unlock_host_key.is_some() { "pinned" } else { "MISSING" };
         println!("{:<16} {:<21} {:<21} {:>7}  {}", p.name, unlock_ssh, os_ssh, p.targets_meta.len(), hostkey);
     }
@@ -558,10 +564,11 @@ fn handle_show(st: &State, parts: &[&str]) -> Result<(), String> {
     if matches.free.is_empty() { return Err("Usage: show <profile>".into()); }
     let n = &matches.free[0];
     let (v, p) = st.vault_and_profile_ref(n)?;
-    let os_addr = match (&p.os_host, p.os_port) {
-        (Some(h), Some(pt)) => format!("{}:{}", h, pt),
-        (Some(h), None) => format!("{}:{}", h, p.unlock_port),
-        _ => "same as unlock SSH".to_string(),
+    let (os_host, os_port) = os_ssh_addr(p);
+    let os_addr = if p.os_host.is_none() && p.os_port.is_none() {
+        format!("{}:{} (same as unlock SSH)", os_host, os_port)
+    } else {
+        format!("{}:{}", os_host, os_port)
     };
     println!("name: {}\nunlock SSH: {}:{} user {}\nOS SSH: {}\nuuid: {}", p.name, p.unlock_host, p.unlock_port, p.username, os_addr, uuid::Uuid::from_bytes(p.uuid));
     println!("notes: {}", if p.notes.is_empty() { "(none)" } else { &p.notes });
@@ -598,7 +605,7 @@ fn handle_edit(st: &mut State, parts: &[&str]) -> Result<(), String> {
         println!();
         println!("Editable fields:");
         println!("  name                Profile name");
-        println!("  unlock_host         Unlock SSH host (IP/DNS)");
+        println!("  unlock_host         Unlock SSH host (IP/hostname)");
         println!("  unlock_port         Unlock SSH port (default 22)");
         println!("  os_host             OS SSH host (blank = same as unlock SSH)");
         println!("  os_port             OS SSH port (blank = same as unlock SSH)");
