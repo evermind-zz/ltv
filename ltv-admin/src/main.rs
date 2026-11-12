@@ -90,6 +90,27 @@ fn os_ssh_addr(p: &Profile) -> (String, u16) {
     )
 }
 
+/// Parse a target selection: "all"/"y", "none"/"n"/empty, or an index list
+/// such as "0,2" / "0 2". Returns sorted, de-duplicated, in-range indices.
+fn parse_selection(input: &str, max: usize) -> Result<Vec<usize>, String> {
+    let s = input.trim().to_lowercase();
+    match s.as_str() {
+        "" | "n" | "no" | "none" => Ok(vec![]),
+        "y" | "yes" | "all" => Ok((0..max).collect()),
+        _ => {
+            let mut idx = Vec::new();
+            for tok in s.split(|c: char| c == ',' || c.is_whitespace()) {
+                if tok.is_empty() { continue; }
+                let i: usize = tok.parse().map_err(|_| format!("invalid selection '{tok}' (expected numbers, 'all', or 'none')"))?;
+                if i >= max { return Err(format!("selection {i} out of range (valid: 0-{})", max - 1)); }
+                if !idx.contains(&i) { idx.push(i); }
+            }
+            idx.sort_unstable();
+            Ok(idx)
+        }
+    }
+}
+
 fn cmd_add(st: &mut State) -> Result<(), String> {
     let v = st.vault.as_mut().ok_or("no vault open")?;
     let name = ask("Profile name: ");
@@ -422,7 +443,7 @@ fn print_help() {
   unlock <profile> [--verbose] [--sequential]   Full push-unlock with live progress
   enroll <profile> [--target <uuid|mapper>] [--verbose] [--sequential]
                                  Enroll keyfiles into LUKS headers over booted OS
-  fetch <profile> [--verbose]    Discover LUKS volumes on booted OS, offer to add as targets
+  fetch <profile> [--verbose]    Discover LUKS volumes on booted OS, choose targets to add
   server-setup <profile> [--out <dir>]
                                  Generate mkinitfs deployment artifacts for remote unlock
   passwd                         Change VAULT master passphrase (re-encrypts vault, not LUKS)
@@ -1173,27 +1194,39 @@ async fn handle_fetch(st: &mut State, parts: &[&str]) -> Result<(), String> {
         }
     }
 
-    let choice = ask("\nAdd all as targets? [y/N]: ").to_lowercase();
-    if choice == "y" {
-        for info in results {
-            // Use existing mapper name if available, otherwise ask user
-            let mapped = if let Some(mapper) = info.mapper_name {
-                mapper
-            } else {
+    let selection = parse_selection(&ask("\nAdd targets? [all/none/numbers, e.g. 0,2]: "), results.len())?;
+    if selection.is_empty() {
+        println!("No targets added.");
+        return Ok(());
+    }
+    let mut added = 0;
+    for i in selection {
+        let info = &results[i];
+        if p.targets_meta.iter().any(|t| t.luks_uuid == info.luks_uuid) {
+            println!("  skipped {} (already a target)", info.luks_uuid);
+            continue;
+        }
+        // Use existing mapper name if available, otherwise ask user
+        let mapped = match &info.mapper_name {
+            Some(mapper) => mapper.clone(),
+            None => {
                 let default = format!("crypt{}", info.luks_uuid.split('-').next().unwrap_or("vol"));
                 ask_or(&format!("Mapper name for {}", info.luks_uuid), &default)
-            };
-            let meta = TargetMeta {
-                luks_uuid: info.luks_uuid.clone(),
-                fallback_path: Some(info.device_path.clone()),
-                mapped_name: mapped.clone(),
-                order: 0,
-                keyslot: None,
-                token_id: None,
-            };
-            v.add_target(&p.uuid, meta, None).map_err(|e| e.to_string())?;
-            println!("  added target {}", mapped);
-        }
+            }
+        };
+        let meta = TargetMeta {
+            luks_uuid: info.luks_uuid.clone(),
+            fallback_path: Some(info.device_path.clone()),
+            mapped_name: mapped.clone(),
+            order: 0,
+            keyslot: None,
+            token_id: None,
+        };
+        v.add_target(&p.uuid, meta, None).map_err(|e| e.to_string())?;
+        println!("  added target {}", mapped);
+        added += 1;
+    }
+    if added > 0 {
         println!("targets added. Remember to 'save'.");
     }
     Ok(())
@@ -1246,4 +1279,31 @@ fn handle_backup(st: &mut State, parts: &[&str]) -> Result<(), String> {
     fs::write(&backup_path, bytes).map_err(|e| e.to_string())?;
     println!("backup saved to {}", backup_path);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_selection;
+
+    #[test]
+    fn selection_keywords() {
+        assert_eq!(parse_selection("", 3).unwrap(), Vec::<usize>::new());
+        assert_eq!(parse_selection("none", 3).unwrap(), Vec::<usize>::new());
+        assert_eq!(parse_selection("N", 3).unwrap(), Vec::<usize>::new());
+        assert_eq!(parse_selection("all", 3).unwrap(), vec![0, 1, 2]);
+        assert_eq!(parse_selection("Y", 2).unwrap(), vec![0, 1]);
+    }
+
+    #[test]
+    fn selection_indices_are_sorted_and_deduped() {
+        assert_eq!(parse_selection("1,0,2", 3).unwrap(), vec![0, 1, 2]);
+        assert_eq!(parse_selection("2 0", 3).unwrap(), vec![0, 2]);
+        assert_eq!(parse_selection("1,1", 3).unwrap(), vec![1]);
+    }
+
+    #[test]
+    fn selection_rejects_bad_input() {
+        assert!(parse_selection("3", 3).is_err());
+        assert!(parse_selection("abc", 3).is_err());
+    }
 }
