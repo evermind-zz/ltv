@@ -1418,6 +1418,13 @@ fn handle_dump_keys(st: &State, parts: &[&str]) -> Result<(), String> {
     let only = matches.opt_str("target");
     let out = PathBuf::from(matches.opt_str("out").unwrap_or_else(|| format!("{}-keys", safe_filename(n))));
     let (v, p) = st.vault_and_profile_ref(n)?;
+
+    // Re-verify vault master passphrase before dumping key material.
+    let pass = pass("Confirm vault passphrase: ");
+    let bytes = fs::read(st.path.as_ref().ok_or("no vault path")?).map_err(|e| e.to_string())?;
+    Vault::open(&bytes, &pass).map_err(|_| "incorrect passphrase")?;
+    println!("✓ Passphrase verified.");
+
     dump_keyfiles(v, p, only.as_deref(), &out)
 }
 
