@@ -449,6 +449,7 @@ async fn handle_command(st: &mut State, parts: &[&str]) -> Result<bool, String> 
         "server-setup" => handle_server_setup(st, parts).await?,
         "passwd" => handle_passwd(st, parts)?,
         "backup" => handle_backup(st, parts)?,
+        "dump-keys" => handle_dump_keys(st, parts)?,
         "rotate-key" => handle_rotate(st, parts).await?,
         "copy-profile" => handle_copy_profile(st, parts).await?,
         _ => return Err(format!("unknown command: {}. Type 'help' for list.", parts[0])),
@@ -485,6 +486,9 @@ fn print_help() {
                                  Generate mkinitfs deployment artifacts for remote unlock
   passwd                         Change VAULT master passphrase (re-encrypts vault, not LUKS)
   backup <path>                  Create timestamped encrypted vault copy
+  dump-keys <profile> [--out <dir>] [--target <uuid|mapper>]
+                                  Write each target's LUKS keyfile to '<dir>/<mapper>.key' (0600)
+                                  WARNING: these files unlock the volumes; store them offline
   copy-profile <src> <prof> [--name <n>] [--keep]
                                   Copy profile from another vault
                                   --keep: identical copy (same client key + host keys)
@@ -1394,9 +1398,116 @@ fn handle_backup(st: &mut State, parts: &[&str]) -> Result<(), String> {
     Ok(())
 }
 
+fn handle_dump_keys(st: &State, parts: &[&str]) -> Result<(), String> {
+    let mut opts = Options::new();
+    opts.optopt("o", "out", "output directory (default: <profile>-keys)", "DIR");
+    opts.optopt("t", "target", "only this target (UUID or mapper name)", "TARGET");
+    opts.optflag("h", "help", "show help");
+    let matches = opts.parse(&parts[1..]).map_err(|e| e.to_string())?;
+
+    if matches.free.is_empty() || matches.opt_present("h") {
+        println!("Usage: dump-keys <profile> [--out <dir>] [--target <uuid|mapper>]");
+        println!();
+        println!("Writes each target's raw LUKS keyfile to '<dir>/<mapper>.key' with mode 0600.");
+        println!("These files are direct unlock material: anyone holding them can open the volume.");
+        println!("Scope: per-target LUKS keyfiles only (not the client SSH identity).");
+        return Ok(());
+    }
+
+    let n = &matches.free[0];
+    let only = matches.opt_str("target");
+    let out = PathBuf::from(matches.opt_str("out").unwrap_or_else(|| format!("{}-keys", safe_filename(n))));
+    let (v, p) = st.vault_and_profile_ref(n)?;
+    dump_keyfiles(v, p, only.as_deref(), &out)
+}
+
+/// Write every selected target's stored LUKS keyfile into `out` as `<mapper>.key`.
+fn dump_keyfiles(v: &Vault, p: &Profile, only: Option<&str>, out: &Path) -> Result<(), String> {
+    let secrets = v.open_secrets(p).map_err(|e| e.to_string())?;
+
+    // Borrow the key bytes straight from the zeroizing SecretPayload; no copies.
+    let mut selected: Vec<(&TargetMeta, &[u8])> = Vec::new();
+    for t in p.targets_meta.iter().filter(|t| only.map_or(true, |f| f == t.luks_uuid || f == t.mapped_name)) {
+        let key = secrets.keyfiles.iter().find(|k| k.luks_uuid == t.luks_uuid)
+            .ok_or_else(|| format!("missing keyfile for target {}", t.mapped_name))?;
+        selected.push((t, &key.keyfile));
+    }
+    if selected.is_empty() {
+        return Err(match only {
+            Some(f) => format!("no target matches '{f}'"),
+            None => "profile has no targets".into(),
+        });
+    }
+
+    println!("This writes raw LUKS keyfiles in plaintext to the local filesystem.");
+    println!("Anyone with these files can unlock the volume(s) without this vault.");
+    if ask(&format!("Dump {} keyfile(s) to '{}'? type YES: ", selected.len(), out.display())) != "YES" {
+        return Err("aborted".into());
+    }
+
+    let existed = out.exists();
+    fs::create_dir_all(out).map_err(|e| format!("create {}: {e}", out.display()))?;
+    if !existed { secure_dir(out)?; }
+
+    let paths: Vec<PathBuf> = selected.iter()
+        .map(|(t, _)| out.join(format!("{}.key", safe_filename(&t.mapped_name))))
+        .collect();
+    for (i, path) in paths.iter().enumerate() {
+        if paths[..i].contains(path) {
+            return Err(format!("two targets map to the same output file: {}", path.display()));
+        }
+    }
+    let existing = paths.iter().filter(|p| p.exists()).count();
+    if existing > 0 && ask(&format!("{existing} key file(s) already exist there. Overwrite? [y/N]: ")).to_lowercase() != "y" {
+        return Err("aborted".into());
+    }
+
+    for ((t, bytes), path) in selected.iter().zip(paths.iter()) {
+        write_secret_file(path, bytes).map_err(|e| format!("write {}: {e}", path.display()))?;
+        println!("  {} ({} bytes)  mapper={} uuid={}", path.display(), bytes.len(), t.mapped_name, t.luks_uuid);
+    }
+    println!("done. Keep these files offline; delete them when no longer needed.");
+    Ok(())
+}
+
+/// Restrict a user/host supplied name to a single safe filename component.
+fn safe_filename(name: &str) -> String {
+    let s: String = name.chars()
+        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') { c } else { '_' })
+        .collect();
+    if s.is_empty() || s == "." || s == ".." { "target".into() } else { s }
+}
+
+#[cfg(unix)]
+fn secure_dir(path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+        .map_err(|e| format!("chmod {}: {e}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn secure_dir(_path: &Path) -> Result<(), String> { Ok(()) }
+
+/// Create/truncate a file with mode 0600 from the start (no world-readable window).
+#[cfg(unix)]
+fn write_secret_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let mut f = fs::OpenOptions::new()
+        .write(true).create(true).truncate(true).mode(0o600).open(path)?;
+    f.write_all(bytes)?;
+    f.set_permissions(fs::Permissions::from_mode(0o600))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn write_secret_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    fs::write(path, bytes)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{parse_selection, target_diff, TargetMeta};
+    use super::{fs, parse_selection, safe_filename, target_diff, write_secret_file, TargetMeta};
 
     fn meta() -> TargetMeta {
         TargetMeta {
@@ -1462,5 +1573,28 @@ mod tests {
         m.fallback_path = None;
         let d = target_diff(0, "uuid-1", &m, Some("cryptroot"), "/dev/vda4").unwrap();
         assert_eq!(d.device, Some((None, "/dev/vda4".into())));
+    }
+
+    #[test]
+    fn safe_filename_stays_in_one_component() {
+        assert_eq!(safe_filename("cryptroot"), "cryptroot");
+        assert_eq!(safe_filename("../../etc/passwd"), ".._.._etc_passwd");
+        assert_eq!(safe_filename("a/b\\c"), "a_b_c");
+        assert_eq!(safe_filename(".."), "target");
+        assert_eq!(safe_filename(""), "target");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn secret_keyfile_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("ltv-dump-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("key");
+        write_secret_file(&path, b"\x00secret\xff").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"\x00secret\xff");
+        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        let _ = fs::remove_dir_all(&dir);
     }
 }
