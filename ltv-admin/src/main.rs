@@ -607,7 +607,7 @@ fn handle_status(st: &State) -> Result<(), String> {
 
 fn handle_ls(st: &State) -> Result<(), String> {
     let v = st.vault_ref()?;
-    println!("{:<16} {:<21} {:<21} {:>7}  {}", "NAME", "UNLOCK SSH", "OS SSH", "TARGETS", "HOSTKEY");
+    println!("{:<16} {:<21} {:<21} {:>7}  {}", "NAME", "UNLOCK SSH", "OS SSH", "TARGETS", "UNLOCK HOSTKEY");
     for p in &v.inventory.profiles {
         let unlock_ssh = format!("{}:{}", p.unlock_host, p.unlock_port);
         let (os_h, os_p) = os_ssh_addr(p);
