@@ -707,14 +707,15 @@ async fn handle_hostkey(st: &mut State, parts: &[&str]) -> Result<(), String> {
 
     match subcmd.as_str() {
         "fetch" => {
-            println!("Fetching host key from {}:{} ...", p.unlock_host, p.unlock_port);
-            let hk = match fetch_host_key(&p.unlock_host, p.unlock_port, p.connect_timeout_s).await {
+            let (host, port) = if is_os { os_ssh_addr(&p) } else { (p.unlock_host.clone(), p.unlock_port) };
+            println!("Fetching host key from {}:{} ...", host, port);
+            let hk = match fetch_host_key(&host, port, p.connect_timeout_s).await {
                 Ok(hk) => hk,
                 Err(e) => {
                     let msg = e.to_string();
                     if msg.contains("Connection refused") || msg.contains("Connection timed out") {
                         let svc = if is_os { "OS SSH" } else { "unlock SSH" };
-                        return Err(format!("Failed to connect to {}:{}. Is {} running?", p.unlock_host, p.unlock_port, svc));
+                        return Err(format!("Failed to connect to {}:{}. Is {} running?", host, port, svc));
                     }
                     return Err(msg);
                 }
@@ -822,8 +823,9 @@ async fn handle_enroll(st: &mut State, parts: &[&str]) -> Result<(), String> {
     let p = resolve(v, n)?.clone();
 
     if p.os_host_key.is_none() {
-        println!("No OS host key pinned. Fetching from {}:{} ...", p.unlock_host, p.unlock_port);
-        let hk = fetch_host_key(&p.unlock_host, p.unlock_port, p.connect_timeout_s).await.map_err(|e| e.to_string())?;
+        let (os_host, os_port) = os_ssh_addr(&p);
+        println!("No OS host key pinned. Fetching from {}:{} ...", os_host, os_port);
+        let hk = fetch_host_key(&os_host, os_port, p.connect_timeout_s).await.map_err(|e| e.to_string())?;
         println!("{} {}", hk.key_type, fingerprint_sha256(&hk.key_bytes));
         if ask("Pin as OS host key? [y/N]: ").to_lowercase() != "y" { return Err("aborted".into()); }
         v.set_host_key(&p.uuid, hk, true).map_err(|e| e.to_string())?;
@@ -921,8 +923,9 @@ async fn handle_rotate(st: &mut State, parts: &[&str]) -> Result<(), String> {
     let p = resolve(v, n)?.clone();
 
     if p.os_host_key.is_none() {
-        println!("No OS host key pinned. Fetching from {}:{} ...", p.unlock_host, p.unlock_port);
-        let hk = fetch_host_key(&p.unlock_host, p.unlock_port, p.connect_timeout_s).await.map_err(|e| e.to_string())?;
+        let (os_host, os_port) = os_ssh_addr(&p);
+        println!("No OS host key pinned. Fetching from {}:{} ...", os_host, os_port);
+        let hk = fetch_host_key(&os_host, os_port, p.connect_timeout_s).await.map_err(|e| e.to_string())?;
         println!("{} {}", hk.key_type, fingerprint_sha256(&hk.key_bytes));
         if ask("Pin as OS host key? [y/N]: ").to_lowercase() != "y" { return Err("aborted".into()); }
         v.set_host_key(&p.uuid, hk, true).map_err(|e| e.to_string())?;
@@ -1110,13 +1113,14 @@ async fn handle_fetch(st: &mut State, parts: &[&str]) -> Result<(), String> {
 
     // Fetch OS host key (for enroll/rotate against booted OS)
     if p.os_host_key.is_none() {
-        println!("No OS host key pinned. Fetching from {}:{} ...", p.unlock_host, p.unlock_port);
-        let hk = match fetch_host_key(&p.unlock_host, p.unlock_port, p.connect_timeout_s).await {
+        let (os_host, os_port) = os_ssh_addr(&p);
+        println!("No OS host key pinned. Fetching from {}:{} ...", os_host, os_port);
+        let hk = match fetch_host_key(&os_host, os_port, p.connect_timeout_s).await {
             Ok(hk) => hk,
             Err(e) => {
                 let msg = e.to_string();
                 if msg.contains("Connection refused") || msg.contains("Connection timed out") {
-                    return Err(format!("Failed to connect to {}:{}. Is the OS booted and SSH running?", p.unlock_host, p.unlock_port));
+                    return Err(format!("Failed to connect to {}:{}. Is the OS booted and SSH running?", os_host, os_port));
                 }
                 return Err(msg);
             }
