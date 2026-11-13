@@ -248,11 +248,17 @@ fn emit_rotate_msg(msg: RotateMsg, on: &mut impl FnMut(RotateEvent),
 
 /// Rotates the keyfile for each target: adds new key, verifies, kills old slot.
 /// Updates vault with new keyfile and slot, saves atomically after each target.
+/// 
+/// If `per_target_save` is provided, it is called after each target's vault update
+/// (after verification, before killing old slot) to persist the vault to disk.
+/// The callback receives the vault so it can serialize and save it.
+/// This enables a paranoid rotation procedure where each step is persisted.
 pub async fn rotate_key(
     vault: &mut Vault, uuid: &[u8; 16], access: &BootedAccess, mode: ExecutionMode,
     mut passphrase_provider: impl FnMut(&str) -> Result<SecretString, String>,
     only_target: Option<&str>, mut on: impl FnMut(RotateEvent),
     mut verbose: Option<Box<dyn FnMut(&str) + Send>>,
+    mut per_target_save: Option<&mut dyn FnMut(&mut Vault) -> Result<(), UnlockError>>,
 ) -> Result<Vec<RotateResult>, UnlockError> {
     let p = vault.profile(uuid)?.clone();
     let os_key = p.os_host_key.clone().ok_or(UnlockError::HostKeyNotPinned)?;
@@ -303,6 +309,11 @@ pub async fn rotate_key(
                 let old_slot = done.old_slot;
                 let name = done.target.mapped_name.clone();
                 let res = finish_rotate(vault, uuid, done).await?;
+
+                // Persist vault to disk before killing old slot (paranoid mode)
+                if let Some(save_fn) = per_target_save.as_mut() {
+                    save_fn(vault)?;
+                }
 
                 // 11. Kill old slot
                 let cmd = format!("{sudo}cryptsetup luksKillSlot {dev} {old_slot}");

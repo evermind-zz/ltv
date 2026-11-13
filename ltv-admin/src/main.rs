@@ -60,6 +60,17 @@ fn save_atomic(st: &mut State) -> AdminResult<()> {
     Ok(())
 }
 
+/// Save vault to disk given path and vault reference (for use in callbacks)
+fn save_vault_atomic(path: &Path, vault: &mut Vault) -> Result<(), ltv_core::error::UnlockError> {
+    let bytes = vault.save().map_err(|e| ltv_core::error::UnlockError::Vault(e))?;
+    let tmp = path.with_extension("ltv.tmp");
+    std::fs::write(&tmp, &bytes).map_err(|e| ltv_core::error::UnlockError::Vault(ltv_core::error::VaultError::Serde(e.to_string())))?;
+    if path.exists() { let _ = std::fs::copy(path, path.with_extension("ltv.bak")); }
+    std::fs::rename(&tmp, path).map_err(|e| ltv_core::error::UnlockError::Vault(ltv_core::error::VaultError::Serde(e.to_string())))?;
+    println!("saved {}", path.display());
+    Ok(())
+}
+
 /// Metadata difference detected when re-running `fetch` for an already configured
 /// target (identity is the LUKS UUID; only mapper/device metadata can drift).
 #[derive(Debug)]
@@ -934,6 +945,24 @@ async fn handle_rotate(st: &mut State, parts: &[&str]) -> AdminResult<()> {
     let sequential = matches.opt_present("sequential");
     let mode = if sequential { ExecutionMode::Sequential } else { ExecutionMode::Parallel };
 
+    // Pre-flight: get vault path early, check not dirty
+    let vault_path = st.path.as_ref().ok_or(AdminError::NoVaultPath)?.clone();
+    {
+        let v = require_vault_mut(st)?;
+        if v.is_dirty() {
+            return Err(AdminError::InvalidArgument("vault has unsaved changes; run 'save' first".into()));
+        }
+    }
+
+    // Create backup before rotation
+    let backup_path = format!("{}.rotate-backup", vault_path.display());
+    {
+        let v = require_vault_mut(st)?;
+        let backup_bytes = v.save().map_err(AdminError::Vault)?;
+        fs::write(&backup_path, &backup_bytes).map_err(AdminError::Io)?;
+        println!("Created backup: {}", backup_path);
+    }
+
     let v = require_vault_mut(st)?;
     let p = find_profile(&v, n)?.clone();
 
@@ -980,7 +1009,7 @@ async fn handle_rotate(st: &mut State, parts: &[&str]) -> AdminResult<()> {
         }
     }
 
-    // Ask if all targets use the same LUKS passphrase
+    // Ask if all targets use the same LUKS passphrase (only if >1 target)
     let same_passphrase = if targets.len() > 1 {
         ask("Do all targets use the same LUKS passphrase? [Y/n]: ").to_lowercase() != "n"
     } else {
@@ -1011,7 +1040,19 @@ async fn handle_rotate(st: &mut State, parts: &[&str]) -> AdminResult<()> {
         }
     }
 
-    let results = ltv_core::rotate_key(v, &p.uuid, &access, mode, |luks_uuid| {
+    // For paranoid mode, force sequential and save after each target
+    let use_paranoid = targets.len() > 0; // always use paranoid when we have targets
+    let effective_mode = if use_paranoid { ExecutionMode::Sequential } else { mode };
+    if !sequential && effective_mode == ExecutionMode::Sequential {
+        println!("Note: using sequential mode for safe per-target vault persistence");
+    }
+
+    let vault_path_clone = vault_path.clone();
+    let mut save_after_each = |vault: &mut Vault| -> Result<(), ltv_core::error::UnlockError> {
+        save_vault_atomic(&vault_path_clone, vault)
+    };
+
+    let results = ltv_core::rotate_key(v, &p.uuid, &access, effective_mode, |luks_uuid| {
         passphrases.get(luks_uuid).cloned().ok_or_else(|| format!("no passphrase for {}", luks_uuid))
     }, only.as_deref(), |e| {
         match e {
@@ -1019,12 +1060,13 @@ async fn handle_rotate(st: &mut State, parts: &[&str]) -> AdminResult<()> {
             other if !verbose => println!(" ✓ {other}"),
             _ => {}
         }
-    }, if verbose { Some(Box::new(|cmd: &str| println!("  [rotate] $ {cmd}")) as Box<dyn FnMut(&str) + Send>) } else { None }).await.map_err(AdminError::Unlock)?;
+    }, if verbose { Some(Box::new(|cmd: &str| println!("  [rotate] $ {cmd}")) as Box<dyn FnMut(&str) + Send>) } else { None }, Some(&mut save_after_each)).await.map_err(AdminError::Unlock)?;
 
-    // Persist vault to disk after all rotations
-    save_atomic(st)?;
+    // Clean up backup on success
+    let _ = fs::remove_file(&backup_path);
+    println!("Backup removed: {}", backup_path);
 
-    println!("rotated {} target(s); vault saved.", results.len());
+    println!("rotated {} target(s); vault saved after each target.", results.len());
     Ok(())
 }
 
