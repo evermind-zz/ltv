@@ -11,10 +11,11 @@ use tokio::sync::{mpsc, Semaphore};
 pub enum RotateEvent {
     Connected, Authenticated,
     TargetStart(String),
-    SlotChosen(String, u8),      // new slot chosen
-    SlotAdded(String, u8),       // new key added
-    Verified(String),            // new key verified
-    OldSlotKilled(String, u8),   // old slot removed
+    OldSlotFound(String, u8),      // old slot containing our key
+    SlotChosen(String, u8),        // new slot chosen for rotation
+    SlotAdded(String, u8),         // new key added
+    Verified(String),              // new key verified
+    OldSlotKilled(String, u8),     // old slot removed
     Skipped(String, String),
     Done,
 }
@@ -25,6 +26,7 @@ impl std::fmt::Display for RotateEvent {
             RotateEvent::Connected => write!(f, "connected to OS SSH"),
             RotateEvent::Authenticated => write!(f, "authenticated"),
             RotateEvent::TargetStart(t) => write!(f, "{t}: rotating keyfile"),
+            RotateEvent::OldSlotFound(uuid, slot) => write!(f, "{uuid}: found old slot {slot}"),
             RotateEvent::SlotChosen(uuid, slot) => write!(f, "{uuid}: chosen new slot {slot}"),
             RotateEvent::SlotAdded(uuid, slot) => write!(f, "{uuid}: added new key to slot {slot}"),
             RotateEvent::Verified(uuid) => write!(f, "{uuid}: verified new key"),
@@ -148,7 +150,7 @@ async fn rotate_one(
             return Ok(None);
         }
     };
-    emit(RotateEvent::SlotChosen(tm.mapped_name.clone(), old_slot)); // reuse for old slot
+    emit(RotateEvent::OldSlotFound(tm.mapped_name.clone(), old_slot));
 
     // 2. Generate new keyfile
     let mut new_keyfile = vec![0u8; 64];

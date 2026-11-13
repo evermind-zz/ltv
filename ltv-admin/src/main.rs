@@ -1021,7 +1021,10 @@ async fn handle_rotate(st: &mut State, parts: &[&str]) -> AdminResult<()> {
         }
     }, if verbose { Some(Box::new(|cmd: &str| println!("  [rotate] $ {cmd}")) as Box<dyn FnMut(&str) + Send>) } else { None }).await.map_err(AdminError::Unlock)?;
 
-    println!("rotated {} target(s); vault auto-saved.", results.len());
+    // Persist vault to disk after all rotations
+    save_atomic(st)?;
+
+    println!("rotated {} target(s); vault saved.", results.len());
     Ok(())
 }
 
