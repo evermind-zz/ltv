@@ -34,9 +34,6 @@ Mapper name [cryptroot]: cryptroot
 Order [0]: 0
   target added, 64-byte keyfile generated.
 LUKS UUID (blank = done):
-
-Client public key (deploy to initramfs authorized_keys):
-ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI... ltv:myserver
 ```
 
 ## 3. Deploy to Target
@@ -51,12 +48,11 @@ scp -r ./deploy-myserver root@192.0.2.10:/root/
 # On target (as root):
 cd /root/deploy-myserver
 ./deploy.sh
-
-# Update bootloader (syslinux example)
-# Edit /etc/syslinux.conf:
-#   INITRD /boot/initramfs-ltv-6.18.59-0-virt
-#   APPEND ltv=yes ip=dhcp modules=virtio_net root=UUID=... quiet
-
+# Follow printed manual steps:
+# 1. Add 'ltv' to FEATURES in /etc/mkinitfs/mkinitfs.conf
+# 2. Add kernel cmdline: ltv=yes ip=dhcp modules=virtio_net
+# 3. Run mkinitfs manually
+# 4. Update bootloader (INTEGRATE params, don't replace) and reboot
 reboot
 ```
 
@@ -96,7 +92,7 @@ ltv-admin> quit
 
 ## 6. Test Unlock
 
-Reboot target → initramfs → from admin:
+Reboot target -> initramfs -> from admin:
 
 ```bash
 ltv-admin> unlock myserver
@@ -122,7 +118,7 @@ add -> name, host, UUID, mapper
 # Deploy
 server-setup name --out ./deploy
 scp -r ./deploy root@host:/root/
-# On target: ./deploy.sh -> update bootloader -> reboot
+# On target: ./deploy.sh -> follow manual steps -> reboot
 
 # Pin key
 hostkey fetch name
@@ -134,17 +130,10 @@ enroll name
 unlock name
 ```
 
-## Files Created
-
-| File | Purpose |
-|------|---------|
-| `~/.ltv/vault.ltv` | Encrypted vault (backup this!) |
-| `deploy-*/deploy.sh` | Run on target to install feature |
-| `deploy-*/README.md` | Full deployment instructions |
-
 ## Next Steps
 
+- Full deployment guide: [docs/DEPLOYMENT.md](DEPLOYMENT.md)
+- Operational workflows: [docs/WORKFLOWS.md](WORKFLOWS.md)
 - Add more targets: `target add <profile>`
 - Discover volumes: `fetch <profile>`
 - Backup vault: `backup ~/.ltv/backup.ltv`
-- Read full docs: `docs/WORKFLOWS.md`, `docs/DEPLOYMENT.md`

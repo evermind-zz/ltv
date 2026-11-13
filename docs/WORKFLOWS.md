@@ -1,5 +1,8 @@
 # LTV Workflows
 
+This document describes the operational workflows for LTV. For deployment details,
+see [DEPLOYMENT.md](DEPLOYMENT.md).
+
 ## 1. Initial Setup (Admin Workstation)
 
 ```bash
@@ -24,7 +27,9 @@ LUKS UUID (blank = done):
 
 ## 2. Server Preparation (Target Server)
 
-**Automated via deploy.sh:**
+See [DEPLOYMENT.md](DEPLOYMENT.md) for full deployment guide.
+
+**Quick summary:**
 
 ```bash
 # On admin: generate deployment artifacts
@@ -36,19 +41,11 @@ scp -r ./deploy-web01 root@192.0.2.10:/root/
 # On target server (as root):
 cd /root/deploy-web01
 ./deploy.sh
-# Output shows manual steps required:
+# Follow printed manual steps:
 # 1. Add 'ltv' to FEATURES in /etc/mkinitfs/mkinitfs.conf
 # 2. Add kernel cmdline: ltv=yes ip=dhcp modules=virtio_net
 # 3. Run mkinitfs manually
-# 4. Update bootloader and reboot
-```
-
-**Bootloader update (syslinux example):**
-
-```bash
-# Edit /etc/syslinux.conf, change initramfs line and add:
-ltv=yes ip=dhcp modules=virtio_net
-reboot
+# 4. Update bootloader (integrate params, don't replace) and reboot
 ```
 
 ## 3. Host Key Pinning (TOFU)
@@ -234,13 +231,22 @@ Type YES to confirm plaintext export: YES
 keyfile written to /tmp/keyfile.bin
 ```
 
+## 10. Key Rotation
+
+```bash
+# Rotate LUKS keyfiles for all targets in a profile
+ltv-admin> rotate-key web01
+```
+
+This performs a paranoid rotation: backup vault -> for each target: add new key -> verify -> save vault -> remove old slot -> cleanup backup.
+
 ## Summary: Complete Onboarding Flow
 
 ```
 1. create vault.ltv
 2. add profile (name, host, targets)
 3. server-setup profile -> deploy.sh
-4. Copy deploy to target, run deploy.sh, update bootloader (ltv=yes ip=dhcp modules=virtio_net), reboot
+4. Copy deploy to target, run deploy.sh, update bootloader (integrate ltv=yes ip=dhcp modules=virtio_net), reboot
 5. hostkey fetch profile (pin initramfs key)
 6. enroll profile (add keyfile to LUKS header via booted OS)
 7. save

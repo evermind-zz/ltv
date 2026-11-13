@@ -136,7 +136,7 @@ Vault file corrupted or modified. Restore from backup.
 |-------|-----|
 | `mkinitfs: command not found` | Install `mkinitfs` package (Alpine base) |
 | `dropbearkey: not found` | Install `dropbear` package |
-| `cp: cannot stat 'ltv-hook.sh'` | Run from deploy directory |
+| `cp: cannot stat 'ltv-luks-wrapper.sh'` | Run from deploy directory |
 | Permission denied | Run as root |
 
 ## Debugging Tips
@@ -155,15 +155,16 @@ ssh -v -i <key> -p 22 root@192.0.2.10
 mkdir -p /tmp/initramfs-test
 cd /tmp/initramfs-test
 zcat /boot/initramfs-ltv-$(uname -r) | cpio -idmv
-ls -la sbin/dropbear usr/share/mkinitfs/features.d/ltv-hook.sh sbin/ltv-init-wrapper
+ls -la sbin/dropbear usr/share/mkinitfs/ltv-luks-wrapper.sh etc/mkinitfs/ltv-stuff/
 ```
 
-### Test Hook Manually
+### Test Wrapper Manually
 
 ```bash
 # In initramfs (emergency shell)
-export LTV_MAPPERS="cryptroot"
-/usr/share/mkinitfs/features.d/ltv-hook.sh
+export LTV_PORT=22
+/usr/share/mkinitfs/ltv-luks-wrapper.sh
+# This starts Dropbear and runs nlplug-findfs
 ```
 
 ### Verify LUKS Keyslots
