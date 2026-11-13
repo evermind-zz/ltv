@@ -306,6 +306,11 @@ sudo sh deploy_nopatch.sh
 
 Add to kernel command line:
 ltv=yes
+ip=dhcp
+modules=virtio_net
+
+Note: Use `ip=dhcp` (or static IP config per Alpine docs) for network in initramfs.
+Use `modules=virtio_net` (or your NIC driver, e.g. e1000, vmxnet3) to load the network driver.
 
 ## From Admin Machine
 

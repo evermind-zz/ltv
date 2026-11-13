@@ -13,17 +13,17 @@
 
 ```
 deploy-<profile>/
-├── ltv.files                    # Feature file list (installed to /etc/mkinitfs/features.d/)
-├── ltv.modules                  # Kernel modules (empty - uses cryptsetup feature)
-├── ltv.packages                 # APK packages: dropbear
-├── ltv-hook.sh                  # Initramfs hook script (installed to /usr/share/mkinitfs/)
-├── initramfs-init.patch         # Sed script to patch /usr/share/mkinitfs/initramfs-init
-├── etc/dropbear/
-│   └── README.txt               # "Run: dropbearkey -t ed25519 ..."
-├── authorized_keys              # Restricted client pubkey
-├── cmdline.txt                  # Kernel cmdline snippet
-├── deploy.sh                    # Run on target server
-└── README.md                    # This guide
+├── ltv.files                     # Feature file list (installed to /etc/mkinitfs/features.d/)
+├── ltv.modules                   # Kernel modules (empty - uses cryptsetup feature)
+├── ltv.packages                  # APK packages: dropbear
+├── ltv-luks-wrapper.sh           # Luks wrapper (replaces nlplug-findfs, starts Dropbear, waits for resume)
+├── ltv-patch-init.sh             # Script to patch initramfs-init (idempotent)
+├── authorized_keys               # Restricted client pubkey for initramfs SSH
+├── dropbear_ed25519_host_key     # Dropbear host private key (pre-generated)
+├── dropbear_ed25519_host_key.pub # Dropbear host public key
+├── deploy.sh                     # Run on target server (patches initramfs-init)
+├── deploy_nopatch.sh             # Alternative without patching initramfs-init
+└── README.md                     # This guide
 ```
 
 ## deploy.sh Actions
@@ -32,26 +32,32 @@ deploy-<profile>/
 #!/bin/sh
 # 1. Install mkinitfs feature files
 cp ltv.files ltv.modules ltv.packages /etc/mkinitfs/features.d/
-cp ltv-hook.sh /usr/share/mkinitfs/ltv-hook.sh
-chmod 755 /usr/share/mkinitfs/ltv-hook.sh
 
-# 2. Patch initramfs init script to call ltv-hook
-sh initramfs-init.patch
+# 2. Install luks wrapper
+cp ltv-luks-wrapper.sh /usr/share/mkinitfs/ltv-luks-wrapper.sh
+chmod 755 /usr/share/mkinitfs/ltv-luks-wrapper.sh
 
-# 3. Generate Dropbear Ed25519 host key
-dropbearkey -t ed25519 -f /etc/dropbear/dropbear_ed25519_host_key
+# 3. Install Dropbear host key and authorized_keys overlay
+mkdir -p /etc/mkinitfs/ltv-stuff/etc/dropbear
+cp dropbear_ed25519_host_key /etc/mkinitfs/ltv-stuff/etc/dropbear/
+cp dropbear_ed25519_host_key.pub /etc/mkinitfs/ltv-stuff/etc/dropbear/
+mkdir -p /etc/mkinitfs/ltv-stuff/root/.ssh
+cp authorized_keys /etc/mkinitfs/ltv-stuff/root/.ssh/authorized_keys
+chmod 600 /etc/mkinitfs/ltv-stuff/etc/dropbear/dropbear_ed25519_host_key
+chmod 644 /etc/mkinitfs/ltv-stuff/etc/dropbear/dropbear_ed25519_host_key.pub
+chmod 600 /etc/mkinitfs/ltv-stuff/root/.ssh/authorized_keys
 
-# 4. Create authorized_keys overlay for initramfs
-mkdir -p /etc/mkinitfs/features.d/ltv-ssh.keys/root/.ssh
-cp authorized_keys /etc/mkinitfs/features.d/ltv-ssh.keys/root/.ssh/authorized_keys
-chmod 600 /etc/mkinitfs/features.d/ltv-ssh.keys/root/.ssh/authorized_keys
+# 4. Install patch script and commit hook
+cp ltv-patch-init.sh /etc/mkinitfs/ltv-stuff/ltv-patch-init.sh
+chmod 755 /etc/mkinitfs/ltv-stuff/ltv-patch-init.sh
+mkdir -p /etc/apk/commit_hooks.d
+cp ltv-commit-hook.sh /etc/apk/commit_hooks.d/ltv-commit-hook.sh
+chmod 755 /etc/apk/commit_hooks.d/ltv-commit-hook.sh
 
-# 5. Regenerate initramfs
-KERNEL=$(uname -r)
-mkinitfs -F "base ltv cryptsetup network" -k "$KERNEL" \
-  -o "/boot/initramfs-ltv-$KERNEL" "$KERNEL"
+# 5. Patch initramfs init script
+sh /etc/mkinitfs/ltv-stuff/ltv-patch-init.sh /usr/share/mkinitfs/initramfs-init
 
-# 6. Print next steps for bootloader
+# 6. Print next steps (user runs mkinitfs manually)
 ```
 
 ## Bootloader Configuration
@@ -66,17 +72,15 @@ LABEL ltv
     MENU_LABEL Alpine Linux with LTV
     LINUX /boot/vmlinuz-virt
     INITRD /boot/initramfs-ltv-6.18.59-0-virt
-    APPEND ltv_mappers=cryptroot,cryptdata root=UUID=<rootfs-uuid> modules=sd-mod,usb-storage,ext4 quiet
+    APPEND ltv=yes ip=dhcp modules=virtio_net root=UUID=<rootfs-uuid> quiet
 ```
-
-**Note**: No `init=` wrapper needed - the hook is called from the patched init script.
 
 ### GRUB
 
 Edit `/etc/default/grub`:
 
 ```bash
-GRUB_CMDLINE_LINUX_DEFAULT="ltv_mappers=cryptroot,cryptdata"
+GRUB_CMDLINE_LINUX_DEFAULT="ltv=yes ip=dhcp modules=virtio_net"
 ```
 
 Then: `grub-mkconfig -o /boot/grub/grub.cfg`
@@ -85,7 +89,10 @@ Then: `grub-mkconfig -o /boot/grub/grub.cfg`
 
 | Parameter | Description | Example |
 |-----------|-------------|---------|
-| `ltv_mappers=cryptroot,cryptdata` | Comma-separated mapper names to wait for | Required |
+| `ltv=yes` | Enable LTV remote unlock (required) | Required |
+| `ip=dhcp` | Configure network via DHCP (required for remote unlock) | Required for network |
+| `ip=<static>` | Static IP config (Alpine format) | Alternative to DHCP |
+| `modules=<driver>` | Load network driver early (e.g. virtio_net, e1000, vmxnet3) | Recommended |
 
 ## Network Configuration
 
@@ -99,70 +106,47 @@ The initramfs network is configured via standard Alpine kernel params:
 
 See Alpine `mkinitfs` docs for full network options.
 
+**Important**: Network must be configured in initramfs for Dropbear SSH to be reachable. The `ltv-patch-init.sh` patches `initramfs-init` to run `configure_ip` when `ltv=yes` is present.
+
 ## Dropbear Configuration
 
-The hook starts Dropbear with:
+The wrapper starts Dropbear with:
 
 ```bash
-dropbear -R -s -j -k -p 22 -r /etc/dropbear/dropbear_ed25519_host_key
+dropbear -E -p ${LTV_PORT:-22} -r /etc/mkinitfs/ltv-stuff/etc/dropbear/dropbear_ed25519_host_key -D /etc/mkinitfs/ltv-stuff/root/.ssh/ &
 ```
 
 | Flag | Purpose |
 |------|---------|
-| `-R` | Don't daemonize (we background manually) |
-| `-s` | Disable password auth |
-| `-j` | Disable local port forwarding |
-| `-k` | Disable keepalive |
-| `-p 22` | Listen on port 22 |
+| `-E` | Log to stderr |
+| `-p 22` | Listen on port 22 (configurable via LTV_PORT) |
 | `-r` | Host key file |
+| `-D` | Authorized keys file directory |
 
 **Authorized keys restrictions** (from `authorized_keys`):
 ```
 no-port-forwarding,no-agent-forwarding,no-X11-forwarding,no-pty ssh-ed25519 ...
 ```
 
-## Hook Behavior (ltv-hook.sh)
+## Wrapper Behavior (ltv-luks-wrapper.sh)
 
 ```bash
-# 1. Ensure host keys exist
-for keytype in ed25519 ecdsa rsa; do
-    [ -f /etc/dropbear/dropbear_${keytype}_host_key ] || dropbearkey -t $keytype -f ...
-done
-
-# 2. Start Dropbear
-dropbear ... &
-DROPBEAR_PID=$!
-
-# 3. Wait for mappers or resume signal
-while [ $ELAPSED -lt 300 ]; do
-    ready=1
-    for m in $LTV_MAPPERS; do
-        [ -e /dev/mapper/$m ] || ready=0
-    done
-    [ $ready -eq 1 ] && break
-    [ -e /run/ltv/resume ] && break
-    sleep 1
-    ELAPSED=$((ELAPSED + 1))
-done
-
-# 4. Cleanup
-kill $DROPBEAR_PID
-wait $DROPBEAR_PID
+# 1. Filter crypto arguments from nlplug-findfs call
+# 2. Start Dropbear SSH server
+# 3. Background monitor for /run/ltv/resume signal
+# 4. First nlplug-findfs run (foreground, TTY password prompt)
+# 5. If unlocked via SSH: Second run without crypto options (triggers mdev/LVM)
 ```
 
-**Timeout**: 300 seconds (5 minutes). After timeout, hook exits with error.
+**Timeout**: No built-in timeout - waits for `/run/ltv/resume` or TTY unlock.
 
 ## Init Script Patching
 
-The `initramfs-init.patch` inserts the hook call after the comment `run nlplug-findfs before SINGLEMODE` in `/usr/share/mkinitfs/initramfs-init`:
+The `ltv-patch-init.sh` script patches `/usr/share/mkinitfs/initramfs-init` idempotently:
 
-```bash
-# LTV hook - start dropbear for remote unlock
-if [ -n "$KOPT_ltv_mappers" ]; then
-    export LTV_MAPPERS="$KOPT_ltv_mappers"
-    /usr/share/mkinitfs/ltv-hook.sh
-fi
-```
+1. **Adds 'ltv' to myopts** - makes `ltv=yes` recognized as a kernel option
+2. **Inserts network setup** - runs `configure_ip` when `ltv=yes` and networking is enabled
+3. **Replaces nlplug-findfs call** - calls `ltv-luks-wrapper.sh` instead
 
 This runs **after the second `configure_ip` call** (network is up) and **before `nlplug-findfs` for cryptroot**.
 
@@ -170,13 +154,13 @@ This runs **after the second `configure_ip` call** (network is up) and **before 
 
 After deployment, verify:
 
-- [ ] `dropbearkey -t ed25519` generated host key in `/etc/dropbear/`
 - [ ] `/etc/mkinitfs/features.d/ltv.*` files present
-- [ ] `/usr/share/mkinitfs/ltv-hook.sh` executable
-- [ ] `/usr/share/mkinitfs/initramfs-init` patched (backup at `.ltv-backup`)
+- [ ] `/usr/share/mkinitfs/ltv-luks-wrapper.sh` executable
+- [ ] `/usr/share/mkinitfs/initramfs-init` patched (check for "LTV PATCH" markers)
+- [ ] `/etc/mkinitfs/ltv-stuff/` contains dropbear keys and authorized_keys
+- [ ] `/etc/apk/commit_hooks.d/ltv-commit-hook.sh` present
 - [ ] Initramfs regenerated: `/boot/initramfs-ltv-<kernel>`
-- [ ] Bootloader updated with new initramfs + cmdline
-- [ ] `authorized_keys` overlay created in `/etc/mkinitfs/features.d/ltv-ssh.keys/`
+- [ ] Bootloader updated with new initramfs + kernel cmdline (`ltv=yes ip=dhcp modules=virtio_net`)
 
 ## Testing
 
@@ -193,29 +177,4 @@ ltv-admin> unlock web01
 
 # 4. Verify boot completes
 # Target should boot to login prompt
-```
-
-## Troubleshooting
-
-| Issue | Check |
-|-------|-------|
-| Dropbear not starting | `ltv-hook.sh` executable? Host keys in `/etc/dropbear/`? |
-| SSH connection refused | Port 22 open? `ltv_mappers` cmdline correct? |
-| Host key mismatch | `hostkey fetch` run after deploy? |
-| Mapper not appearing | Keyfile correct? `enroll` completed? LUKS UUID matches? |
-| Timeout | Network up? `configure_ip` ran before hook? Increase timeout? |
-
-## Updating
-
-To update deployment (new key, new target, etc.):
-
-```bash
-# On admin
-ltv-admin> server-setup web01 --out ./deploy-web01-v2
-scp -r ./deploy-web01-v2 root@target:/root/
-# On target
-cd /root/deploy-web01-v2
-./deploy.sh
-# Update bootloader if kernel changed
-reboot
 ```

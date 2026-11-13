@@ -19,11 +19,12 @@ Fallback device path (optional): /dev/sda2
 Mapper name [cryptroot]: cryptroot
 Order [0]: 0
   target added, 64-byte keyfile generated.
+LUKS UUID (blank = done):
+```
 
-LUKS UUID (blank = done): 
 ## 2. Server Preparation (Target Server)
 
-**Option A: Automated via deploy.sh**
+**Automated via deploy.sh:**
 
 ```bash
 # On admin: generate deployment artifacts
@@ -35,34 +36,20 @@ scp -r ./deploy-web01 root@192.0.2.10:/root/
 # On target server (as root):
 cd /root/deploy-web01
 ./deploy.sh
-# Output:
-#   Regenerating initramfs for kernel 6.18.59-0-virt...
-#   === NEXT STEPS ===
-#   1. Update bootloader to use: /boot/initramfs-ltv-6.18.59-0-virt
-#   2. Add kernel cmdline: ltv_mappers=cryptroot
-#   3. Reboot
-
-# Update bootloader (syslinux example)
-# Edit /etc/syslinux.conf, change initramfs line and add:
-#   ltv_mappers=cryptroot
-reboot
-```
-# Output:
-#   Regenerating initramfs for kernel 6.18.59-0-virt...
-#   === NEXT STEPS ===
-#   1. Update bootloader to use: /boot/initramfs-ltv-6.18.59-0-virt
-#   2. Add kernel cmdline: ltv_mappers=cryptroot
-#   3. Reboot
-
-# Update bootloader (syslinux example)
-# Edit /etc/syslinux.conf, change initramfs line and add:
-#   ltv_mappers=cryptroot
-reboot
+# Output shows manual steps required:
+# 1. Add 'ltv' to FEATURES in /etc/mkinitfs/mkinitfs.conf
+# 2. Add kernel cmdline: ltv=yes ip=dhcp modules=virtio_net
+# 3. Run mkinitfs manually
+# 4. Update bootloader and reboot
 ```
 
-**Option B: Manual**
+**Bootloader update (syslinux example):**
 
-See `deploy.sh` content for step-by-step.
+```bash
+# Edit /etc/syslinux.conf, change initramfs line and add:
+ltv=yes ip=dhcp modules=virtio_net
+reboot
+```
 
 ## 3. Host Key Pinning (TOFU)
 
@@ -99,14 +86,14 @@ Pin as OS host key? [y/N]: y
 
 OS SSH user [root]: root
 Auth: (p)assword / (k)ey file [k]: k
-Key file [/home/user/.ssh/id_ed25519]: 
+Key file [/home/user/.ssh/id_ed25519]:
 Do all targets use the same LUKS passphrase? [Y/n]: y
 Existing LUKS passphrase (for all targets): ********
 
- ✓ TargetStart("cryptroot")
- ✓ SlotChosen("cryptroot", 1)
- ✓ SlotAdded("cryptroot", 1)
- ✓ Verified("cryptroot")
+  TargetStart("cryptroot")
+  SlotChosen("cryptroot", 1)
+  SlotAdded("cryptroot", 1)
+  Verified("cryptroot")
 
 enrolled 1 target(s); keyslots recorded. Remember to 'save'.
 ```
@@ -125,10 +112,10 @@ enrolled 1 target(s); keyslots recorded. Remember to 'save'.
 
 **Pre-check output (key already enrolled):**
 ```
- ✓ TargetStart("cryptdata")
- ✓ SlotChosen("cryptdata", 0)
- ✓ SlotUpdated("cryptdata", 0)
- ✓ Verified("cryptdata")
+  TargetStart("cryptdata")
+  SlotChosen("cryptdata", 0)
+  SlotUpdated("cryptdata", 0)
+  Verified("cryptdata")
 ```
 
 **If targets have different passphrases:**
@@ -140,16 +127,16 @@ Existing LUKS passphrase for cryptdata (eeee-ffff-gggg-hhhh): ********
 
 ## 5. Remote Unlock (Boot Time)
 
-Server reboots → initramfs → Dropbear starts → Admin runs:
+Server reboots -> initramfs -> Dropbear starts -> Admin runs:
 
 ```bash
 ltv-admin> unlock web01
- ✓ UnlockEvent::Connecting { host: "192.0.2.10", port: 22 }
- ✓ UnlockEvent::HostKeyVerified { fingerprint: "SHA256:abc123..." }
- ✓ UnlockEvent::Authenticated
- ✓ UnlockEvent::TargetStarted { target: "cryptroot", uuid: "aaaa-bbbb-cccc-dddd" }
- ✓ UnlockEvent::TargetSuccess { target: "cryptroot", keyslot: 1 }
- ✓ UnlockEvent::ResumeCommand
+  UnlockEvent::Connecting { host: "192.0.2.10", port: 22 }
+  UnlockEvent::HostKeyVerified { fingerprint: "SHA256:abc123..." }
+  UnlockEvent::Authenticated
+  UnlockEvent::TargetStarted { target: "cryptroot", uuid: "aaaa-bbbb-cccc-dddd" }
+  UnlockEvent::TargetSuccess { target: "cryptroot", keyslot: 1 }
+  UnlockEvent::ResumeCommand
 ```
 
 **What happens:**
@@ -158,7 +145,7 @@ ltv-admin> unlock web01
 3. Ed25519 auth with client_private_seed
 4. For each target: `exec cryptsetup luksOpen --key-file=- UUID=... <mapper>`
 5. Push 64-byte keyfile to stdin
-6. Hook detects mapper, exits, boot continues
+6. Wrapper detects `/run/ltv/resume`, exits, boot continues
 
 ## 6. Discovery (Find LUKS Volumes on Booted OS)
 
@@ -252,12 +239,12 @@ keyfile written to /tmp/keyfile.bin
 ```
 1. create vault.ltv
 2. add profile (name, host, targets)
-3. server-setup profile → deploy.sh
-4. Copy deploy to target, run deploy.sh, update bootloader, reboot
+3. server-setup profile -> deploy.sh
+4. Copy deploy to target, run deploy.sh, update bootloader (ltv=yes ip=dhcp modules=virtio_net), reboot
 5. hostkey fetch profile (pin initramfs key)
 6. enroll profile (add keyfile to LUKS header via booted OS)
 7. save
-8. Reboot target → unlock profile → boot complete
+8. Reboot target -> unlock profile -> boot complete
 ```
 
 ## Multi-Drive Setup
@@ -270,4 +257,4 @@ Target 2 (order=1): cryptdata (data volume) - unlocks second
 Target 3 (order=2): cryptbackup (backup volume) - unlocks third
 ```
 
-The hook waits for ALL mappers before exiting (300s timeout).
+The wrapper waits for `/run/ltv/resume` signal before exiting (no hardcoded timeout).

@@ -33,7 +33,7 @@ Fallback device path (optional): /dev/sda2
 Mapper name [cryptroot]: cryptroot
 Order [0]: 0
   target added, 64-byte keyfile generated.
-LUKS UUID (blank = done): 
+LUKS UUID (blank = done):
 
 Client public key (deploy to initramfs authorized_keys):
 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI... ltv:myserver
@@ -55,7 +55,7 @@ cd /root/deploy-myserver
 # Update bootloader (syslinux example)
 # Edit /etc/syslinux.conf:
 #   INITRD /boot/initramfs-ltv-6.18.59-0-virt
-#   APPEND ltv_mappers=cryptroot root=UUID=... modules=...
+#   APPEND ltv=yes ip=dhcp modules=virtio_net root=UUID=... quiet
 
 reboot
 ```
@@ -78,14 +78,14 @@ Boot target normally (into OS), then:
 ltv-admin> enroll myserver
 OS SSH user [root]: root
 Auth: (p)assword / (k)ey file [k]: k
-Key file [/home/user/.ssh/id_ed25519]: 
+Key file [/home/user/.ssh/id_ed25519]:
 Do all targets use the same LUKS passphrase? [Y/n]: y
 Existing LUKS passphrase (for all targets): ********
 
-  ✓ TargetStart("aaaa-bbbb-cccc-dddd")
-  ✓ SlotChosen("aaaa-bbbb-cccc-dddd", 1)
-  ✓ SlotAdded("aaaa-bbbb-cccc-dddd", 1)
-  ✓ Verified("aaaa-bbbb-cccc-dddd")
+  TargetStart("aaaa-bbbb-cccc-dddd")
+  SlotChosen("aaaa-bbbb-cccc-dddd", 1)
+  SlotAdded("aaaa-bbbb-cccc-dddd", 1)
+  Verified("aaaa-bbbb-cccc-dddd")
 enrolled 1 target(s); keyslots recorded. Remember to 'save'.
 ```
 
@@ -100,12 +100,12 @@ Reboot target → initramfs → from admin:
 
 ```bash
 ltv-admin> unlock myserver
- ✓ UnlockEvent::Connecting { host: "192.0.2.10", port: 22 }
- ✓ UnlockEvent::HostKeyVerified { fingerprint: "SHA256:abc123..." }
- ✓ UnlockEvent::Authenticated
- ✓ UnlockEvent::TargetStarted { target: "cryptroot", uuid: "aaaa-bbbb-cccc-dddd" }
- ✓ UnlockEvent::TargetSuccess { target: "cryptroot", keyslot: 1 }
- ✓ UnlockEvent::ResumeCommand
+  UnlockEvent::Connecting { host: "192.0.2.10", port: 22 }
+  UnlockEvent::HostKeyVerified { fingerprint: "SHA256:abc123..." }
+  UnlockEvent::Authenticated
+  UnlockEvent::TargetStarted { target: "cryptroot", uuid: "aaaa-bbbb-cccc-dddd" }
+  UnlockEvent::TargetSuccess { target: "cryptroot", keyslot: 1 }
+  UnlockEvent::ResumeCommand
 ```
 
 Server boots to login prompt. Done!
@@ -117,12 +117,12 @@ Server boots to login prompt. Done!
 create ~/.ltv/vault.ltv
 
 # Add server
-add → name, host, UUID, mapper
+add -> name, host, UUID, mapper
 
 # Deploy
 server-setup name --out ./deploy
 scp -r ./deploy root@host:/root/
-# On target: ./deploy.sh → update bootloader → reboot
+# On target: ./deploy.sh -> update bootloader -> reboot
 
 # Pin key
 hostkey fetch name
@@ -140,8 +140,7 @@ unlock name
 |------|---------|
 | `~/.ltv/vault.ltv` | Encrypted vault (backup this!) |
 | `deploy-*/deploy.sh` | Run on target to install feature |
-| `deploy-*/cmdline.txt` | Kernel cmdline for bootloader |
-| `deploy-*/README.md` | Full deployment guide |
+| `deploy-*/README.md` | Full deployment instructions |
 
 ## Next Steps
 

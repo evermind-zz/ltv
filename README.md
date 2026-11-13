@@ -23,6 +23,7 @@ ltv-core (library)
   ├── vault.rs       # Vault open/save, slot management, profile/target CRUD
   ├── net.rs         # SSH client (russh), probe, unlock, enroll, fetch
   ├── enroll.rs      # LUKS key enrollment over booted OS (luksAddKey via tmpfs)
+  ├── rotate.rs      # Paranoid key rotation with per-target vault persistence
   └── error.rs       # Error types
 
 ltv-admin (binary)
@@ -48,16 +49,18 @@ ltv-mobile (planned)
 - **Envelope encryption** - per-profile secrets encrypted separately, JIT decryption only
 - **Memory safety** - all secrets use `zeroize::ZeroizeOnDrop`, passphrases in `secrecy::SecretVec`
 
-## Server Requirements (Phase 1: Dropbear)
+## Server Requirements
 
 1. Alpine Linux initramfs with Dropbear SSH
 2. Persistent Ed25519 host key for Dropbear (copied into initramfs)
 3. `authorized_keys` for root in initramfs containing LTV client public key (restricted)
 4. `cryptsetup` binary in initramfs
-5. `ltv-hook` ash script (installed via mkinitfs feature) that:
-   - Starts Dropbear
-   - Polls `/dev/mapper/<name>` for configured mappers
-   - Exits when all mappers exist or `/run/ltv/resume` flag appears
+5. `ltv-luks-wrapper.sh` ash script (installed via mkinitfs feature) that:
+   - Replaces `nlplug-findfs` call in initramfs-init
+   - Starts Dropbear SSH server
+   - Runs `nlplug-findfs` for TTY password prompt
+   - Background monitor waits for `/run/ltv/resume` signal
+   - On signal: kills first `nlplug-findfs`, runs second without crypto options
 
 ## Unlock Protocol (Push-to-Stdin)
 
@@ -94,16 +97,15 @@ Interactive shell (sqlite-style) and non-interactive subcommands:
 | `unlock <profile>` | Full push-unlock with live progress |
 | `enroll <profile> [--target <uuid>]` | Enroll keyfiles into LUKS headers over booted OS |
 | `fetch <profile>` | Discover LUKS volumes on booted OS, offer to add as targets |
-| `server-setup <profile>` | Generate deployment artifacts (feature file, hook, authorized_keys, cmdline) |
+| `server-setup <profile>` | Generate deployment artifacts (feature file, wrapper, keys, patch script) |
 | `export-keyfile <profile> <uuid> <path>` | Emergency plaintext export (requires re-auth) |
 | `backup <path>` | Timestamped encrypted vault copy |
 | `import-profile` / `export-profile` | Move profiles between vaults |
+| `dump-keys <profile>` | Dump keyfiles for verification (requires passphrase re-entry) |
 
 ## Deploying Remote Unlock (server-setup)
 
-The `server-setup` command generates all files needed to deploy LTV remote unlock
-to an Alpine Linux server. It creates an `mkinitfs` feature that installs Dropbear
-and the LTV hook into the initramfs.
+The `server-setup` command generates all files needed to deploy LTV remote unlock to an Alpine Linux server. It creates an `mkinitfs` feature that installs Dropbear and the LTV luks-wrapper into the initramfs.
 
 ### Prerequisites on Target Server
 
@@ -117,14 +119,16 @@ and the LTV hook into the initramfs.
 ltv-admin> server-setup web01 --out ./deploy-web01
 
 # This creates ./deploy-web01/ with:
-#   ltv.files, ltv.modules, ltv.packages    - mkinitfs feature definition
-#   usr/share/mkinitfs/features.d/ltv-hook.sh - hook script (starts dropbear, waits for mappers)
-#   sbin/ltv-init-wrapper                   - init wrapper (runs hook before real init)
-#   etc/dropbear/README.txt                 - instruction to generate host key on target
-#   authorized_keys                         - restricted client pubkey for initramfs SSH
-#   cmdline.txt                             - kernel cmdline to add
-#   deploy.sh                               - run this on target server
-#   README.md                               - deployment instructions
+#   ltv.files, ltv.modules, ltv.packages      - mkinitfs feature definition
+#   ltv-luks-wrapper.sh                        - wrapper script (replaces nlplug-findfs)
+#   ltv-patch-init.sh                          - idempotent patcher for initramfs-init
+#   ltv-commit-hook.sh                         - apk commit hook for persistence
+#   authorized_keys                            - restricted client pubkey for initramfs SSH
+#   dropbear_ed25519_host_key                  - Dropbear host private key (pre-generated)
+#   dropbear_ed25519_host_key.pub              - Dropbear host public key
+#   deploy.sh                                  - run this on target server (patches initramfs-init)
+#   deploy_nopatch.sh                          - alternative without patching
+#   README.md                                  - deployment instructions
 ```
 
 ```bash
@@ -138,46 +142,53 @@ cd /root/deploy-web01
 
 The `deploy.sh` script:
 1. Copies feature files to `/etc/mkinitfs/features.d/`
-2. Copies hook and init wrapper to their locations
-3. Generates Dropbear Ed25519 host key (`dropbearkey -t ed25519`)
-4. Creates authorized_keys overlay for initramfs
-5. Regenerates initramfs: `mkinitfs -F "base ltv cryptsetup network" ...`
-6. Prints next steps for bootloader update
+2. Copies wrapper to `/usr/share/mkinitfs/ltv-luks-wrapper.sh`
+3. Creates Dropbear host key and authorized_keys overlay in `/etc/mkinitfs/ltv-stuff/`
+4. Installs patch script and apk commit hook
+5. Patches `/usr/share/mkinitfs/initramfs-init` (idempotent)
+6. **Prints manual steps** (does NOT run mkinitfs automatically)
 
 ```bash
-# 4. Update bootloader (syslinux example):
-# Edit /etc/syslinux.conf to use the new initramfs and add cmdline:
-#   init=/sbin/ltv-init-wrapper ltv_mappers=cryptroot,cryptdata
-
-# 5. Reboot
+# 4. Manual steps (printed by deploy.sh):
+#    a) Add 'ltv' to FEATURES in /etc/mkinitfs/mkinitfs.conf:
+#       FEATURES="virtio base cryptsetup ltv network keymap ata ide scsi usb phy ext4"
+#    b) Add kernel cmdline: ltv=yes ip=dhcp modules=virtio_net
+#    c) Regenerate initramfs:
+#       mkinitfs -F "virtio base cryptsetup ltv network keymap ata ide scsi usb phy ext4" -k "$KERNEL" \
+#         -o "/boot/initramfs-ltv-$KERNEL" "$KERNEL"
+#    d) Update bootloader and reboot
 reboot
 ```
 
 ### What Happens at Boot
 
 1. Kernel loads initramfs with LTV feature
-2. `ltv-init-wrapper` runs (via `init=` cmdline), calls `ltv-hook.sh`
-3. Hook starts Dropbear on port 22 (Ed25519 host key, pubkey-only auth)
-4. Hook polls `/dev/mapper/<name>` for all configured mappers
-5. Admin runs `ltv-admin unlock web01` from workstation
-6. Client pushes keyfiles over SSH to `cryptsetup --key-file=-`
-7. Mappers appear, hook exits, boot continues
+2. Patched `initramfs-init` runs `configure_ip` when `ltv=yes` is set
+3. `nlplug-findfs` call replaced with `ltv-luks-wrapper.sh`
+4. Wrapper starts Dropbear on port 22 (Ed25519 host key, pubkey-only auth)
+5. Wrapper runs `nlplug-findfs` (foreground, TTY password prompt available)
+6. Background monitor waits for `/run/ltv/resume` (created by unlock client)
+7. Admin runs `ltv-admin unlock web01` from workstation
+8. Client pushes keyfiles over SSH to `cryptsetup --key-file=-`
+9. On success, client writes `/run/ltv/resume`, wrapper kills first nlplug-findfs, runs second
+10. Boot continues
 
 ### Generated Kernel Cmdline
 
 ```
-init=/sbin/ltv-init-wrapper ltv_mappers=cryptroot,cryptdata
+ltv=yes ip=dhcp modules=virtio_net
 ```
 
-- `init=/sbin/ltv-init-wrapper` - runs hook before real init
-- `ltv_mappers=cryptroot,cryptdata` - comma-separated mapper names to wait for
+- `ltv=yes` - enables LTV remote unlock (required)
+- `ip=dhcp` - configures network in initramfs via DHCP (required for remote unlock)
+- `modules=virtio_net` - loads network driver early (use your NIC driver: e1000, vmxnet3, etc.)
 
 ### Security Notes
 
-- Initramfs host key is generated on target during `deploy.sh` (first boot)
+- Initramfs host key is pre-generated and deployed (not generated on target)
 - Fingerprint is shown in `README.md` - verify on first connection
 - Client public key in `authorized_keys` has restrictions: no port forwarding, no agent, no X11, no pty
-- Hook times out after 300 seconds if mappers don't appear
+- Wrapper has no hardcoded timeout - waits for `/run/ltv/resume` or TTY unlock
 
 ## Dependencies
 
@@ -195,6 +206,7 @@ Core crates:
 - `thiserror` - Error handling
 - `rpassword` - Secure password input
 - `rustyline` - Interactive shell
+- `getopts` - CLI parsing
 
 ## Building
 
