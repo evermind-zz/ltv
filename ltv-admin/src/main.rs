@@ -1,15 +1,17 @@
 use std::{fs, path::PathBuf, env};
-use ltv_core::{format::Argon2Params, model::{Profile, TargetMeta, BootedAccess, BootedAuth, fingerprint_sha256, HostKey, SecretPayload, ExecutionMode}, net::{fetch_host_key, fetch_luks_info, probe, unlock, ProbeResult}, vault::{Vault, ssh_ed25519_blob}, enroll::EnrollEvent, rotate::RotateEvent, scripts::{render_cmdline, render_deploy_sh, render_deploy_nopatch_sh, LTV_FILES, LTV_MODULES, LTV_PACKAGES, LTV_LUKS_WRAPPER, LTV_COMMON, LTV_PATCH_INIT, LTV_COMMIT_HOOK}};
+use ltv_core::{format::Argon2Params, model::{Profile, TargetMeta, fingerprint_sha256, HostKey, SecretPayload, ExecutionMode}, net::{fetch_host_key, fetch_luks_info, probe, unlock, ProbeResult}, vault::{Vault, ssh_ed25519_blob}, enroll::EnrollEvent, rotate::RotateEvent, scripts::{render_cmdline, render_deploy_sh, render_deploy_nopatch_sh, LTV_FILES, LTV_MODULES, LTV_PACKAGES, LTV_LUKS_WRAPPER, LTV_COMMON, LTV_PATCH_INIT, LTV_COMMIT_HOOK}};
 use std::path::Path;
 use rustyline::{error::ReadlineError, DefaultEditor};
-use secrecy::{ExposeSecret, SecretString, SecretVec};
+use secrecy::{ExposeSecret};
 use getopts::Options;
 use base64::Engine;
 use ed25519_dalek::SigningKey;
 
+mod constants;
 mod error;
 mod util;
 
+use constants::*;
 use error::{AdminError, AdminResult};
 use util::*;
 
@@ -510,8 +512,8 @@ fn handle_create(st: &mut State, parts: &[&str]) -> AdminResult<()> {
         if confirm.to_lowercase() != "y" { return Err(AdminError::Aborted); }
     }
     
-    let p1 = prompt_passphrase("New passphrase: "); 
-    let p2 = prompt_passphrase("Repeat: ");
+    let p1 = prompt_passphrase(PROMPT_NEW_PASSPHRASE)?; 
+    let p2 = prompt_passphrase(PROMPT_REPEAT_PASSPHRASE)?;
     if p1.expose_secret() != p2.expose_secret() { return Err(AdminError::PassphrasesDiffer); }
     st.vault = Some(Vault::create(&p1, Argon2Params::default()).map_err(AdminError::Vault)?);
     st.path = Some(path);
@@ -534,7 +536,8 @@ fn handle_open(st: &mut State, parts: &[&str]) -> AdminResult<()> {
     }
     
     let bytes = fs::read(&f).map_err(AdminError::Io)?;
-    let v = Vault::open(&bytes, &prompt_passphrase("Passphrase: ")).map_err(|_| AdminError::IncorrectPassphrase)?;
+    let pass = prompt_passphrase(PROMPT_VAULT_PASSPHRASE)?;
+    let v = Vault::open(&bytes, &pass).map_err(|_| AdminError::IncorrectPassphrase)?;
     println!("opened: {} profiles", v.inventory.profiles.len());
     let path = PathBuf::from(f);
     st.vault_name = path.file_stem().and_then(|s| s.to_str()).map(|s| s.to_string());
@@ -747,7 +750,7 @@ async fn handle_hostkey(st: &mut State, parts: &[&str]) -> AdminResult<()> {
                 }
             };
             println!("{} {}", hk.key_type, fingerprint_sha256(&hk.key_bytes));
-            if ask("Pin this key? [y/N]: ").to_lowercase() == "y" {
+            if ask(CONFIRM_PIN_HOST_KEY).to_lowercase() == "y" {
                 v.set_host_key(&p.uuid, hk, is_os).map_err(AdminError::Vault)?;
             }
         }
@@ -767,7 +770,7 @@ async fn handle_hostkey(st: &mut State, parts: &[&str]) -> AdminResult<()> {
                 }
             };
             println!("{} {}", hk.key_type, fingerprint_sha256(&hk.key_bytes));
-            if ask("Replace pinned unlock SSH host key? [y/N]: ").to_lowercase() == "y" {
+            if ask(CONFIRM_REPIN_UNLOCK_HOST_KEY).to_lowercase() == "y" {
                 v.set_host_key(&p.uuid, hk, false).map_err(AdminError::Vault)?;
                 println!("Unlock SSH host key updated.");
             }
@@ -853,67 +856,28 @@ async fn handle_enroll(st: &mut State, parts: &[&str]) -> AdminResult<()> {
         println!("No OS host key pinned. Fetching from {}:{} ...", os_host, os_port);
         let hk = fetch_host_key(&os_host, os_port, p.connect_timeout_s).await.map_err(AdminError::Net)?;
         println!("{} {}", hk.key_type, fingerprint_sha256(&hk.key_bytes));
-        if ask("Pin as OS host key? [y/N]: ").to_lowercase() != "y" { return Err(AdminError::Aborted); }
+        if ask(CONFIRM_PIN_OS_HOST_KEY).to_lowercase() != "y" { return Err(AdminError::Aborted); }
         v.set_host_key(&p.uuid, hk, true).map_err(AdminError::Vault)?;
     }
 
-    let username = ask_or("OS SSH user", "root");
-    let auth = match ask_or("Auth: (p)assword / (k)ey file", "k").as_str() {
-        "p" => BootedAuth::Password(SecretString::new(prompt_passphrase_optional("OS password: "))),
-        _ => {
-            let home = home_dir();
-            let path = ask_or("Key file", &format!("{}/.ssh/id_ed25519", home.display()));
-            let kp = russh_keys::load_secret_key(&path, None)
-                .or_else(|_| russh_keys::load_secret_key(&path, Some(&prompt_passphrase_optional("Key passphrase: "))))
-                .map_err(|e| AdminError::InvalidArgument(format!("load key: {e}")))?;
-            match kp {
-                russh_keys::key::KeyPair::Ed25519(sk) => BootedAuth::Ed25519Seed(sk.to_bytes()),
-                _ => return Err(AdminError::InvalidArgument("only Ed25519 keys supported".into())),
-            }
-        }
-    };
-    let access = BootedAccess { use_sudo: username != "root", username, auth, connect_timeout_s: p.connect_timeout_s };
+    let (username, auth, timeout) = setup_booted_access(&p)?;
+    let access = make_booted_access(username, auth, timeout);
 
     // Filter targets based on --target
-    let targets: Vec<_> = p.targets_meta.iter()
-        .filter(|tm| only.as_ref().map_or(true, |f| f == &tm.luks_uuid || f == &tm.mapped_name))
-        .cloned()
-        .collect();
+    let targets = filter_targets(&p, only.as_deref());
     
     if targets.is_empty() {
         return Err(AdminError::NoTargetMatches(only.unwrap_or_default()));
     }
 
-    // Ask if all targets use the same LUKS passphrase
-    let same_passphrase = if targets.len() > 1 {
-        ask("Do all targets use the same LUKS passphrase? [Y/n]: ").to_lowercase() != "n"
-    } else {
-        true
-    };
+    // Check for missing keyslots
+    check_target_keyslots(&targets);
+
+    // Ask if all targets use the same LUKS passphrase (only if >1 target)
+    let same_passphrase = ask_same_passphrase(&targets);
 
     // Collect passphrases
-    let mut passphrases: std::collections::HashMap<String, SecretString> = std::collections::HashMap::new();
-    
-    if same_passphrase {
-        let pass = loop {
-            let p = rpassword::prompt_password("Existing LUKS passphrase (for all targets): ").unwrap_or_default();
-            if !p.is_empty() { break SecretString::new(p); }
-            eprintln!("Passphrase cannot be empty.");
-        };
-        for tm in &targets {
-            passphrases.insert(tm.luks_uuid.clone(), pass.clone());
-        }
-    } else {
-        for tm in &targets {
-            let pass = loop {
-                let prompt = format!("Existing LUKS passphrase for {} ({}): ", tm.mapped_name, tm.luks_uuid);
-                let p = rpassword::prompt_password(&prompt).unwrap_or_default();
-                if !p.is_empty() { break SecretString::new(p); }
-                eprintln!("Passphrase cannot be empty.");
-            };
-            passphrases.insert(tm.luks_uuid.clone(), pass);
-        }
-    }
+    let passphrases = collect_luks_passphrases(&targets, same_passphrase)?;
 
     let results = ltv_core::enroll(v, &p.uuid, &access, mode, |luks_uuid| {
         passphrases.get(luks_uuid).cloned().ok_or_else(|| format!("no passphrase for {}", luks_uuid))
@@ -950,7 +914,7 @@ async fn handle_rotate(st: &mut State, parts: &[&str]) -> AdminResult<()> {
     {
         let v = require_vault_mut(st)?;
         if v.is_dirty() {
-            return Err(AdminError::InvalidArgument("vault has unsaved changes; run 'save' first".into()));
+            return Err(AdminError::InvalidArgument(ERR_VAULT_DIRTY.into()));
         }
     }
 
@@ -971,74 +935,28 @@ async fn handle_rotate(st: &mut State, parts: &[&str]) -> AdminResult<()> {
         println!("No OS host key pinned. Fetching from {}:{} ...", os_host, os_port);
         let hk = fetch_host_key(&os_host, os_port, p.connect_timeout_s).await.map_err(AdminError::Net)?;
         println!("{} {}", hk.key_type, fingerprint_sha256(&hk.key_bytes));
-        if ask("Pin as OS host key? [y/N]: ").to_lowercase() != "y" { return Err(AdminError::Aborted); }
+        if ask(CONFIRM_PIN_OS_HOST_KEY).to_lowercase() != "y" { return Err(AdminError::Aborted); }
         v.set_host_key(&p.uuid, hk, true).map_err(AdminError::Vault)?;
     }
 
-    let username = ask_or("OS SSH user", "root");
-    let auth = match ask_or("Auth: (p)assword / (k)ey file", "k").as_str() {
-        "p" => BootedAuth::Password(SecretString::new(prompt_passphrase_optional("OS password: "))),
-        _ => {
-            let home = home_dir();
-            let path = ask_or("Key file", &format!("{}/.ssh/id_ed25519", home.display()));
-            let kp = russh_keys::load_secret_key(&path, None)
-                .or_else(|_| russh_keys::load_secret_key(&path, Some(&prompt_passphrase_optional("Key passphrase: "))))
-                .map_err(|e| AdminError::InvalidArgument(format!("load key: {e}")))?;
-            match kp {
-                russh_keys::key::KeyPair::Ed25519(sk) => BootedAuth::Ed25519Seed(sk.to_bytes()),
-                _ => return Err(AdminError::InvalidArgument("only Ed25519 keys supported".into())),
-            }
-        }
-    };
-    let access = BootedAccess { use_sudo: username != "root", username, auth, connect_timeout_s: p.connect_timeout_s };
+    let (username, auth, timeout) = setup_booted_access(&p)?;
+    let access = make_booted_access(username, auth, timeout);
 
     // Filter targets based on --target
-    let targets: Vec<_> = p.targets_meta.iter()
-        .filter(|tm| only.as_ref().map_or(true, |f| f == &tm.luks_uuid || f == &tm.mapped_name))
-        .cloned()
-        .collect();
+    let targets = filter_targets(&p, only.as_deref());
     
     if targets.is_empty() {
         return Err(AdminError::NoTargetMatches(only.unwrap_or_default()));
     }
 
     // Check that each target has a keyslot recorded
-    for tm in &targets {
-        if tm.keyslot.is_none() {
-            println!("Warning: target {} ({}) has no keyslot recorded. Run 'enroll' first.", tm.mapped_name, tm.luks_uuid);
-        }
-    }
+    check_target_keyslots(&targets);
 
     // Ask if all targets use the same LUKS passphrase (only if >1 target)
-    let same_passphrase = if targets.len() > 1 {
-        ask("Do all targets use the same LUKS passphrase? [Y/n]: ").to_lowercase() != "n"
-    } else {
-        true
-    };
+    let same_passphrase = ask_same_passphrase(&targets);
 
     // Collect passphrases
-    let mut passphrases: std::collections::HashMap<String, SecretString> = std::collections::HashMap::new();
-    
-    if same_passphrase {
-        let pass = loop {
-            let p = rpassword::prompt_password("Existing LUKS passphrase (for all targets): ").unwrap_or_default();
-            if !p.is_empty() { break SecretString::new(p); }
-            eprintln!("Passphrase cannot be empty.");
-        };
-        for tm in &targets {
-            passphrases.insert(tm.luks_uuid.clone(), pass.clone());
-        }
-    } else {
-        for tm in &targets {
-            let pass = loop {
-                let prompt = format!("Existing LUKS passphrase for {} ({}): ", tm.mapped_name, tm.luks_uuid);
-                let p = rpassword::prompt_password(&prompt).unwrap_or_default();
-                if !p.is_empty() { break SecretString::new(p); }
-                eprintln!("Passphrase cannot be empty.");
-            };
-            passphrases.insert(tm.luks_uuid.clone(), pass);
-        }
-    }
+    let passphrases = collect_luks_passphrases(&targets, same_passphrase)?;
 
     // For paranoid mode, force sequential and save after each target
     let use_paranoid = targets.len() > 0; // always use paranoid when we have targets
@@ -1086,7 +1004,7 @@ async fn handle_copy_profile(st: &mut State, parts: &[&str]) -> AdminResult<()> 
     let keep = matches.opt_present("keep");
     
     // Open source vault
-    let src_pass = prompt_passphrase("Source vault passphrase: ");
+    let src_pass = prompt_passphrase(PROMPT_SRC_VAULT_PASSPHRASE)?;
     let src_bytes = fs::read(src_vault_path).map_err(AdminError::Io)?;
     let src_vault = Vault::open(&src_bytes, &src_pass).map_err(|_| AdminError::IncorrectPassphrase)?;
     
@@ -1186,31 +1104,17 @@ async fn handle_fetch(st: &mut State, parts: &[&str]) -> AdminResult<()> {
             }
         };
         println!("{} {}", hk.key_type, fingerprint_sha256(&hk.key_bytes));
-        if ask("Pin as OS host key? [y/N]: ").to_lowercase() != "y" { return Err(AdminError::Aborted); }
+        if ask(CONFIRM_PIN_OS_HOST_KEY).to_lowercase() != "y" { return Err(AdminError::Aborted); }
         v.set_host_key(&p.uuid, hk, true).map_err(AdminError::Vault)?;
     }
 
-    let username = ask_or("OS SSH user", "root");
-    let auth = match ask_or("Auth: (p)assword / (k)ey file", "k").as_str() {
-        "p" => BootedAuth::Password(SecretString::new(prompt_passphrase_optional("OS password: "))),
-        _ => {
-            let home = home_dir();
-            let path = ask_or("Key file", &format!("{}/.ssh/id_ed25519", home.display()));
-            let kp = russh_keys::load_secret_key(&path, None)
-                .or_else(|_| russh_keys::load_secret_key(&path, Some(&prompt_passphrase_optional("Key passphrase: "))))
-                .map_err(|e| AdminError::InvalidArgument(format!("load key: {e}")))?;
-            match kp {
-                russh_keys::key::KeyPair::Ed25519(sk) => BootedAuth::Ed25519Seed(sk.to_bytes()),
-                _ => return Err(AdminError::InvalidArgument("only Ed25519 keys supported".into())),
-            }
-        }
-    };
-    let access = BootedAccess { use_sudo: username != "root", username, auth, connect_timeout_s: p.connect_timeout_s };
+    let (username, auth, timeout) = setup_booted_access(&p)?;
+    let access = make_booted_access(username, auth, timeout);
 
     let results = fetch_luks_info(v, &p.uuid, &access, None, if verbose { Some(Box::new(|cmd: &str| println!("  [fetch] $ {cmd}")) as Box<dyn FnMut(&str) + Send>) } else { None }).await.map_err(AdminError::Unlock)?;
 
     if results.is_empty() {
-        println!("No LUKS volumes found.");
+        println!("{}", MSG_NO_LUKS_VOLUMES);
         return Ok(());
     }
 
@@ -1233,7 +1137,7 @@ async fn handle_fetch(st: &mut State, parts: &[&str]) -> AdminResult<()> {
         }
     }
 
-    let selection = parse_selection(&ask("\nTargets to add or refresh? [all/none/numbers, e.g. 0,2]: "), results.len())?;
+    let selection = parse_selection(&ask(PROMPT_TARGET_SELECTION), results.len())?;
     if selection.is_empty() {
         println!("No targets added.");
         return Ok(());
@@ -1332,17 +1236,17 @@ async fn handle_fetch(st: &mut State, parts: &[&str]) -> AdminResult<()> {
             println!("  updated {}", d.luks_uuid);
         }
         if mapper_changed {
-            println!("note: mapper names changed; re-run 'server-setup' and redeploy so the initramfs cmdline matches.");
+            println!("{}", NOTE_MAPPER_CHANGED);
         }
     } else if !diffs.is_empty() {
-        println!("kept existing target metadata unchanged.");
+        println!("{}", MSG_KEPT_EXISTING);
     }
 
     if added > 0 {
-        println!("targets added.");
+        println!("{}", MSG_TARGETS_ADDED);
     }
     if added > 0 || do_update {
-        println!("Remember to 'save'.");
+        println!("{}", MSG_REMEMBER_SAVE);
     }
     Ok(())
 }
@@ -1368,13 +1272,13 @@ fn handle_passwd(st: &mut State, parts: &[&str]) -> AdminResult<()> {
     let v = require_vault_mut(st)?;
     
     // Ask for old passphrase and verify
-    let old_pass = prompt_passphrase("Old passphrase: ");
+    let old_pass = prompt_passphrase(PROMPT_OLD_PASSPHRASE)?;
     let bytes = fs::read(&path).map_err(AdminError::Io)?;
     Vault::open(&bytes, &old_pass).map_err(|_| AdminError::OldPassphraseIncorrect)?;
     
     // Ask for new passphrase twice
-    let p1 = prompt_passphrase("New passphrase: "); 
-    let p2 = prompt_passphrase("Repeat: ");
+    let p1 = prompt_passphrase(PROMPT_NEW_PASSPHRASE)?; 
+    let p2 = prompt_passphrase(PROMPT_REPEAT_PASSPHRASE)?;
     if p1.expose_secret() != p2.expose_secret() { return Err(AdminError::PassphrasesDiffer); }
     v.change_passphrase(0, &p1, Argon2Params::default()).map_err(AdminError::Vault)?;
     println!("Passphrase changed successfully.");
@@ -1419,10 +1323,10 @@ fn handle_dump_keys(st: &State, parts: &[&str]) -> AdminResult<()> {
     let (v, p) = st.vault_and_profile_ref(n)?;
 
     // Re-verify vault master passphrase before dumping key material.
-    let pass = prompt_passphrase("Confirm vault passphrase: ");
+    let pass = prompt_passphrase(PROMPT_VAULT_PASSPHRASE)?;
     let bytes = fs::read(require_vault_path(st)?).map_err(AdminError::Io)?;
     Vault::open(&bytes, &pass).map_err(|_| AdminError::IncorrectPassphrase)?;
-    println!("✓ Passphrase verified.");
+    println!("{}", MSG_PASSPHRASE_VERIFIED);
 
     dump_keyfiles(v, p, only.as_deref(), &out)
 }
@@ -1453,7 +1357,7 @@ fn dump_keyfiles(v: &Vault, p: &Profile, only: Option<&str>, out: &Path) -> Admi
 
     let existed = out.exists();
     fs::create_dir_all(out).map_err(|e| AdminError::InvalidArgument(format!("create {}: {e}", out.display())))?;
-    if !existed { secure_dir(out)?; }
+    if !existed { secure_dir(&out)?; }
 
     let paths: Vec<PathBuf> = selected.iter()
         .map(|(t, _)| out.join(format!("{}.key", safe_filename(&t.mapped_name))))
@@ -1475,46 +1379,11 @@ fn dump_keyfiles(v: &Vault, p: &Profile, only: Option<&str>, out: &Path) -> Admi
     println!("done. Keep these files offline; delete them when no longer needed.");
     Ok(())
 }
-
-/// Restrict a user/host supplied name to a single safe filename component.
-fn safe_filename(name: &str) -> String {
-    let s: String = name.chars()
-        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') { c } else { '_' })
-        .collect();
-    if s.is_empty() || s == "." || s == ".." { "target".into() } else { s }
-}
-
-#[cfg(unix)]
-fn secure_dir(path: &Path) -> AdminResult<()> {
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
-        .map_err(AdminError::Io)
-}
-
-#[cfg(not(unix))]
-fn secure_dir(_path: &Path) -> AdminResult<()> { Ok(()) }
-
-/// Create/truncate a file with mode 0600 from the start (no world-readable window).
-#[cfg(unix)]
-fn write_secret_file(path: &Path, bytes: &[u8]) -> AdminResult<()> {
-    use std::io::Write;
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-    let mut f = fs::OpenOptions::new()
-        .write(true).create(true).truncate(true).mode(0o600).open(path)
-        .map_err(AdminError::Io)?;
-    f.write_all(bytes).map_err(AdminError::Io)?;
-    f.set_permissions(fs::Permissions::from_mode(0o600)).map_err(AdminError::Io)?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn write_secret_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    fs::write(path, bytes)
-}
-
+ 
 #[cfg(test)]
 mod tests {
-    use super::{fs, parse_selection, safe_filename, target_diff, write_secret_file, TargetMeta};
+    use super::{fs, parse_selection, target_diff, TargetMeta};
+    use crate::util::{safe_filename, write_secret_file};
 
     fn meta() -> TargetMeta {
         TargetMeta {

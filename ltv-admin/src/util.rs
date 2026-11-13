@@ -1,24 +1,28 @@
 //! Common utilities for the admin tool.
-use std::path::PathBuf;
-use secrecy::{SecretVec, SecretString};
+use std::path::{Path, PathBuf};
+use secrecy::{SecretString, SecretVec};
 use rpassword;
-use ltv_core::{Vault, model::Profile};
+use ltv_core::{Vault, model::{Profile, BootedAccess, BootedAuth, TargetMeta}};
+use russh_keys;
+use crate::constants::*;
 use crate::error::{AdminError, AdminResult, ToAdminResult};
 
 /// Prompt for a non-empty passphrase, returning a zeroizing SecretVec.
-pub fn prompt_passphrase(prompt: &str) -> SecretVec<u8> {
+pub fn prompt_passphrase(prompt: &str) -> AdminResult<SecretVec<u8>> {
     loop {
-        let p = rpassword::prompt_password(prompt).unwrap_or_default();
+        let p = rpassword::prompt_password(prompt)
+            .map_err(|e| AdminError::InvalidArgument(format!("prompt failed: {e}")))?;
         if !p.is_empty() {
-            return SecretVec::new(p.into_bytes());
+            return Ok(SecretVec::new(p.into_bytes()));
         }
-        eprintln!("Passphrase cannot be empty.");
+        eprintln!("{}", ERR_EMPTY_PASSPHRASE);
     }
 }
 
 /// Prompt for an optional passphrase (allows empty), returning String.
-pub fn prompt_passphrase_optional(prompt: &str) -> String {
-    rpassword::prompt_password(prompt).unwrap_or_default()
+pub fn prompt_passphrase_optional(prompt: &str) -> AdminResult<String> {
+    rpassword::prompt_password(prompt)
+        .map_err(|e| AdminError::InvalidArgument(format!("prompt failed: {e}")))
 }
 
 /// Prompt for a yes/no confirmation. Returns true for 'y' or 'Y'.
@@ -64,9 +68,9 @@ pub(crate) fn open_vault_file(path: &PathBuf, pass: &SecretVec<u8>) -> AdminResu
 
 /// Verify the current vault's master passphrase by re-reading the file.
 pub(crate) fn verify_vault_passphrase(_vault: &Vault, path: &PathBuf) -> AdminResult<()> {
-    let pass = prompt_passphrase("Confirm vault passphrase: ");
+    let pass = prompt_passphrase("Confirm vault passphrase: ")?;
     open_vault_file(path, &pass)?;
-    println!("✓ Passphrase verified.");
+    println!("{}", MSG_PASSPHRASE_VERIFIED);
     Ok(())
 }
 
@@ -128,7 +132,7 @@ pub fn safe_filename(name: &str) -> String {
 
 /// Create a directory with restricted permissions (0o700 on Unix).
 #[cfg(unix)]
-pub fn secure_dir(path: &PathBuf) -> AdminResult<()> {
+pub fn secure_dir<P: AsRef<Path>>(path: P) -> AdminResult<()> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
         .map_err(|e| AdminError::Io(e))
@@ -136,13 +140,13 @@ pub fn secure_dir(path: &PathBuf) -> AdminResult<()> {
 
 /// Create a directory with restricted permissions (no-op on non-Unix).
 #[cfg(not(unix))]
-pub fn secure_dir(_path: &PathBuf) -> AdminResult<()> {
+pub fn secure_dir<P: AsRef<Path>>(_path: P) -> AdminResult<()> {
     Ok(())
 }
 
 /// Write a secret file with mode 0o600 from creation (no world-readable window).
 #[cfg(unix)]
-pub fn write_secret_file(path: &PathBuf, bytes: &[u8]) -> AdminResult<()> {
+pub fn write_secret_file<P: AsRef<Path>>(path: P, bytes: &[u8]) -> AdminResult<()> {
     use std::io::Write;
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     let mut f = std::fs::OpenOptions::new()
@@ -155,7 +159,7 @@ pub fn write_secret_file(path: &PathBuf, bytes: &[u8]) -> AdminResult<()> {
 
 /// Write a secret file (non-Unix fallback).
 #[cfg(not(unix))]
-pub fn write_secret_file(path: &PathBuf, bytes: &[u8]) -> AdminResult<()> {
+pub fn write_secret_file<P: AsRef<Path>>(path: P, bytes: &[u8]) -> AdminResult<()> {
     std::fs::write(path, bytes).map_err(AdminError::Io)
 }
 
@@ -193,4 +197,97 @@ pub fn ask(prompt: &str) -> String {
 /// Prompt for a string with a default value.
 pub fn ask_or(prompt: &str, default: &str) -> String {
     let v = ask(&format!("{prompt} [{default}]: ")); if v.is_empty() { default.into() } else { v }
+}
+
+/// Setup SSH authentication for booted OS operations (enroll, rotate, fetch).
+/// Returns (username, BootedAuth, connect_timeout_s).
+pub fn setup_booted_access(profile: &Profile) -> AdminResult<(String, BootedAuth, u16)> {
+    let username = ask_or(PROMPT_OS_SSH_USER, DEFAULT_OS_SSH_USER);
+    let auth = match ask_or(PROMPT_AUTH_METHOD, DEFAULT_AUTH_METHOD).as_str() {
+        "p" => {
+            let pass = prompt_passphrase_optional(PROMPT_OS_PASSWORD)?;
+            BootedAuth::Password(SecretString::new(pass))
+        }
+        _ => {
+            let home = home_dir();
+            let path = ask_or(PROMPT_KEY_FILE, &format!("{}/.ssh/id_ed25519", home.display()));
+            let key_passphrase = prompt_passphrase_optional(PROMPT_KEY_PASSPHRASE)?;
+            let kp = russh_keys::load_secret_key(&path, None)
+                .or_else(|_| russh_keys::load_secret_key(&path, Some(&key_passphrase)))
+                .map_err(|e| AdminError::InvalidArgument(format!("load key: {e}")))?;
+            match kp {
+                russh_keys::key::KeyPair::Ed25519(sk) => BootedAuth::Ed25519Seed(sk.to_bytes()),
+                _ => return Err(AdminError::InvalidArgument(ERR_ONLY_ED25519.into())),
+            }
+        }
+    };
+    Ok((username, auth, profile.connect_timeout_s))
+}
+
+/// Build BootedAccess from username, auth, and timeout.
+pub fn make_booted_access(username: String, auth: BootedAuth, timeout: u16) -> BootedAccess {
+    BootedAccess { use_sudo: username != "root", username, auth, connect_timeout_s: timeout }
+}
+
+/// Collect LUKS passphrases for the given targets.
+/// If `same_passphrase` is true, prompts once for all targets.
+/// Returns a map of luks_uuid -> SecretString.
+pub fn collect_luks_passphrases(
+    targets: &[TargetMeta],
+    same_passphrase: bool,
+) -> AdminResult<std::collections::HashMap<String, SecretString>> {
+    let mut passphrases = std::collections::HashMap::new();
+    
+    if same_passphrase {
+        let pass = loop {
+            let p = rpassword::prompt_password(PROMPT_LUKS_PASSPHRASE_ALL)
+                .map_err(|e| AdminError::InvalidArgument(format!("prompt failed: {e}")))?;
+            if !p.is_empty() { break SecretString::new(p); }
+            eprintln!("{}", ERR_EMPTY_PASSPHRASE);
+        };
+        for tm in targets {
+            passphrases.insert(tm.luks_uuid.clone(), pass.clone());
+        }
+    } else {
+        for tm in targets {
+            let pass = loop {
+                let prompt = format!("Existing LUKS passphrase for {} ({}): ", tm.mapped_name, tm.luks_uuid);
+                let p = rpassword::prompt_password(&prompt)
+                    .map_err(|e| AdminError::InvalidArgument(format!("prompt failed: {e}")))?;
+                if !p.is_empty() { break SecretString::new(p); }
+                eprintln!("{}", ERR_EMPTY_PASSPHRASE);
+            };
+            passphrases.insert(tm.luks_uuid.clone(), pass);
+        }
+    }
+    Ok(passphrases)
+}
+
+/// Filter targets by the optional --target filter (UUID or mapper name).
+pub fn filter_targets(
+    profile: &Profile,
+    only: Option<&str>,
+) -> Vec<TargetMeta> {
+    profile.targets_meta.iter()
+        .filter(|tm| only.map_or(true, |f| f == &tm.luks_uuid || f == &tm.mapped_name))
+        .cloned()
+        .collect()
+}
+
+/// Check targets for missing keyslots and print warnings.
+pub fn check_target_keyslots(targets: &[TargetMeta]) {
+    for tm in targets {
+        if tm.keyslot.is_none() {
+            eprintln!("Warning: target {} ({}) has no keyslot recorded. Run 'enroll' first.", tm.mapped_name, tm.luks_uuid);
+        }
+    }
+}
+
+/// Ask if all targets use the same LUKS passphrase (only if >1 target).
+pub fn ask_same_passphrase(targets: &[TargetMeta]) -> bool {
+    if targets.len() > 1 {
+        ask(PROMPT_SAME_LUKS_PASSPHRASE).to_lowercase() != "n"
+    } else {
+        true
+    }
 }
