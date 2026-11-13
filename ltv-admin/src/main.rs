@@ -1,5 +1,5 @@
 use std::{fs, path::PathBuf, env};
-use ltv_core::{format::Argon2Params, model::{Profile, TargetMeta, fingerprint_sha256, HostKey, SecretPayload, ExecutionMode}, net::{fetch_host_key, fetch_luks_info, probe, unlock, ProbeResult}, vault::{Vault, ssh_ed25519_blob}, enroll::EnrollEvent, rotate::RotateEvent, scripts::{render_cmdline, render_deploy_sh, render_deploy_nopatch_sh, LTV_FILES, LTV_MODULES, LTV_PACKAGES, LTV_LUKS_WRAPPER, LTV_COMMON, LTV_PATCH_INIT, LTV_COMMIT_HOOK}};
+use ltv_core::{format::Argon2Params, model::{Profile, TargetMeta, fingerprint_sha256, HostKey, SecretPayload, ExecutionMode}, net::{fetch_host_key, fetch_luks_info, probe, unlock, ProbeResult}, vault::{Vault, ssh_ed25519_blob}, enroll::EnrollEvent, rotate::RotateEvent, scripts::{render_cmdline, render_deploy_sh, render_deploy_nopatch_sh, LTV_FILES, LTV_MODULES, LTV_PACKAGES, LTV_LUKS_WRAPPER, LTV_PATCH_INIT, LTV_COMMIT_HOOK}};
 use std::path::Path;
 use rustyline::{error::ReadlineError, DefaultEditor};
 use secrecy::{ExposeSecret};
@@ -242,7 +242,6 @@ async fn cmd_server_setup(st: &mut State, name: &str, args: &[&str]) -> AdminRes
     let mut perms = fs::metadata(deploy_dir.join("ltv-luks-wrapper.sh")).map_err(AdminError::Io)?.permissions();
     perms.set_mode(0o755);
     fs::set_permissions(deploy_dir.join("ltv-luks-wrapper.sh"), perms).map_err(AdminError::Io)?;
-    fs::write(deploy_dir.join("ltv-common.sh"), LTV_COMMON).map_err(AdminError::Io)?;
 
     // 3. patch script + commit hook (idempotent re-patch after mkinitfs upgrade)
     fs::write(deploy_dir.join("ltv-patch-init.sh"), LTV_PATCH_INIT).map_err(AdminError::Io)?;
@@ -290,7 +289,6 @@ async fn cmd_server_setup(st: &mut State, name: &str, args: &[&str]) -> AdminRes
 - `ltv.modules` - Kernel modules (empty)
 - `ltv.packages` - APK packages: dropbear
 - `ltv-luks-wrapper.sh` - Luks wrapper (replaces nlplug-findfs, starts Dropbear, waits for resume)
-- `ltv-common.sh` - Shared functions
 - `ltv-patch-init.sh` - Script to patch initramfs-init (idempotent)
 - `authorized_keys` - Client public key for initramfs SSH (no forced commands)
 - `dropbear_ed25519_host_key` - Dropbear host private key (pre-generated)

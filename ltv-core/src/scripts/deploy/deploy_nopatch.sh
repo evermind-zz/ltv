@@ -6,13 +6,11 @@
 set -e
 
 echo "Installing mkinitfs feature files..."
-mkdir -p /etc/mkinitfs/ltv-stuff
-cp ltv.files ltv.modules ltv.packages /etc/mkinitfs/ltv-stuff/
+cp ltv.files ltv.modules ltv.packages /etc/mkinitfs/features.d/
 
-echo "Installing luks wrapper and common lib to /usr/share/mkinitfs/"
+echo "Installing luks wrapper to /usr/share/mkinitfs/"
 cp ltv-luks-wrapper.sh /usr/share/mkinitfs/ltv-luks-wrapper.sh
 chmod 755 /usr/share/mkinitfs/ltv-luks-wrapper.sh
-cp ltv-common.sh /usr/share/mkinitfs/ltv-common.sh
 
 echo "Installing Dropbear host key and authorized_keys overlay..."
 mkdir -p /etc/mkinitfs/ltv-stuff/etc/dropbear

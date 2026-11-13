@@ -1,83 +1,76 @@
 #!/bin/sh
 # ltv-luks-wrapper: controlled nlplug-findfs with dual unlock path
-# Replaces direct nlplug-findfs call in initramfs-init
-# Usage: ltv-luks-wrapper [nlplug-findfs args including -c -m -k ...]
+# Replaces direct nlplug-findfs cryptroot call in initramfs-init
+# Usage: ltv-luks-wrapper.sh [nlplug-findfs args including -c -m -k ...]
 
-set -eu
+# 1. filter non crypto arguments
+set -- "$@"
+# we use a position array via set -- to keep quoting
+NON_CRYPTOPTS=""
 
-# Original args passed from init script (includes crypto options)
-CRYPTOPTS="$@"
-
-# Extract non-crypto args for second nlplug-findfs pass (udev settling)
-# Strip: -c DEVICE, -m NAME, -k KEY, -H HEADER, -o OFFSET, -D
-NON_CRYPTOPTS=$(echo "$CRYPTOPTS" | sed \
-  -e 's/-c [^ ]*//g' \
-  -e 's/-m [^ ]*//g' \
-  -e 's/-k [^ ]*//g' \
-  -e 's/-H [^ ]*//g' \
-  -e 's/-o [^ ]*//g' \
-  -e 's/-D//g')
-
-# LTV_MAPPERS from staged metadata (written by admin during unlock)
-# Falls back to kernel cmdline if staging not yet done
-get_mappers() {
-  if [ -d /run/ltv ] && [ -n "$(ls -A /run/ltv 2>/dev/null)" ]; then
-    for f in /run/ltv/*/mapper; do
-      [ -f "$f" ] && cat "$f"
-    done | sort -u
-  else
-    # Fallback: read from kernel cmdline via KOPT_ltv_mappers
-    # (set by init script before calling wrapper)
-    echo "$LTV_MAPPERS" | tr ',' '\n'
-  fi
+filter_args() {
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            # skip crypto options with arguments
+            -c|--crypt-device|-m|--crypt-name|-k|--crypt-key|-H|--crypt-header|-o|--crypt-offset)
+                shift 2
+                ;;
+            # skip crypto options without arguments
+            -D|--crypt-discards)
+                shift 1
+                ;;
+            # keep every other options
+            *)
+                # we add a temporary delimiter '|' as ash has on real arrays
+                NON_CRYPTOPTS="${NON_CRYPTOPTS}${NON_CRYPTOPTS:+|}$1"
+                shift 1
+                ;;
+        esac
+    done
 }
 
-# Start nlplug-findfs WITH crypto options in BACKGROUND (TTY fallback path)
-nlplug-findfs $CRYPTOPTS -p /sbin/mdev -d &
-NLPID=$!
+filter_args "$@"
 
-# Start dropbear SSH server
+# 2. Start dropbear SSH server so ltv-admin or similar can connect
 dropbear -E -p ${LTV_PORT:-22} -r /etc/mkinitfs/ltv-stuff/etc/dropbear/dropbear_ed25519_host_key -D /etc/mkinitfs/ltv-stuff/root/.ssh/ &
-DROPBEAR_PID=$!
 
-# Monitor loop: wait for admin to write /run/ltv/resume OR all mappers to appear
-ELAPSED=0
-while true; do
-  # Check if admin signaled completion
-  if [ -e /run/ltv/resume ]; then
-    break
-  fi
+cleanup() {
+    DBPIDS=$(pidof dropbear)
+    [ -n "$DBPIDS" ] && kill -9 $DBPIDS 2>/dev/null || true
+    kill -9 "$MONITOR_PID" 2>/dev/null || true
+}
 
-  # Check if ALL expected mappers exist (TTY manual unlock path)
-  ready=1
-  for m in $(get_mappers); do
-    [ -e /dev/mapper/$m ] || ready=0
-  done
-  [ $ready -eq 1 ] && break
+trap cleanup EXIT
 
-  # Check if background nlplug-findfs exited (TTY success or error)
-  if ! kill -0 $NLPID 2>/dev/null; then
-    wait $NLPID
-    exit $?
-  fi
+# 3. background monitor for SSH Unlock
+(
+    while true; do
+        if [ -e /run/ltv/resume ]; then
+            # Terminate the first nlplug-findfs process that we started earlier
+            # -> the original call we wrapped ourselves into.
+            # -> now everything is unlocked and the script can continue running
+            NLPID=$(pidof nlplug-findfs)
+            if [ -n "$NLPID" ]; then
+                kill -9 $NLPID 2>/dev/null || true
+            fi
+            break
+        fi
+        sleep 1
+    done
+) &
+MONITOR_PID=$!
 
-  sleep 1
-  ELAPSED=$((ELAPSED + 1))
-  if [ $ELAPSED -gt 300 ]; then
-    kill -9 $NLPID $DROPBEAR_PID 2>/dev/null
-    exit 1
-  fi
-done
+# 4. First run in the foreground (for TTY password prompt) (original call)
+nlplug-findfs "$@" || true
 
-# Admin signaled done (or TTY succeeded) - kill crypto nlplug-findfs
-kill -9 $NLPID 2>/dev/null
-wait $NLPID 2>/dev/null
+# 5. If unlocked via SSH: Second run without crypto options
+if [ -e /run/ltv/resume ]; then
+    # loaded filtered arguments into $@
+    OLD_IFS="$IFS"
+    IFS="|"
+    set -- $NON_CRYPTOPTS
+    IFS="$OLD_IFS"
 
-# Restart nlplug-findfs WITHOUT crypto to finish udev for remaining devices
-nlplug-findfs $NON_CRYPTOPTS -p /sbin/mdev -d
-
-# Clean up dropbear
-kill $DROPBEAR_PID 2>/dev/null
-wait $DROPBEAR_PID 2>/dev/null
-
-exit 0
+    # Second run: triggers mdev/LVM/device events for the open mapper device
+    nlplug-findfs "$@"
+fi
