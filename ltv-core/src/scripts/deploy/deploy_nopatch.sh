@@ -22,10 +22,26 @@ chmod 600 /etc/mkinitfs/ltv-stuff/etc/dropbear/dropbear_ed25519_host_key
 chmod 644 /etc/mkinitfs/ltv-stuff/etc/dropbear/dropbear_ed25519_host_key.pub
 chmod 600 /etc/mkinitfs/ltv-stuff/root/.ssh/authorized_keys
 
-echo "Regenerating initramfs (without patching initramfs-init)..."
-KERNEL="{kernel_version}"
-mkinitfs -F "virtio base cryptsetup ltv network keymap ata ide scsi usb phy ext4" -k "$KERNEL" \
-  -o "/boot/initramfs-ltv-$KERNEL" "$KERNEL"
+# Detect kernel version
+KERNEL=$(uname -r)
 
-echo "Done! Update bootloader with kernel cmdline from cmdline.txt"
-echo "Then reboot."
+echo ""
+echo "======================================================================"
+echo "DEPLOYMENT FILES INSTALLED - MANUAL STEP REQUIRED"
+echo "======================================================================"
+echo ""
+echo "To complete the installation (without patching initramfs-init), you need to:"
+echo ""
+echo "1. Add 'ltv' to FEATURES in /etc/mkinitfs/mkinitfs.conf:"
+echo "   FEATURES=\"virtio base cryptsetup ltv network keymap ata ide scsi usb phy ext4\""
+echo ""
+echo "2. Add 'ltv=yes' to your kernel command line (bootloader config):"
+echo "   Example: ltv=yes"
+echo ""
+echo "3. Regenerate initramfs manually:"
+echo "   mkinitfs -F \"virtio base cryptsetup ltv network keymap ata ide scsi usb phy ext4\" -k \"$KERNEL\" \\"
+echo "     -o \"/boot/initramfs-ltv-$KERNEL\" \"$KERNEL\""
+echo ""
+echo "======================================================================"
+echo "Then update your bootloader and reboot."
+echo "======================================================================"

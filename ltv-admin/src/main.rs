@@ -1,5 +1,5 @@
 use std::{fs, path::PathBuf, env};
-use ltv_core::{format::Argon2Params, model::{Profile, TargetMeta, fingerprint_sha256, HostKey, SecretPayload, ExecutionMode}, net::{fetch_host_key, fetch_luks_info, probe, unlock, ProbeResult}, vault::{Vault, ssh_ed25519_blob}, enroll::EnrollEvent, rotate::RotateEvent, scripts::{render_cmdline, render_deploy_sh, render_deploy_nopatch_sh, LTV_FILES, LTV_MODULES, LTV_PACKAGES, LTV_LUKS_WRAPPER, LTV_PATCH_INIT, LTV_COMMIT_HOOK}};
+use ltv_core::{format::Argon2Params, model::{Profile, TargetMeta, fingerprint_sha256, HostKey, SecretPayload, ExecutionMode}, net::{fetch_host_key, fetch_luks_info, probe, unlock, ProbeResult}, vault::{Vault, ssh_ed25519_blob}, enroll::EnrollEvent, rotate::RotateEvent, scripts::{render_deploy_sh, render_deploy_nopatch_sh, LTV_FILES, LTV_MODULES, LTV_PACKAGES, LTV_LUKS_WRAPPER, LTV_PATCH_INIT, LTV_COMMIT_HOOK}};
 use std::path::Path;
 use rustyline::{error::ReadlineError, DefaultEditor};
 use secrecy::{ExposeSecret};
@@ -275,12 +275,7 @@ async fn cmd_server_setup(st: &mut State, name: &str, args: &[&str]) -> AdminRes
     let mut perms = fs::metadata(deploy_dir.join("deploy_nopatch.sh")).map_err(AdminError::Io)?.permissions();
     perms.set_mode(0o755);
     fs::set_permissions(deploy_dir.join("deploy_nopatch.sh"), perms).map_err(AdminError::Io)?;
-
-    // 8. cmdline.txt (from template)
-    let cmdline = render_cmdline(&p);
-    fs::write(deploy_dir.join("cmdline.txt"), &cmdline).map_err(AdminError::Io)?;
-
-    // 9. README
+    // 8. README
     let readme = format!(r#"# LTV Deployment Artifacts for profile: {}
 
 ## Files
@@ -295,7 +290,6 @@ async fn cmd_server_setup(st: &mut State, name: &str, args: &[&str]) -> AdminRes
 - `dropbear_ed25519_host_key.pub` - Dropbear host public key
 - `deploy.sh` - Run this on the target server (sudo sh deploy.sh)
 - `deploy_nopatch.sh` - Alternative without patching initramfs-init
-- `cmdline.txt` - Kernel command line parameters
 
 ## Quick Deploy
 
@@ -310,21 +304,23 @@ sudo sh deploy_nopatch.sh
 
 ## Bootloader Configuration
 
-Add to kernel command line (from cmdline.txt):
-{}
+Add to kernel command line:
+ltv=yes
+
 ## From Admin Machine
 
 After deployment and reboot:
     ltv-admin> unlock {}
 
 # This will push keyfiles to initramfs Dropbear via SSH (full shell, not push-to-stdin yet)
-"#, p.name, &cmdline, p.name);
+"#, p.name, p.name);
     fs::write(deploy_dir.join("README.md"), readme).map_err(AdminError::Io)?;
 
     println!("Deployment artifacts written to {}", deploy_dir.display());
     println!("Run: sudo sh {}/deploy.sh on the target server", out_dir);
     Ok(())
 }
+
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
