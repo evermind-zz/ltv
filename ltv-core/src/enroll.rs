@@ -60,7 +60,7 @@ async fn enroll_one(
     }
 
     // 2. Pick a free slot: dump LUKS header
-    let cmd = format!("{sudo}cryptsetup luksDump {dev}");
+    let cmd = format!("{sudo}{CRYPTSETUP} {CMD_LUKS_DUMP} {dev}");
     log(&cmd);
     let dump = exec(session, &cmd, None, t).await?;
     if dump.code != 0 {
@@ -103,7 +103,7 @@ async fn enroll_one(
         })?;
 
     // 6. Add key using both tmpfs files
-    let cmd = format!("{sudo}cryptsetup luksAddKey --key-file={passfile} --new-keyfile={newkeyfile} --key-slot {slot} {dev}");
+    let cmd = format!("{sudo}{CRYPTSETUP} {CMD_LUKS_ADD_KEY} {ARG_KEY_FILE}={passfile} {ARG_NEW_KEY_FILE}={newkeyfile} {ARG_KEY_SLOT} {slot} {dev}");
     log(&cmd);
     let add = exec(session, &cmd, None, t).await;
 
@@ -121,7 +121,7 @@ async fn enroll_one(
     }
 
     // 8. Verify with the new key itself (--test-passphrase doesn't open the device)
-    let cmd = format!("{sudo}cryptsetup open --test-passphrase --key-file=- --key-slot {slot} {dev}");
+    let cmd = format!("{sudo}{CRYPTSETUP} {CMD_LUKS_OPEN} {ARG_TEST_PASSPHRASE} {ARG_KEY_FILE}=- {ARG_KEY_SLOT} {slot} {dev}");
     log(&cmd);
     let verify = exec(session, &cmd, Some(keyfile), t).await?;
     if verify.code != 0 {
@@ -173,7 +173,7 @@ pub async fn enroll(
     on(EnrollEvent::Authenticated);
 
     let sudo = if access.use_sudo && access.username != "root" { "sudo -n " } else { "" };
-    let t = Duration::from_secs(p.exec_timeout_s.max(60) as u64); // luksAddKey runs PBKDF, be generous
+    let t = Duration::from_secs(p.exec_timeout_s.max(MIN_EXEC_TIMEOUT_SECS) as u64);
     let secrets = vault.open_secrets(&p)?;
 
     // Apply target filter up front.

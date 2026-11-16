@@ -83,7 +83,7 @@ async fn rotate_one(
     emit(RotateEvent::OldSlotFound(tm.mapped_name.clone(), old_slot));
 
     // 2. Generate new keyfile
-    let mut new_keyfile = vec![0u8; 64];
+    let mut new_keyfile = vec![0u8; KEYFILE_SIZE];
     rand::rngs::OsRng.fill_bytes(&mut new_keyfile);
 
     // 3. Get passphrase for this target
@@ -91,7 +91,7 @@ async fn rotate_one(
         target: tm.mapped_name.clone(), code: 0, stderr: e })?;
 
     // 4. Pick free slot for new key
-    let cmd = format!("{sudo}cryptsetup luksDump {dev}");
+    let cmd = format!("{sudo}{CRYPTSETUP} {CMD_LUKS_DUMP} {dev}");
     log(&cmd);
     let dump = exec(session, &cmd, None, t).await?;
     if dump.code != 0 {
@@ -117,7 +117,7 @@ async fn rotate_one(
             target: tm.mapped_name.clone(), code: 0, stderr: format!("stage keyfile: {e}") })?;
 
     // 7. Add new key to free slot
-    let cmd = format!("{sudo}cryptsetup luksAddKey --key-file={passfile} --new-keyfile={newkeyfile} --key-slot {new_slot} {dev}");
+    let cmd = format!("{sudo}{CRYPTSETUP} {CMD_LUKS_ADD_KEY} {ARG_KEY_FILE}={passfile} {ARG_NEW_KEY_FILE}={newkeyfile} {ARG_KEY_SLOT} {new_slot} {dev}");
     log(&cmd);
     let add = exec(session, &cmd, None, t).await;
 
@@ -135,7 +135,7 @@ async fn rotate_one(
     emit(RotateEvent::SlotAdded(tm.mapped_name.clone(), new_slot));
 
     // 9. Verify new key
-    let cmd = format!("{sudo}cryptsetup open --test-passphrase --key-file=- --key-slot {new_slot} {dev}");
+    let cmd = format!("{sudo}{CRYPTSETUP} {CMD_LUKS_OPEN} {ARG_TEST_PASSPHRASE} {ARG_KEY_FILE}=- {ARG_KEY_SLOT} {new_slot} {dev}");
     log(&cmd);
     let verify = exec(session, &cmd, Some(&new_keyfile), t).await?;
     if verify.code != 0 {
@@ -206,7 +206,7 @@ pub async fn rotate_key(
     on(RotateEvent::Authenticated);
 
     let sudo = if access.use_sudo && access.username != "root" { "sudo -n " } else { "" };
-    let t = Duration::from_secs(p.exec_timeout_s.max(60) as u64);
+    let t = Duration::from_secs(p.exec_timeout_s.max(MIN_EXEC_TIMEOUT_SECS) as u64);
     let secrets = vault.open_secrets(&p)?;
 
     let targets: Vec<(usize, TargetMeta)> = p.targets_meta.iter().enumerate()
@@ -240,7 +240,7 @@ pub async fn rotate_key(
                 }
 
                 // 11. Kill old slot
-                let cmd = format!("{sudo}cryptsetup luksKillSlot {dev} {old_slot}");
+                let cmd = format!("{sudo}{CRYPTSETUP} {CMD_LUKS_KILL_SLOT} {dev} {old_slot}");
                 if let Some(v) = verbose.as_mut() { v(&cmd); }
                 let kill = exec(&s, &cmd, None, t).await?;
                 if kill.code != 0 {
@@ -312,14 +312,14 @@ pub async fn rotate_key(
                 let name = done.target.mapped_name.clone();
                 let res = finish_rotate(vault, uuid, done).await?;
 
-                let cmd = format!("{sudo}cryptsetup luksKillSlot {dev} {old_slot}");
+                let cmd = format!("{sudo}{CRYPTSETUP} {CMD_LUKS_KILL_SLOT} {dev} {old_slot}");
                 if let Some(v) = verbose.as_mut() { v(&cmd); }
                 match exec(&s, &cmd, None, t).await {
                     Ok(kill) if kill.code != 0 => {
-                        if let Some(v) = verbose.as_mut() { v(&format!("! luksKillSlot failed: exit {}: {}", kill.code, kill.stderr.trim())); }
+                        if let Some(v) = verbose.as_mut() { v(&format!("! {} failed: exit {}: {}", CMD_LUKS_KILL_SLOT, kill.code, kill.stderr.trim())); }
                     }
                     Ok(_) => on(RotateEvent::OldSlotKilled(name, old_slot)),
-                    Err(e) => { if let Some(v) = verbose.as_mut() { v(&format!("! luksKillSlot error: {e}")); } }
+                    Err(e) => { if let Some(v) = verbose.as_mut() { v(&format!("! {} error: {e}", CMD_LUKS_KILL_SLOT)); } }
                 }
 
                 results.push(res);

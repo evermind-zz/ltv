@@ -1,5 +1,5 @@
 use std::{fs, path::PathBuf, env};
-use ltv_core::{format::Argon2Params, model::{Profile, TargetMeta, HostKey, SecretPayload, ExecutionMode, fingerprint_sha256}, net::{fetch_host_key, fetch_luks_info, probe, unlock, ProbeResult}, vault::{Vault, ssh_ed25519_blob}, enroll::EnrollEvent, rotate::RotateEvent, scripts::{render_deploy_sh, render_deploy_nopatch_sh, LTV_FILES, LTV_MODULES, LTV_PACKAGES, LTV_LUKS_WRAPPER, LTV_PATCH_INIT, LTV_COMMIT_HOOK}};
+use ltv_core::{constants::DEFAULT_SSH_PORT, format::Argon2Params, model::{Profile, TargetMeta, HostKey, SecretPayload, ExecutionMode, fingerprint_sha256}, net::{fetch_host_key, fetch_luks_info, probe, unlock, ProbeResult}, vault::{Vault, ssh_ed25519_blob}, enroll::EnrollEvent, rotate::RotateEvent, scripts::{render_deploy_sh, render_deploy_nopatch_sh, LTV_FILES, LTV_MODULES, LTV_PACKAGES, LTV_LUKS_WRAPPER, LTV_PATCH_INIT, LTV_COMMIT_HOOK}};
 use std::path::Path;
 use rustyline::{error::ReadlineError, DefaultEditor};
 use secrecy::{ExposeSecret};
@@ -116,7 +116,7 @@ fn cmd_add(st: &mut State) -> AdminResult<()> {
     let v = require_vault_mut(st)?;
     let name = ask("Profile name: ");
     let unlock_host = ask("Unlock SSH host (IP/hostname): ");
-    let unlock_port: u16 = ask_or("Unlock SSH port", "22").parse().map_err(|_| AdminError::InvalidArgument("bad port".into()))?;
+    let unlock_port: u16 = ask_or("Unlock SSH port", &DEFAULT_SSH_PORT.to_string()).parse().map_err(|_| AdminError::InvalidArgument("bad port".into()))?;
     let os_host = ask("OS SSH host (IP/hostname, blank = same as unlock SSH): ");
     let os_port_str = ask("OS SSH port (blank = same as unlock SSH): ");
     let os_host = if os_host.is_empty() { None } else { Some(os_host) };

@@ -50,5 +50,31 @@ pub const TMPFS_DIR_MODE: &str = "0755";
 pub const KILL_CMD: &str =
     "pkill -9 nlplug-findfs 2>/dev/null; pkill dropbear 2>/dev/null; pkill cryptsetup 2>/dev/null; true";
 
+// ---------- cryptsetup commands ----------
+pub const CRYPTSETUP: &str = "cryptsetup";
+pub const CMD_LUKS_DUMP: &str = "luksDump";
+pub const CMD_LUKS_ADD_KEY: &str = "luksAddKey";
+pub const CMD_LUKS_KILL_SLOT: &str = "luksKillSlot";
+pub const CMD_IS_LUKS: &str = "isLuks";
+pub const CMD_LUKS_OPEN: &str = "luksOpen";
+pub const ARG_KEY_FILE: &str = "--key-file";
+pub const ARG_NEW_KEY_FILE: &str = "--new-keyfile";
+pub const ARG_KEY_SLOT: &str = "--key-slot";
+pub const ARG_TEST_PASSPHRASE: &str = "--test-passphrase";
+
+// ---------- LUKS parsing strings ----------
+pub const LUKS2_KEYSLOTS_HEADER: &str = "Keyslots:";
+pub const LUKS2_KEYSLOT_TYPE: &str = "luks2";
+pub const LUKS1_KEY_SLOT_PREFIX: &str = "Key Slot ";
+pub const SLOT_ENABLED: &str = "ENABLED";
+pub const SLOT_DISABLED: &str = "DISABLED";
+
+// ---------- LUKS limits ----------
+pub const MAX_KEYSLOTS: u8 = 32;
+pub const KEYFILE_SIZE: usize = 64;
+
+/// Minimum exec timeout for LUKS operations (PBKDF is slow).
+pub const MIN_EXEC_TIMEOUT_SECS: u16 = 60;
+
 // ---------- script builder fragments ----------
 pub const TMPFS_CREATE: &str = "sh -c 'mkdir -p /run/ltv && umask 077 && cat >";

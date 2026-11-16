@@ -1,5 +1,6 @@
 //! Shared LUKS utilities for enroll, rotate, and unlock operations.
 
+use crate::constants::*;
 use crate::model::TargetMeta;
 use crate::error::UnlockError;
 use crate::net::exec;
@@ -8,9 +9,6 @@ use secrecy::SecretString;
 use std::collections::HashMap;
 use std::time::Duration;
 
-/// Maximum number of LUKS keyslots
-pub const MAX_KEYSLOTS: u8 = 32;
-
 /// Parse enabled keyslots from `cryptsetup luksDump` output.
 /// Handles both LUKS1 ("Key Slot N: ENABLED") and LUKS2 ("Keyslots: ... N: luks2") formats.
 pub fn parse_used_slots(dump: &str) -> Vec<u8> {
@@ -18,16 +16,16 @@ pub fn parse_used_slots(dump: &str) -> Vec<u8> {
     let mut in_keyslots = false;
     for line in dump.lines() {
         let l = line.trim();
-        if l.starts_with("Keyslots:") { in_keyslots = true; continue; }
+        if l.starts_with(LUKS2_KEYSLOTS_HEADER) { in_keyslots = true; continue; }
         if in_keyslots {
             if l.ends_with(':') && !l.chars().next().map_or(false, |c| c.is_ascii_digit()) { in_keyslots = false; continue; }
             if let Some((n, rest)) = l.split_once(':') {
-                if rest.trim().starts_with("luks2") { if let Ok(x) = n.trim().parse() { v.push(x); } }
+                if rest.trim().starts_with(LUKS2_KEYSLOT_TYPE) { if let Ok(x) = n.trim().parse() { v.push(x); } }
             }
         }
-        if let Some(rest) = l.strip_prefix("Key Slot ") {
+        if let Some(rest) = l.strip_prefix(LUKS1_KEY_SLOT_PREFIX) {
             if let Some((n, st)) = rest.split_once(':') {
-                if st.trim() == "ENABLED" { if let Ok(x) = n.trim().parse() { v.push(x); } }
+                if st.trim() == SLOT_ENABLED { if let Ok(x) = n.trim().parse() { v.push(x); } }
             }
         }
     }
@@ -51,14 +49,14 @@ pub async fn resolve_device<Hk: russh::client::Handler>(
     let mut dev = format!("UUID={}", tm.luks_uuid);
 
     // 0. sanity: device exists & is LUKS
-    let cmd = format!("{sudo}cryptsetup isLuks {dev}");
+    let cmd = format!("{sudo}{CRYPTSETUP} {CMD_IS_LUKS} {dev}");
     log(&cmd);
     let mut r = exec(session, &cmd, None, timeout).await?;
 
     if r.code != 0 && r.stderr.to_lowercase().contains("not exist") {
         if let Some(fp) = &tm.fallback_path {
             dev = fp.clone();
-            let cmd = format!("{sudo}cryptsetup isLuks {dev}");
+            let cmd = format!("{sudo}{CRYPTSETUP} {CMD_IS_LUKS} {dev}");
             log(&cmd);
             r = exec(session, &cmd, None, timeout).await?;
         }
@@ -83,7 +81,7 @@ pub async fn find_existing_slot<Hk: russh::client::Handler>(
     timeout: Duration,
     log: &mut dyn FnMut(&str),
 ) -> Result<Option<u8>, UnlockError> {
-    let cmd = format!("{sudo}cryptsetup luksDump {dev}");
+    let cmd = format!("{sudo}{CRYPTSETUP} {CMD_LUKS_DUMP} {dev}");
     log(&cmd);
     let dump = exec(session, &cmd, None, timeout).await?;
     if dump.code != 0 {
@@ -92,7 +90,7 @@ pub async fn find_existing_slot<Hk: russh::client::Handler>(
     let used = parse_used_slots(&dump.stdout);
 
     for slot in used {
-        let cmd = format!("{sudo}cryptsetup open --test-passphrase --key-file=- --key-slot {slot} {dev}");
+        let cmd = format!("{sudo}{CRYPTSETUP} {CMD_LUKS_OPEN} {ARG_TEST_PASSPHRASE} {ARG_KEY_FILE}=- {ARG_KEY_SLOT} {slot} {dev}");
         log(&cmd);
         let r = exec(session, &cmd, Some(keyfile), timeout).await?;
         if r.code == 0 {
@@ -104,12 +102,12 @@ pub async fn find_existing_slot<Hk: russh::client::Handler>(
 
 /// Per-target passphrase file path in tmpfs.
 pub fn target_passfile(index: usize) -> String {
-    format!("/run/ltv/{}/pass", index)
+    format!("{}/{}/pass", TMPFS_BASE, index)
 }
 
 /// Per-target new keyfile path in tmpfs (for rotate).
 pub fn target_newkeyfile(index: usize) -> String {
-    format!("/run/ltv/{}/newkey", index)
+    format!("{}/{}/newkey", TMPFS_BASE, index)
 }
 
 /// Stage passphrases for sequential execution with caching.

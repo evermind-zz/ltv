@@ -307,7 +307,7 @@ pub async fn fetch_luks_info(
         let dev_path = format!("/dev/{}", name);
 
         // Get LUKS details
-        let cmd = format!("{sudo}cryptsetup luksDump UUID={}", uuid);
+        let cmd = format!("{sudo}{CRYPTSETUP} {CMD_LUKS_DUMP} UUID={}", uuid);
         if let Some(v) = verbose.as_mut() { v(&cmd); }
         let dump = exec(&mut s, &cmd, None, t).await?;
         if dump.code != 0 {
@@ -433,12 +433,12 @@ async fn process_unlock_target(
     tmpfs_stage(session, &order_file, idx.to_string().as_bytes(), sudo, t).await?;
 
     // Use tmpfs file for unlock
-    let mut cmd = format!("cryptsetup luksOpen --key-file={} UUID={} {}", keyfile, tm.luks_uuid, tm.mapped_name);
+    let mut cmd = format!("{CRYPTSETUP} {CMD_LUKS_OPEN} {ARG_KEY_FILE}={} UUID={} {}", keyfile, tm.luks_uuid, tm.mapped_name);
     if let Some(v) = verbose.as_mut() { v(&cmd); }
     let mut r = exec(session, &cmd, None, t).await?;
     if r.code != 0 && r.stderr.to_lowercase().contains("not exist") {
         if let Some(fp) = &tm.fallback_path {
-            cmd = format!("cryptsetup luksOpen --key-file={} {} {}", keyfile, fp, tm.mapped_name);
+            cmd = format!("{CRYPTSETUP} {CMD_LUKS_OPEN} {ARG_KEY_FILE}={} {} {}", keyfile, fp, tm.mapped_name);
             if let Some(v) = verbose.as_mut() { v(&cmd); }
             r = exec(session, &cmd, None, t).await?;
         }
@@ -513,12 +513,12 @@ async fn process_unlock_targets_parallel(
                 tmpfs_stage(session, &uuid_file, tm.luks_uuid.as_bytes(), sudo, t).await?;
                 tmpfs_stage(session, &order_file, idx.to_string().as_bytes(), sudo, t).await?;
 
-                let mut cmd = format!("cryptsetup luksOpen --key-file={} UUID={} {}", keyfile, tm.luks_uuid, tm.mapped_name);
+                let mut cmd = format!("{CRYPTSETUP} {CMD_LUKS_OPEN} {ARG_KEY_FILE}={} UUID={} {}", keyfile, tm.luks_uuid, tm.mapped_name);
                 let _ = tx.send(UnlockMsg::Verbose(cmd.clone()));
                 let mut r = exec(session, &cmd, None, t).await?;
                 if r.code != 0 && r.stderr.to_lowercase().contains("not exist") {
                     if let Some(fp) = &tm.fallback_path {
-                        cmd = format!("cryptsetup luksOpen --key-file={} {} {}", keyfile, fp, tm.mapped_name);
+                        cmd = format!("{CRYPTSETUP} {CMD_LUKS_OPEN} {ARG_KEY_FILE}={} {} {}", keyfile, fp, tm.mapped_name);
                         let _ = tx.send(UnlockMsg::Verbose(cmd.clone()));
                         r = exec(session, &cmd, None, t).await?;
                     }
