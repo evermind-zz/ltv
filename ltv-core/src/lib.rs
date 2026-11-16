@@ -6,6 +6,7 @@ pub mod model;
 pub mod vault;
 pub mod net;
 pub mod scripts;
+pub mod luks;
 
 #[cfg(feature = "write")]
 pub mod enroll;

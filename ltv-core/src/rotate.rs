@@ -2,8 +2,7 @@ use std::time::Duration;
 use secrecy::{ExposeSecret, SecretString};
 use russh::client;
 use rand::RngCore;
-use crate::{constants::*, error::*, model::{BootedAccess, ExecutionMode, TargetMeta}, net::*, vault::Vault};
-use std::collections::HashMap;
+use crate::{constants::*, error::*, luks::*, model::{BootedAccess, ExecutionMode, TargetMeta}, net::*, vault::Vault};
 use futures::stream::{FuturesUnordered, StreamExt};
 use tokio::sync::{mpsc, Semaphore};
 
@@ -44,57 +43,6 @@ pub struct RotateResult {
     pub new_keyslot: u8,
 }
 
-/// Find the slot containing our keyfile by testing each enabled slot.
-async fn find_existing_slot(
-    session: &client::Handle<Hk>,
-    dev: &str,
-    keyfile: &[u8],
-    sudo: &str,
-    timeout: Duration,
-    log: &mut dyn FnMut(&str),
-) -> Result<Option<u8>, UnlockError> {
-    let cmd = format!("{sudo}cryptsetup luksDump {dev}");
-    log(&cmd);
-    let dump = exec(session, &cmd, None, timeout).await?;
-    if dump.code != 0 {
-        return Ok(None);
-    }
-    let used = parse_used_slots(&dump.stdout);
-
-    for slot in used {
-        let cmd = format!("{sudo}cryptsetup open --test-passphrase --key-file=- --key-slot {slot} {dev}");
-        log(&cmd);
-        let r = exec(session, &cmd, Some(keyfile), timeout).await?;
-        if r.code == 0 {
-            return Ok(Some(slot));
-        }
-    }
-    Ok(None)
-}
-
-fn parse_used_slots(dump: &str) -> Vec<u8> {
-    let mut v = Vec::new();
-    let mut in_keyslots = false;
-    for line in dump.lines() {
-        let l = line.trim();
-        if l.starts_with("Keyslots:") { in_keyslots = true; continue; }
-        if in_keyslots {
-            if l.ends_with(':') && !l.chars().next().map_or(false, |c| c.is_ascii_digit()) { in_keyslots = false; continue; }
-            if let Some((n, rest)) = l.split_once(':') {
-                if rest.trim().starts_with("luks2") { if let Ok(x) = n.trim().parse() { v.push(x); } }
-            }
-        }
-        if let Some(rest) = l.strip_prefix("Key Slot ") {
-            if let Some((n, st)) = rest.split_once(':') {
-                if st.trim() == "ENABLED" { if let Ok(x) = n.trim().parse() { v.push(x); } }
-            }
-        }
-    }
-    v
-}
-
-fn first_free(used: &[u8]) -> Option<u8> { (0u8..32).find(|s| !used.contains(s)) }
-
 /// Result of the SSH-side portion of rotating one target. The vault update and
 /// old-slot removal happen after this, so the vault is never mutated from
 /// concurrent tasks.
@@ -121,26 +69,8 @@ async fn rotate_one(
 ) -> Result<Option<RotateSshResult>, UnlockError> {
     emit(RotateEvent::TargetStart(tm.mapped_name.clone()));
 
-    // Try UUID first, then fallback to fallback_path if device not found
-    let mut dev = format!("UUID={}", tm.luks_uuid);
-
-    // 0. sanity: device exists & is LUKS
-    let cmd = format!("{sudo}cryptsetup isLuks {dev}");
-    log(&cmd);
-    let mut r = exec(session, &cmd, None, t).await?;
-    if r.code != 0 && r.stderr.to_lowercase().contains("not exist") {
-        if let Some(fp) = &tm.fallback_path {
-            dev = fp.clone();
-            let cmd = format!("{sudo}cryptsetup isLuks {dev}");
-            log(&cmd);
-            r = exec(session, &cmd, None, t).await?;
-        }
-    }
-    if r.code != 0 {
-        log(&format!("! cmd={} exit={} stderr: {}", &cmd, r.code, r.stderr.trim()));
-        emit(RotateEvent::Skipped(tm.mapped_name.clone(), format!("not a LUKS device: {}", r.stderr.trim())));
-        return Ok(None);
-    }
+    // 0. Resolve device (try UUID, then fallback)
+    let dev = resolve_device(session, tm, sudo, t, log).await?;
 
     // 1. Find current slot (where our key lives)
     let old_slot = match find_existing_slot(session, &dev, current_keyfile, sudo, t, log).await? {
@@ -255,7 +185,7 @@ fn emit_rotate_msg(msg: RotateMsg, on: &mut impl FnMut(RotateEvent),
 /// This enables a paranoid rotation procedure where each step is persisted.
 pub async fn rotate_key(
     vault: &mut Vault, uuid: &[u8; 16], access: &BootedAccess, mode: ExecutionMode,
-    mut passphrase_provider: impl FnMut(&str) -> Result<SecretString, String>,
+    passphrase_provider: impl FnMut(&str) -> Result<SecretString, String>,
     only_target: Option<&str>, mut on: impl FnMut(RotateEvent),
     mut verbose: Option<Box<dyn FnMut(&str) + Send>>,
     mut per_target_save: Option<&mut dyn FnMut(&mut Vault) -> Result<(), UnlockError>>,
@@ -288,19 +218,13 @@ pub async fn rotate_key(
 
     match mode {
         ExecutionMode::Sequential => {
-            let mut passphrase_cache: HashMap<String, SecretString> = HashMap::new();
+            let mut pass = make_sequential_passphrase_provider(passphrase_provider);
             for (idx, tm) in &targets {
                 let current_key = secrets.keyfiles.iter().find(|k| k.luks_uuid == tm.luks_uuid)
                     .ok_or(VaultError::Invariant("missing keyfile"))?;
 
                 let mut log = |s: &str| { if let Some(v) = verbose.as_mut() { v(s); } };
                 let mut emit = |e: RotateEvent| on(e);
-                let mut pass = |uuid: &str| -> Result<SecretString, String> {
-                    if let Some(c) = passphrase_cache.get(uuid) { return Ok(c.clone()); }
-                    let p = passphrase_provider(uuid)?;
-                    passphrase_cache.insert(uuid.to_string(), p.clone());
-                    Ok(p)
-                };
 
                 let done = rotate_one(*idx, tm, &s, &current_key.keyfile, &mut pass, sudo, t, &mut log, &mut emit).await?;
                 let Some(done) = done else { continue };
@@ -330,14 +254,7 @@ pub async fn rotate_key(
         }
         ExecutionMode::Parallel => {
             // Fetch every needed passphrase up front (provider is FnMut).
-            let mut pass_map: HashMap<String, SecretString> = HashMap::new();
-            for (_, tm) in &targets {
-                if !pass_map.contains_key(&tm.luks_uuid) {
-                    let pass = passphrase_provider(&tm.luks_uuid).map_err(|e| UnlockError::CryptsetupFailed {
-                        target: tm.mapped_name.clone(), code: 0, stderr: e })?;
-                    pass_map.insert(tm.luks_uuid.clone(), pass);
-                }
-            }
+            let pass_map = make_parallel_passphrase_map(&targets, passphrase_provider)?;
 
             if let Some(v) = verbose.as_mut() { v(&format!("running {} target(s) in parallel", targets.len())); }
 

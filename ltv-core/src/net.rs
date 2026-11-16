@@ -113,7 +113,7 @@ pub async fn probe(p: &Profile, mut verbose: Option<Box<dyn FnMut(&str) + Send>>
 
 pub(crate) struct ExecResult { pub code: u32, pub stdout: String, pub stderr: String }
 
-pub(crate) async fn exec(session: &client::Handle<Hk>, cmd: &str, stdin: Option<&[u8]>, t: Duration)
+pub(crate) async fn exec<Hk: russh::client::Handler>(session: &client::Handle<Hk>, cmd: &str, stdin: Option<&[u8]>, t: Duration)
     -> Result<ExecResult, NetError>
 {
     let mut ch = session.channel_open_session().await.map_err(|e| NetError::Ssh(e.to_string()))?;
@@ -147,7 +147,7 @@ pub(crate) fn keypair_from_seed(seed: &[u8; 32]) -> Arc<KeyPair> {
 
 /// Stage binary data to a tmpfs file on the remote (umask 077, mkdir -p).
 /// `sudo` prefix (e.g. "sudo -n ") can be empty. Returns Ok(()) or NetError.
-pub(crate) async fn tmpfs_stage(
+pub(crate) async fn tmpfs_stage<Hk: russh::client::Handler>(
     session: &client::Handle<Hk>,
     path: &str,
     data: &[u8],
@@ -172,7 +172,7 @@ pub(crate) async fn tmpfs_stage(
 
 /// Remove tmpfs files on the remote.
 /// `sudo` prefix (e.g. "sudo -n ") can be empty. Best-effort, errors ignored.
-pub(crate) async fn tmpfs_cleanup(
+pub(crate) async fn tmpfs_cleanup<Hk: russh::client::Handler>(
     session: &client::Handle<Hk>,
     paths: &[&str],
     sudo: &str,

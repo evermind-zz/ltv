@@ -27,16 +27,6 @@ pub fn target_keyfile(index: usize) -> String {
     format!("{}/key", target_tmpfs_dir(index))
 }
 
-/// Returns the passphrase file path within a target's staging directory.
-pub fn target_passfile(index: usize) -> String {
-    format!("{}/pass", target_tmpfs_dir(index))
-}
-
-/// Returns the new keyfile path within a target's staging directory (for rotate).
-pub fn target_newkeyfile(index: usize) -> String {
-    format!("{}/newkey", target_tmpfs_dir(index))
-}
-
 // ---------- shell ----------
 pub const SSH_KEY_TYPE: &str = "ssh-ed25519";
 pub const ENV_PREFIX: &[u8] = b"ltv-envelope:v1:";
