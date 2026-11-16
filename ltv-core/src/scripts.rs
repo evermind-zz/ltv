@@ -12,8 +12,6 @@ pub const LTV_COMMIT_HOOK: &str = include_str!("scripts/deploy/ltv-commit-hook.s
 pub const DEPLOY_SH: &str = include_str!("scripts/deploy/deploy.sh");
 pub const DEPLOY_NOPATCH_SH: &str = include_str!("scripts/deploy/deploy_nopatch.sh");
 
-use crate::model::Profile;
-
 /// Render deploy.sh with kernel version.
 pub fn render_deploy_sh(kernel_version: &str) -> String {
     DEPLOY_SH.replace("{kernel_version}", kernel_version)

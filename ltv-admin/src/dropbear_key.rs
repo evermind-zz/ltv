@@ -1,6 +1,7 @@
+use crate::fingerprint_sha256;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use rand::rngs::OsRng;
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 
 /// Dropbear Ed25519 private key format (matches dropbear's buf_put_ed25519_priv_key):
 /// - 4 bytes: length of "ssh-ed25519" (11, big-endian)
@@ -95,14 +96,6 @@ pub fn ssh_ed25519_public_key_blob(verifying_key: &VerifyingKey) -> Vec<u8> {
         b.extend_from_slice(part);
     }
     b
-}
-
-/// Compute SHA256 fingerprint of SSH public key blob (matches fingerprint_sha256 in ltv-core)
-pub fn fingerprint_sha256(blob: &[u8]) -> String {
-    use sha2::{Sha256, Digest};
-    use base64::Engine;
-    let hash = Sha256::digest(blob);
-    format!("SHA256:{}", base64::engine::general_purpose::STANDARD_NO_PAD.encode(hash))
 }
 
 #[cfg(test)]
