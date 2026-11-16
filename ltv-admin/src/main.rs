@@ -1,5 +1,5 @@
 use std::{fs, path::PathBuf, env};
-use ltv_core::{format::Argon2Params, model::{Profile, TargetMeta, fingerprint_sha256, HostKey, SecretPayload, ExecutionMode}, net::{fetch_host_key, fetch_luks_info, probe, unlock, ProbeResult}, vault::{Vault, ssh_ed25519_blob}, enroll::EnrollEvent, rotate::RotateEvent, scripts::{render_deploy_sh, render_deploy_nopatch_sh, LTV_FILES, LTV_MODULES, LTV_PACKAGES, LTV_LUKS_WRAPPER, LTV_PATCH_INIT, LTV_COMMIT_HOOK}};
+use ltv_core::{format::Argon2Params, model::{Profile, TargetMeta, HostKey, SecretPayload, ExecutionMode}, net::{fetch_host_key, fetch_luks_info, probe, unlock, ProbeResult}, vault::{Vault, ssh_ed25519_blob}, enroll::EnrollEvent, rotate::RotateEvent, scripts::{render_deploy_sh, render_deploy_nopatch_sh, LTV_FILES, LTV_MODULES, LTV_PACKAGES, LTV_LUKS_WRAPPER, LTV_PATCH_INIT, LTV_COMMIT_HOOK}};
 use std::path::Path;
 use rustyline::{error::ReadlineError, DefaultEditor};
 use secrecy::{ExposeSecret};
@@ -8,10 +8,12 @@ use base64::Engine;
 use ed25519_dalek::SigningKey;
 
 mod constants;
+mod dropbear_key;
 mod error;
 mod util;
 
 use constants::*;
+use dropbear_key::{generate_ed25519_keypair, write_dropbear_ed25519_private_key, ssh_ed25519_public_key_blob, fingerprint_sha256};
 use error::{AdminError, AdminResult};
 use util::*;
 
@@ -156,67 +158,36 @@ async fn cmd_server_setup(st: &mut State, name: &str, args: &[&str]) -> AdminRes
     let key_path = deploy_dir.join("dropbear_ed25519_host_key");
     let pub_key_path = deploy_dir.join("dropbear_ed25519_host_key.pub");
 
-    // Generate Dropbear host keypair LOCALLY using dropbearkey binary
-    // Native dropbear format (83 bytes) with correct magic ensures russh connects
-    println!("Generating dropbear host key locally using dropbearkey...");
-    let key_path_str = key_path.to_str().ok_or_else(|| AdminError::InvalidArgument("invalid key path: not valid UTF-8".into()))?;
-    let output = std::process::Command::new("dropbearkey")
-        .args(["-t", "ed25519", "-f", key_path_str])
-        .output()
-        .map_err(|e| AdminError::Io(e))?;
+    // Generate Dropbear host keypair LOCALLY using native Rust implementation
+    // Native dropbear format ensures russh connects
+    println!("Generating dropbear host key locally...");
+    let signing_key = generate_ed25519_keypair();
 
-    if !output.status.success() {
-        return Err(AdminError::InvalidArgument(format!("dropbearkey failed: {}", String::from_utf8_lossy(&output.stderr))));
-    }
-    let gen_out = String::from_utf8_lossy(&output.stdout);
-    for line in gen_out.lines() {
-        if !line.starts_with("Generating") { println!("{}", line); }
-    }
+    // Write private key in Dropbear format
+    let mut key_file = fs::File::create(&key_path).map_err(AdminError::Io)?;
+    write_dropbear_ed25519_private_key(&mut key_file, &signing_key).map_err(AdminError::Io)?;
 
-    // Extract public key locally
-    let output = std::process::Command::new("dropbearkey")
-        .args(["-y", "-f", key_path_str])
-        .output()
-        .map_err(|e| AdminError::Io(e))?;
-
-    if !output.status.success() {
-        return Err(AdminError::InvalidArgument(format!("dropbearkey -y failed: {}", String::from_utf8_lossy(&output.stderr))));
-    }
-    let pub_output = String::from_utf8_lossy(&output.stdout);
-    for line in pub_output.lines() {
-        if !line.starts_with("Generating") { println!("{}", line); }
-    }
-
-    // Parse public key line
-    let pub_key_line = pub_output.lines()
-        .find(|l| l.starts_with("ssh-ed25519 "))
-        .ok_or_else(|| AdminError::InvalidArgument("no public key in dropbearkey output".into()))?;
-    let pub_key_parts: Vec<&str> = pub_key_line.split_whitespace().collect();
-    let pub_b64 = pub_key_parts.get(1).ok_or_else(|| AdminError::InvalidArgument("invalid public key format".into()))?;
-    let host_key_public_bytes_full = base64::engine::general_purpose::STANDARD.decode(pub_b64)
-        .map_err(|e| AdminError::InvalidArgument(format!("invalid base64 in public key: {e}")))?;
-
-    // host_key_public_bytes_full is the full SSH wire format (51 bytes):
-    // 4 bytes len("ssh-ed25519") + 11 bytes "ssh-ed25519" + 4 bytes len(pubkey) + 32 bytes pubkey
-    // This matches what russh presents via PublicKey::public_key_bytes() and what dropbearkey fingerprint uses.
-
-    // Compute fingerprint on FULL 51-byte blob (matches dropbearkey output)
-    let fp = fingerprint_sha256(&host_key_public_bytes_full);
-    println!("Pin unlock SSH host key fingerprint: {}", fp);
-
+    // Set permissions on private key
     use std::os::unix::fs::PermissionsExt;
     let mut perms = fs::metadata(&key_path).map_err(AdminError::Io)?.permissions();
     perms.set_mode(0o600);
     fs::set_permissions(&key_path, perms).map_err(AdminError::Io)?;
 
+    // Generate public key in SSH wire format (51 bytes)
+    let verifying_key = signing_key.verifying_key();
+    let host_key_public_bytes = ssh_ed25519_public_key_blob(&verifying_key);
+
+    // Compute fingerprint on FULL 51-byte blob (matches dropbearkey output)
+    let fp = fingerprint_sha256(&host_key_public_bytes);
+    println!("Pin unlock SSH host key fingerprint: {}", fp);
+
     // Write public key in authorized_keys format locally
-    fs::write(&pub_key_path, pub_key_line).map_err(AdminError::Io)?;
+    let pub_b64 = base64::engine::general_purpose::STANDARD.encode(verifying_key.as_bytes());
+    let pub_key_line = format!("ssh-ed25519 {} ltv:{}", pub_b64, p.name);
+    fs::write(&pub_key_path, &pub_key_line).map_err(AdminError::Io)?;
     let mut perms = fs::metadata(&pub_key_path).map_err(AdminError::Io)?.permissions();
     perms.set_mode(0o644);
     fs::set_permissions(&pub_key_path, perms).map_err(AdminError::Io)?;
-
-    // Store FULL 51-byte SSH wire format in vault (matches russh presented key)
-    let host_key_public_bytes = host_key_public_bytes_full;
 
     // Always pin the freshly generated unlock SSH host key (overwrite any stale value)
     v.set_host_key(&p.uuid, HostKey {
