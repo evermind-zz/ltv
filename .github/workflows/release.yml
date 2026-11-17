@@ -72,9 +72,10 @@ jobs:
           else
             cp target/release/ltv-admin staging/
           fi
-          # Include license and readme
+          # Include license, readme, and docs
           cp LICENSE staging/ 2>/dev/null || echo "No LICENSE file found"
           cp README.md staging/ 2>/dev/null || echo "No README.md found"
+          cp -r docs staging/ 2>/dev/null || echo "No docs directory found"
 
           tar -czf "${TARBALL}" -C staging .
           sha256sum "${TARBALL}" > "${TARBALL}.sha256"
