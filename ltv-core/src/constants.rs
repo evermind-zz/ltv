@@ -92,5 +92,10 @@ pub const KEYFILE_SIZE: usize = 64;
 /// Minimum exec timeout for LUKS operations (PBKDF is slow).
 pub const MIN_EXEC_TIMEOUT_SECS: u16 = 60;
 
+/// Returns a formatted per-target error context (e.g., "target-0", "target-1").
+pub fn target_error_fmt(idx: usize) -> String {
+    format!("target-{}", idx)
+}
+
 // ---------- script builder fragments ----------
 pub const TMPFS_CREATE: &str = "sh -c 'mkdir -p /run/ltv && umask 077 && cat >";

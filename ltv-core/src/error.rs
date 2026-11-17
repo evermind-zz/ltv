@@ -75,6 +75,22 @@ impl std::fmt::Display for HostKeyMismatchError {
 
 impl std::error::Error for HostKeyMismatchError {}
 
+impl From<String> for UnlockError {
+    fn from(s: String) -> Self {
+        UnlockError::CryptsetupFailed {
+            target: "unknown".into(),
+            code: 0,
+            stderr: s,
+        }
+    }
+}
+
+impl From<&str> for UnlockError {
+    fn from(s: &str) -> Self {
+        UnlockError::from(s.to_string())
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum UnlockError {
     #[error(transparent)]

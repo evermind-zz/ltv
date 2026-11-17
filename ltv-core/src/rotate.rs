@@ -15,25 +15,23 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 use crate::{
-    constants::*,
+    constants::{CMD_LUKS_KILL_SLOT, CRYPTSETUP, KEYFILE_SIZE},
     error::*,
-    luks::*,
-    model::{BootedAccess, ExecutionMode, TargetMeta},
-    net::*,
+    execution::{run_execution, ExecutionStrategy, TargetInput, VerboseCb},
+    luks::{find_existing_slot, resolve_device},
+    luks_ops::{add_key_to_slot, find_or_pick_slot, stage_passphrase_and_key, verify_key},
+    model::{BootedAccess, ExecutionMode, SecretPayload, TargetMeta},
+    net::{connect_and_auth, exec, Hk},
     vault::Vault,
 };
 use rand::RngCore;
 use russh::client;
-use secrecy::{ExposeSecret, SecretString};
+use secrecy::SecretString;
+use std::sync::Arc;
 use std::time::Duration;
-
-/// Type alias for the verbose callback used throughout the module
-type VerboseCb = Option<Box<dyn FnMut(&str) + Send>>;
 
 /// Type alias for the per-target save callback
 type PerTargetSaveCb<'a> = Option<&'a mut dyn FnMut(&mut Vault) -> Result<(), UnlockError>>;
-use futures::stream::{FuturesUnordered, StreamExt};
-use tokio::sync::{mpsc, Semaphore};
 
 #[derive(Debug, Clone)]
 pub enum RotateEvent {
@@ -78,6 +76,7 @@ pub struct RotateResult {
 /// Result of the SSH-side portion of rotating one target. The vault update and
 /// old-slot removal happen after this, so the vault is never mutated from
 /// concurrent tasks.
+#[derive(Debug, Clone)]
 struct RotateSshResult {
     target: TargetMeta,
     dev: String,
@@ -86,195 +85,202 @@ struct RotateSshResult {
     new_keyfile: Vec<u8>,
 }
 
-/// Adds a freshly generated key to a free slot and verifies it. Shared by the
-/// sequential and parallel drivers. Returns `Ok(None)` for a skipped target.
-#[allow(clippy::too_many_arguments)]
-async fn rotate_one(
-    idx: usize,
-    tm: &TargetMeta,
-    session: &client::Handle<Hk>,
-    current_keyfile: &[u8],
-    passphrase: &mut dyn FnMut(&str) -> Result<SecretString, String>,
-    sudo: &str,
-    t: Duration,
-    log: &mut dyn FnMut(&str),
-    emit: &mut dyn FnMut(RotateEvent),
-) -> Result<Option<RotateSshResult>, UnlockError> {
-    emit(RotateEvent::TargetStart(tm.mapped_name.clone()));
+/// Rotation execution strategy implementing the shared framework.
+struct RotateStrategy {
+    secrets: Arc<SecretPayload>,
+}
 
-    // 0. Resolve device (try UUID, then fallback)
-    let dev = resolve_device(session, tm, sudo, t, log).await?;
-
-    // 1. Find current slot (where our key lives)
-    let old_slot = match find_existing_slot(session, &dev, current_keyfile, sudo, t, log).await? {
-        Some(slot) => slot,
-        None => {
-            emit(RotateEvent::Skipped(
-                tm.mapped_name.clone(),
-                "current key not found in any slot".into(),
-            ));
-            return Ok(None);
-        }
-    };
-    emit(RotateEvent::OldSlotFound(tm.mapped_name.clone(), old_slot));
-
-    // 2. Generate new keyfile
-    let mut new_keyfile = vec![0u8; KEYFILE_SIZE];
-    rand::rngs::OsRng.fill_bytes(&mut new_keyfile);
-
-    // 3. Get passphrase for this target
-    let luks_pass = passphrase(&tm.luks_uuid).map_err(|e| UnlockError::CryptsetupFailed {
-        target: tm.mapped_name.clone(),
-        code: 0,
-        stderr: e,
-    })?;
-
-    // 4. Pick free slot for new key
-    let cmd = format!("{sudo}{CRYPTSETUP} {CMD_LUKS_DUMP} {dev}");
-    log(&cmd);
-    let dump = exec(session, &cmd, None, t).await?;
-    if dump.code != 0 {
-        log(&format!(
-            "! cmd={} exit={} stderr: {}",
-            cmd,
-            dump.code,
-            dump.stderr.trim()
-        ));
-        emit(RotateEvent::Skipped(
-            tm.mapped_name.clone(),
-            format!("luksDump failed: {}", dump.stderr.trim()),
-        ));
-        return Ok(None);
-    }
-    let used = parse_used_slots(&dump.stdout);
-    let new_slot = first_free(&used).ok_or_else(|| UnlockError::CryptsetupFailed {
-        target: tm.mapped_name.clone(),
-        code: 0,
-        stderr: "no free keyslot".into(),
-    })?;
-    emit(RotateEvent::SlotChosen(tm.mapped_name.clone(), new_slot));
-
-    // 5. Stage existing passphrase in a per-target tmpfs file
-    let passfile = target_passfile(idx);
-    let newkeyfile = target_newkeyfile(idx);
-    tmpfs_stage(
-        session,
-        &passfile,
-        luks_pass.expose_secret().as_bytes(),
-        sudo,
-        t,
-    )
-    .await
-    .map_err(|e| UnlockError::CryptsetupFailed {
-        target: tm.mapped_name.clone(),
-        code: 0,
-        stderr: format!("stage passphrase: {e}"),
-    })?;
-
-    // 6. Stage new key in a per-target tmpfs file
-    tmpfs_stage(session, &newkeyfile, &new_keyfile, sudo, t)
-        .await
-        .map_err(|e| UnlockError::CryptsetupFailed {
-            target: tm.mapped_name.clone(),
-            code: 0,
-            stderr: format!("stage keyfile: {e}"),
-        })?;
-
-    // 7. Add new key to free slot
-    let cmd = format!("{sudo}{CRYPTSETUP} {CMD_LUKS_ADD_KEY} {ARG_KEY_FILE}={passfile} {ARG_NEW_KEY_FILE}={newkeyfile} {ARG_KEY_SLOT} {new_slot} {dev}");
-    log(&cmd);
-    let add = exec(session, &cmd, None, t).await;
-
-    // 8. Always clean up tmpfs
-    let _ = tmpfs_cleanup(session, &[&passfile, &newkeyfile], sudo, t).await;
-
-    let add = add?;
-    if add.code != 0 {
-        log(&format!(
-            "! cmd={} exit={} stderr: {}",
-            cmd,
-            add.code,
-            add.stderr.trim()
-        ));
-        match add.code {
-            2 => {
-                return Err(UnlockError::KeyRejected(format!(
-                    "{}: existing passphrase wrong",
-                    tm.mapped_name
-                )))
-            }
-            c => {
-                return Err(UnlockError::CryptsetupFailed {
-                    target: tm.mapped_name.clone(),
-                    code: c,
-                    stderr: add.stderr,
-                })
-            }
+impl RotateStrategy {
+    fn new(secrets: SecretPayload) -> Self {
+        Self {
+            secrets: Arc::new(secrets),
         }
     }
-    emit(RotateEvent::SlotAdded(tm.mapped_name.clone(), new_slot));
+}
 
-    // 9. Verify new key
-    let cmd = format!("{sudo}{CRYPTSETUP} {CMD_LUKS_OPEN} {ARG_TEST_PASSPHRASE} {ARG_KEY_FILE}=- {ARG_KEY_SLOT} {new_slot} {dev}");
-    log(&cmd);
-    let verify = exec(session, &cmd, Some(&new_keyfile), t).await?;
-    if verify.code != 0 {
-        log(&format!(
-            "! cmd={} exit={} stderr: {}",
-            cmd,
-            verify.code,
-            verify.stderr.trim()
-        ));
-        return Err(UnlockError::CryptsetupFailed {
-            target: tm.mapped_name.clone(),
-            code: verify.code,
-            stderr: format!("verification failed: {}", verify.stderr),
-        });
+impl ExecutionStrategy for RotateStrategy {
+    type Event = RotateEvent;
+    type Result = RotateSshResult;
+    type Error = UnlockError;
+    type Session = Arc<client::Handle<Hk>>;
+
+    async fn initialize(
+        &self,
+        vault: &Vault,
+        uuid: &[u8; 16],
+        access: &BootedAccess,
+    ) -> Result<(Self::Session, Vec<TargetInput>), Self::Error> {
+        let p = vault.profile(uuid)?.clone();
+        let os_key = p.os_host_key.clone().ok_or(UnlockError::HostKeyNotPinned)?;
+
+        // Resolve OS address (fallback to unlock SSH address if not set)
+        let os_host = p.os_host.as_deref().unwrap_or(&p.unlock_host);
+        let os_port = p.os_port.unwrap_or(p.unlock_port);
+
+        // Connect and authenticate using the shared helper.
+        let (s, _) = connect_and_auth(
+            os_host,
+            os_port,
+            access.connect_timeout_s,
+            Some(os_key),
+            &access.username,
+            &access.auth,
+        )
+        .await?;
+
+        // Build target inputs
+        let targets: Vec<TargetInput> = p
+            .targets_meta
+            .iter()
+            .enumerate()
+            .map(|(i, tm)| TargetInput {
+                index: i,
+                target: tm.clone(),
+            })
+            .collect();
+
+        Ok((Arc::new(s), targets))
     }
-    emit(RotateEvent::Verified(tm.mapped_name.clone()));
 
-    Ok(Some(RotateSshResult {
-        target: tm.clone(),
-        dev,
-        old_slot,
-        new_slot,
-        new_keyfile,
-    }))
-}
+    async fn execute_one(
+        &self,
+        input: TargetInput,
+        session: &Self::Session,
+        passphrase: &SecretString,
+        sudo: &str,
+        timeout: Duration,
+        log: &mut dyn FnMut(&str),
+        emit: &mut dyn FnMut(Self::Event),
+    ) -> Result<Option<Self::Result>, Self::Error> {
+        let tm = &input.target;
+        let idx = input.index;
 
-/// Persist the new keyfile/slot in the vault, then remove the old slot.
-async fn finish_rotate(
-    vault: &mut Vault,
-    uuid: &[u8; 16],
-    r: RotateSshResult,
-) -> Result<RotateResult, UnlockError> {
-    // 10. Update vault with new keyfile and slot, then SAVE atomically
-    vault
-        .rotate_keyfile(uuid, &r.target.luks_uuid, r.new_keyfile.clone(), r.new_slot)
-        .map_err(UnlockError::Vault)?;
-    vault.save().map_err(UnlockError::Vault)?;
+        emit(RotateEvent::TargetStart(tm.mapped_name.clone()));
 
-    Ok(RotateResult {
-        luks_uuid: r.target.luks_uuid,
-        old_keyslot: r.old_slot,
-        new_keyslot: r.new_slot,
-    })
-}
+        // 0. Resolve device (try UUID, then fallback)
+        let dev = resolve_device(session, tm, sudo, timeout, log).await?;
 
-/// Message emitted from a parallel rotate task back to the driver loop.
-enum RotateMsg {
-    Event(RotateEvent),
-    Verbose(String),
-}
+        // 1. Find current slot (where our key lives)
+        let keyfile = self
+            .secrets
+            .keyfiles
+            .iter()
+            .find(|k| k.luks_uuid == tm.luks_uuid)
+            .ok_or(VaultError::Invariant("missing keyfile"))?;
 
-fn emit_rotate_msg(msg: RotateMsg, on: &mut impl FnMut(RotateEvent), verbose: &mut VerboseCb) {
-    match msg {
-        RotateMsg::Event(e) => on(e),
-        RotateMsg::Verbose(s) => {
+        let old_slot =
+            match find_existing_slot(session, &dev, &keyfile.keyfile, sudo, timeout, log).await? {
+                Some(slot) => slot,
+                None => {
+                    emit(RotateEvent::Skipped(
+                        tm.mapped_name.clone(),
+                        "current key not found in any slot".into(),
+                    ));
+                    return Ok(None);
+                }
+            };
+        emit(RotateEvent::OldSlotFound(tm.mapped_name.clone(), old_slot));
+
+        // 2. Generate new keyfile
+        let mut new_keyfile = vec![0u8; KEYFILE_SIZE];
+        rand::rngs::OsRng.fill_bytes(&mut new_keyfile);
+
+        // 3. Pick free slot for new key
+        let slot_info =
+            find_or_pick_slot(session, &dev, Some(&keyfile.keyfile), sudo, timeout, log).await?;
+        let new_slot = slot_info.slot;
+        emit(RotateEvent::SlotChosen(tm.mapped_name.clone(), new_slot));
+
+        // 4. Stage passphrase and keyfile to tmpfs
+        let (passfile, newkeyfile) =
+            stage_passphrase_and_key(session, idx, passphrase, &new_keyfile, sudo, timeout).await?;
+
+        // 5. Add new key to free slot
+        add_key_to_slot(
+            session,
+            &dev,
+            &passfile,
+            &newkeyfile,
+            new_slot,
+            sudo,
+            timeout,
+            log,
+        )
+        .await?;
+
+        emit(RotateEvent::SlotAdded(tm.mapped_name.clone(), new_slot));
+
+        // 6. Verify new key
+        verify_key(session, &dev, &new_keyfile, new_slot, sudo, timeout, log).await?;
+
+        emit(RotateEvent::Verified(tm.mapped_name.clone()));
+
+        Ok(Some(RotateSshResult {
+            target: tm.clone(),
+            dev,
+            old_slot,
+            new_slot,
+            new_keyfile,
+        }))
+    }
+
+    async fn finish_one(
+        &self,
+        vault: &mut Vault,
+        uuid: &[u8; 16],
+        r: Self::Result,
+        session: &Self::Session,
+        sudo: &str,
+        timeout: Duration,
+        emit: &mut dyn FnMut(Self::Event),
+        verbose: &mut VerboseCb,
+    ) -> Result<Self::Result, Self::Error> {
+        // 10. Update vault with new keyfile and slot, then SAVE atomically
+        vault
+            .rotate_keyfile(uuid, &r.target.luks_uuid, r.new_keyfile.clone(), r.new_slot)
+            .map_err(UnlockError::Vault)?;
+        vault.save().map_err(UnlockError::Vault)?;
+
+        // 11. Kill old slot
+        let dev = &r.dev;
+        let old_slot = r.old_slot;
+        let cmd = format!("{sudo}{CRYPTSETUP} {CMD_LUKS_KILL_SLOT} {dev} {old_slot}");
+        if let Some(v) = verbose.as_mut() {
+            v(&cmd);
+        }
+        let kill = exec(session, &cmd, None, timeout).await?;
+        if kill.code != 0 {
             if let Some(v) = verbose.as_mut() {
-                v(&s);
+                v(&format!(
+                    "! {} failed: exit {}: {}",
+                    CMD_LUKS_KILL_SLOT,
+                    kill.code,
+                    kill.stderr.trim()
+                ));
             }
+        } else {
+            emit(RotateEvent::OldSlotKilled(
+                r.target.mapped_name.clone(),
+                old_slot,
+            ));
         }
+
+        Ok(r)
+    }
+
+    fn on_target_filtered(&self, filter: &str, emit: &mut dyn FnMut(Self::Event)) {
+        emit(RotateEvent::Skipped(
+            "--target".into(),
+            format!("no target matches filter '{}'", filter),
+        ));
+    }
+
+    fn on_done(&self, emit: &mut dyn FnMut(Self::Event)) {
+        emit(RotateEvent::Done);
+    }
+
+    fn force_sequential(&self) -> bool {
+        true // Paranoid rotation: force sequential mode for safety
     }
 }
 
@@ -291,268 +297,57 @@ pub async fn rotate_key(
     uuid: &[u8; 16],
     access: &BootedAccess,
     mode: ExecutionMode,
-    passphrase_provider: impl FnMut(&str) -> Result<SecretString, String>,
+    passphrase_provider: impl FnMut(&str) -> Result<SecretString, String> + Send,
     only_target: Option<&str>,
     mut on: impl FnMut(RotateEvent),
-    mut verbose: VerboseCb,
+    verbose: VerboseCb,
     mut per_target_save: PerTargetSaveCb<'_>,
 ) -> Result<Vec<RotateResult>, UnlockError> {
     let p = vault.profile(uuid)?.clone();
-    let os_key = p.os_host_key.clone().ok_or(UnlockError::HostKeyNotPinned)?;
+    let secrets = vault.open_secrets(&p)?;
+    let strategy = RotateStrategy::new(secrets);
 
-    // Resolve OS address (fallback to unlock SSH address if not set)
-    let os_host = p.os_host.as_deref().unwrap_or(&p.unlock_host);
-    let os_port = p.os_port.unwrap_or(p.unlock_port);
-
-    // Connect and authenticate using the shared helper.
-    let (s, _) = connect_and_auth(
-        os_host,
-        os_port,
-        access.connect_timeout_s,
-        Some(os_key),
-        &access.username,
-        &access.auth,
+    // Convert the results from SSH-side (RotateSshResult) to public API (RotateResult)
+    let ssh_results = run_execution(
+        vault,
+        uuid,
+        access,
+        mode,
+        passphrase_provider,
+        only_target,
+        &strategy,
+        &mut on,
+        verbose,
+        per_target_save
+            .as_mut()
+            .map(|f| f as &mut dyn FnMut(&mut Vault) -> Result<(), UnlockError>),
     )
     .await?;
-    on(RotateEvent::Connected);
-    on(RotateEvent::Authenticated);
 
-    let sudo = if access.use_sudo && access.username != "root" {
-        "sudo -n "
-    } else {
-        ""
-    };
-    let t = Duration::from_secs(p.exec_timeout_s.max(MIN_EXEC_TIMEOUT_SECS) as u64);
-    let secrets = vault.open_secrets(&p)?;
-
-    let targets: Vec<(usize, TargetMeta)> = p
-        .targets_meta
-        .iter()
-        .enumerate()
-        .filter(|(_, tm)| only_target.is_none_or(|f| f == tm.luks_uuid || f == tm.mapped_name))
-        .map(|(i, tm)| (i, tm.clone()))
+    let results: Vec<RotateResult> = ssh_results
+        .into_iter()
+        .map(|r| RotateResult {
+            luks_uuid: r.target.luks_uuid,
+            old_keyslot: r.old_slot,
+            new_keyslot: r.new_slot,
+        })
         .collect();
 
-    let mut results: Vec<RotateResult> = Vec::new();
-
-    match mode {
-        ExecutionMode::Sequential => {
-            let mut pass = make_sequential_passphrase_provider(passphrase_provider);
-            for (idx, tm) in &targets {
-                let current_key = secrets
-                    .keyfiles
-                    .iter()
-                    .find(|k| k.luks_uuid == tm.luks_uuid)
-                    .ok_or(VaultError::Invariant("missing keyfile"))?;
-
-                let mut log = |s: &str| {
-                    if let Some(v) = verbose.as_mut() {
-                        v(s);
-                    }
-                };
-                let mut emit = |e: RotateEvent| on(e);
-
-                let done = rotate_one(
-                    *idx,
-                    tm,
-                    &s,
-                    &current_key.keyfile,
-                    &mut pass,
-                    sudo,
-                    t,
-                    &mut log,
-                    &mut emit,
-                )
-                .await?;
-                let Some(done) = done else { continue };
-
-                let dev = done.dev.clone();
-                let old_slot = done.old_slot;
-                let name = done.target.mapped_name.clone();
-                let res = finish_rotate(vault, uuid, done).await?;
-
-                // Persist vault to disk before killing old slot (paranoid mode)
-                if let Some(save_fn) = per_target_save.as_mut() {
-                    save_fn(vault)?;
-                }
-
-                // 11. Kill old slot
-                let cmd = format!("{sudo}{CRYPTSETUP} {CMD_LUKS_KILL_SLOT} {dev} {old_slot}");
-                if let Some(v) = verbose.as_mut() {
-                    v(&cmd);
-                }
-                let kill = exec(&s, &cmd, None, t).await?;
-                if kill.code != 0 {
-                    if let Some(v) = verbose.as_mut() {
-                        v(&format!(
-                            "! luksKillSlot failed: exit {}: {}",
-                            kill.code,
-                            kill.stderr.trim()
-                        ));
-                    }
-                } else {
-                    on(RotateEvent::OldSlotKilled(name, old_slot));
-                }
-
-                results.push(res);
-            }
-        }
-        ExecutionMode::Parallel => {
-            // Fetch every needed passphrase up front (provider is FnMut).
-            let pass_map = make_parallel_passphrase_map(&targets, passphrase_provider)?;
-
-            if let Some(v) = verbose.as_mut() {
-                v(&format!("running {} target(s) in parallel", targets.len()));
-            }
-
-            let semaphore = Semaphore::new(MAX_CONCURRENT_TARGETS);
-            let (tx, mut rx) = mpsc::unbounded_channel::<RotateMsg>();
-
-            let mut futs: FuturesUnordered<_> = targets
-                .iter()
-                .map(|(idx, tm)| {
-                    let idx = *idx;
-                    let tx = tx.clone();
-                    let sem = &semaphore;
-                    let pass = pass_map.get(&tm.luks_uuid).cloned();
-                    let s = &s;
-                    let secrets = &secrets;
-                    async move {
-                        let _permit = sem.acquire().await;
-                        let res: Result<Option<RotateSshResult>, UnlockError> = async {
-                            let key = secrets
-                                .keyfiles
-                                .iter()
-                                .find(|k| k.luks_uuid == tm.luks_uuid)
-                                .ok_or(VaultError::Invariant("missing keyfile"))?;
-                            let pass = pass.ok_or(VaultError::Invariant("missing passphrase"))?;
-                            let mut log = |s: &str| {
-                                let _ = tx.send(RotateMsg::Verbose(s.to_string()));
-                            };
-                            let mut emit = |e: RotateEvent| {
-                                let _ = tx.send(RotateMsg::Event(e));
-                            };
-                            let mut provider =
-                                |_: &str| -> Result<SecretString, String> { Ok(pass.clone()) };
-                            rotate_one(
-                                idx,
-                                tm,
-                                s,
-                                &key.keyfile,
-                                &mut provider,
-                                sudo,
-                                t,
-                                &mut log,
-                                &mut emit,
-                            )
-                            .await
-                        }
-                        .await;
-                        res
-                    }
-                })
-                .collect();
-
-            let mut first_err: Option<UnlockError> = None;
-            let mut completed: Vec<RotateSshResult> = Vec::new();
-            let mut pending = targets.len();
-
-            while pending > 0 {
-                tokio::select! {
-                    biased;
-                    Some(msg) = rx.recv() => emit_rotate_msg(msg, &mut on, &mut verbose),
-                    Some(res) = futs.next() => {
-                        pending -= 1;
-                        match res {
-                            Ok(Some(r)) => completed.push(r),
-                            Ok(None) => {}
-                            Err(e) => { if first_err.is_none() { first_err = Some(e); } }
-                        }
-                    }
-                }
-            }
-
-            while let Ok(msg) = rx.try_recv() {
-                emit_rotate_msg(msg, &mut on, &mut verbose);
-            }
-
-            // Persist successful rotations in target order, then remove old slots.
-            completed.sort_by_key(|r| {
-                targets
-                    .iter()
-                    .position(|(_, tm)| tm.luks_uuid == r.target.luks_uuid)
-                    .unwrap_or(usize::MAX)
-            });
-            for done in completed {
-                let dev = done.dev.clone();
-                let old_slot = done.old_slot;
-                let name = done.target.mapped_name.clone();
-                let res = finish_rotate(vault, uuid, done).await?;
-
-                let cmd = format!("{sudo}{CRYPTSETUP} {CMD_LUKS_KILL_SLOT} {dev} {old_slot}");
-                if let Some(v) = verbose.as_mut() {
-                    v(&cmd);
-                }
-                match exec(&s, &cmd, None, t).await {
-                    Ok(kill) if kill.code != 0 => {
-                        if let Some(v) = verbose.as_mut() {
-                            v(&format!(
-                                "! {} failed: exit {}: {}",
-                                CMD_LUKS_KILL_SLOT,
-                                kill.code,
-                                kill.stderr.trim()
-                            ));
-                        }
-                    }
-                    Ok(_) => on(RotateEvent::OldSlotKilled(name, old_slot)),
-                    Err(e) => {
-                        if let Some(v) = verbose.as_mut() {
-                            v(&format!("! {} error: {e}", CMD_LUKS_KILL_SLOT));
-                        }
-                    }
-                }
-
-                results.push(res);
-            }
-
-            if let Some(e) = first_err {
-                return Err(e);
-            }
-        }
-    }
-
-    if let Some(f) = only_target {
-        if targets.is_empty() {
-            on(RotateEvent::Skipped(
-                "--target".into(),
-                format!("no target matches filter '{}'", f),
-            ));
-        }
-    }
-
-    results.sort_by_key(|r| {
-        targets
-            .iter()
-            .position(|(_, tm)| tm.luks_uuid == r.luks_uuid)
-            .unwrap_or(usize::MAX)
-    });
-
-    drop(secrets);
-    on(RotateEvent::Done);
     Ok(results)
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
     #[test]
     fn parse_luks2_slots() {
         let d = "LUKS header information\nVersion: 2\nKeyslots:\n  0: luks2\n\tKey: 512 bits\n  3: luks2\nTokens:\nDigests:\n  0: pbkdf2\n";
-        assert_eq!(parse_used_slots(d), vec![0, 3]);
-        assert_eq!(first_free(&[0, 3]), Some(1));
+        assert_eq!(crate::luks::parse_used_slots(d), vec![0, 3]);
+        assert_eq!(crate::luks::first_free(&[0, 3]), Some(1));
     }
     #[test]
     fn parse_luks1_slots() {
         let d = "Key Slot 0: ENABLED\nKey Slot 1: DISABLED\nKey Slot 2: ENABLED\n";
-        assert_eq!(parse_used_slots(d), vec![0, 2]);
+        assert_eq!(crate::luks::parse_used_slots(d), vec![0, 2]);
     }
 }

@@ -17,10 +17,14 @@
 pub mod constants;
 pub mod crypto;
 pub mod error;
+pub mod execution;
 pub mod format;
 pub mod luks;
+pub mod luks_ops;
 pub mod model;
 pub mod net;
+pub mod parallel;
+pub mod passphrase;
 pub mod scripts;
 pub mod vault;
 
@@ -29,12 +33,16 @@ pub mod enroll;
 #[cfg(feature = "write")]
 pub mod rotate;
 
+#[cfg(feature = "write")]
 pub use enroll::{enroll, EnrollEvent, EnrollResult};
 pub use error::{NetError, UnlockError, VaultError};
+#[cfg(feature = "write")]
+pub use luks_ops::{add_key_to_slot, find_or_pick_slot, kill_slot, verify_key, SlotInfo};
 pub use model::{BootedAccess, BootedAuth, *};
 pub use net::{
     fetch_host_key, fetch_luks_info, probe, unlock, FetchedLuksInfo, ProbeResult, UnlockEvent,
 };
+#[cfg(feature = "write")]
 pub use rotate::{rotate_key, RotateEvent, RotateResult};
 pub use scripts::{
     render_deploy_nopatch_sh, render_deploy_sh, DEPLOY_NOPATCH_SH, DEPLOY_SH, LTV_FILES,

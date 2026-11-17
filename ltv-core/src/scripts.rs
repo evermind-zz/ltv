@@ -42,7 +42,7 @@ pub fn render_deploy_nopatch_sh(kernel_version: &str) -> String {
 mod tests {
     use super::*;
     use crate::{
-        constants::*,
+        constants::{DEFAULT_SSH_PORT, NONCE_LEN},
         model::{Profile, TargetMeta},
     };
     use uuid::Uuid;

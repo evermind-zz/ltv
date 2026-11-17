@@ -15,21 +15,18 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 use crate::{
-    constants::*,
     error::*,
-    luks::*,
-    model::{BootedAccess, ExecutionMode, TargetMeta},
-    net::*,
+    execution::{run_execution, ExecutionStrategy, TargetInput, VerboseCb},
+    luks::{find_existing_slot, resolve_device},
+    luks_ops::{add_key_to_slot, find_or_pick_slot, stage_passphrase_and_key, verify_key},
+    model::{BootedAccess, ExecutionMode, SecretPayload, TargetMeta},
+    net::{connect_and_auth, Hk},
     vault::Vault,
 };
 use russh::client;
-use secrecy::{ExposeSecret, SecretString};
+use secrecy::SecretString;
+use std::sync::Arc;
 use std::time::Duration;
-
-/// Type alias for the verbose callback used throughout the module
-type VerboseCb = Option<Box<dyn FnMut(&str) + Send>>;
-use futures::stream::{FuturesUnordered, StreamExt};
-use tokio::sync::{mpsc, Semaphore};
 
 #[derive(Debug, Clone)]
 pub enum EnrollEvent {
@@ -66,181 +63,162 @@ pub struct EnrollResult {
     pub keyslot: u8,
 }
 
-/// Enrolls one target's keyfile into its LUKS header. Shared by sequential and
-/// parallel drivers. Uses per-target tmpfs staging paths so parallel targets
-/// never collide. Returns `Ok(None)` for a target that was skipped.
-#[allow(clippy::too_many_arguments)]
-async fn enroll_one(
-    idx: usize,
-    tm: &TargetMeta,
-    session: &client::Handle<Hk>,
-    keyfile: &[u8],
-    passphrase: &mut dyn FnMut(&str) -> Result<SecretString, String>,
-    sudo: &str,
-    t: Duration,
-    log: &mut dyn FnMut(&str),
-    emit: &mut dyn FnMut(EnrollEvent),
-) -> Result<Option<EnrollResult>, UnlockError> {
-    emit(EnrollEvent::TargetStart(tm.mapped_name.clone()));
+/// Result of the SSH-side portion of enrolling one target.
+#[derive(Debug, Clone)]
+struct EnrollSshResult {
+    target: TargetMeta,
+    keyslot: u8,
+}
 
-    // 0. Resolve device (try UUID, then fallback)
-    let dev = resolve_device(session, tm, sudo, t, log).await?;
+/// Enrollment execution strategy implementing the shared framework.
+struct EnrollStrategy {
+    secrets: Arc<SecretPayload>,
+}
 
-    // 1. Check if our key is already enrolled in any slot
-    if let Some(existing_slot) = find_existing_slot(session, &dev, keyfile, sudo, t, log).await? {
-        emit(EnrollEvent::SlotChosen(
-            tm.mapped_name.clone(),
-            existing_slot,
-        ));
-        emit(EnrollEvent::SlotUpdated(
-            tm.mapped_name.clone(),
-            existing_slot,
-        ));
-        emit(EnrollEvent::Verified(tm.mapped_name.clone()));
-        return Ok(Some(EnrollResult {
-            luks_uuid: tm.luks_uuid.clone(),
-            keyslot: existing_slot,
-        }));
-    }
-
-    // 2. Pick a free slot: dump LUKS header
-    let cmd = format!("{sudo}{CRYPTSETUP} {CMD_LUKS_DUMP} {dev}");
-    log(&cmd);
-    let dump = exec(session, &cmd, None, t).await?;
-    if dump.code != 0 {
-        log(&format!(
-            "! cmd={} exit={} stderr: {}",
-            cmd,
-            dump.code,
-            dump.stderr.trim()
-        ));
-        emit(EnrollEvent::Skipped(
-            tm.mapped_name.clone(),
-            format!("luksDump failed: {}", dump.stderr.trim()),
-        ));
-        return Ok(None);
-    }
-    let used = parse_used_slots(&dump.stdout);
-    let slot = match tm.keyslot {
-        Some(k) if !used.contains(&k) => k,
-        _ => first_free(&used).ok_or_else(|| UnlockError::CryptsetupFailed {
-            target: tm.mapped_name.clone(),
-            code: 0,
-            stderr: "no free keyslot".into(),
-        })?,
-    };
-    emit(EnrollEvent::SlotChosen(tm.mapped_name.clone(), slot));
-
-    // 3. Get passphrase for this target
-    let luks_pass = passphrase(&tm.luks_uuid).map_err(|e| UnlockError::CryptsetupFailed {
-        target: tm.mapped_name.clone(),
-        code: 0,
-        stderr: e,
-    })?;
-
-    // 4. Stage existing passphrase in a per-target tmpfs file
-    let passfile = target_passfile(idx);
-    let newkeyfile = target_newkeyfile(idx);
-    let stage_pass_cmd =
-        format!("{sudo}sh -c 'umask {UMASK_TMPFS} && mkdir -p {TMPFS_BASE} && cat > {passfile}'");
-    log(&stage_pass_cmd);
-    tmpfs_stage(
-        session,
-        &passfile,
-        luks_pass.expose_secret().as_bytes(),
-        sudo,
-        t,
-    )
-    .await
-    .map_err(|e| UnlockError::CryptsetupFailed {
-        target: tm.mapped_name.clone(),
-        code: 0,
-        stderr: format!("stage passphrase: {e}"),
-    })?;
-
-    // 5. Stage new key in a per-target tmpfs file
-    let stage_key_cmd = format!("{sudo}sh -c 'umask {UMASK_TMPFS} && cat > {newkeyfile}'");
-    log(&stage_key_cmd);
-    tmpfs_stage(session, &newkeyfile, keyfile, sudo, t)
-        .await
-        .map_err(|e| UnlockError::CryptsetupFailed {
-            target: tm.mapped_name.clone(),
-            code: 0,
-            stderr: format!("stage keyfile: {e}"),
-        })?;
-
-    // 6. Add key using both tmpfs files
-    let cmd = format!("{sudo}{CRYPTSETUP} {CMD_LUKS_ADD_KEY} {ARG_KEY_FILE}={passfile} {ARG_NEW_KEY_FILE}={newkeyfile} {ARG_KEY_SLOT} {slot} {dev}");
-    log(&cmd);
-    let add = exec(session, &cmd, None, t).await;
-
-    // 7. Always clean up tmpfs
-    let _ = tmpfs_cleanup(session, &[&passfile, &newkeyfile], sudo, t).await;
-
-    let add = add?;
-    if add.code != 0 {
-        log(&format!(
-            "! cmd={} exit={} stderr: {}",
-            cmd,
-            add.code,
-            add.stderr.trim()
-        ));
-    }
-    match add.code {
-        0 => emit(EnrollEvent::SlotAdded(tm.mapped_name.clone(), slot)),
-        2 => {
-            return Err(UnlockError::KeyRejected(format!(
-                "{}: existing passphrase wrong",
-                tm.mapped_name
-            )))
+impl EnrollStrategy {
+    fn new(secrets: SecretPayload) -> Self {
+        Self {
+            secrets: Arc::new(secrets),
         }
-        c => {
-            return Err(UnlockError::CryptsetupFailed {
-                target: tm.mapped_name.clone(),
-                code: c,
-                stderr: add.stderr,
+    }
+}
+
+impl ExecutionStrategy for EnrollStrategy {
+    type Event = EnrollEvent;
+    type Result = EnrollSshResult;
+    type Error = UnlockError;
+    type Session = Arc<client::Handle<Hk>>;
+
+    async fn initialize(
+        &self,
+        vault: &Vault,
+        uuid: &[u8; 16],
+        access: &BootedAccess,
+    ) -> Result<(Self::Session, Vec<TargetInput>), Self::Error> {
+        let p = vault.profile(uuid)?.clone();
+        let os_key = p.os_host_key.clone().ok_or(UnlockError::HostKeyNotPinned)?;
+
+        // Resolve OS address (fallback to unlock SSH address if not set)
+        let os_host = p.os_host.as_deref().unwrap_or(&p.unlock_host);
+        let os_port = p.os_port.unwrap_or(p.unlock_port);
+
+        // Connect and authenticate using the shared helper.
+        let (s, _) = connect_and_auth(
+            os_host,
+            os_port,
+            access.connect_timeout_s,
+            Some(os_key),
+            &access.username,
+            &access.auth,
+        )
+        .await?;
+
+        // Build target inputs
+        let targets: Vec<TargetInput> = p
+            .targets_meta
+            .iter()
+            .enumerate()
+            .map(|(i, tm)| TargetInput {
+                index: i,
+                target: tm.clone(),
             })
-        }
+            .collect();
+
+        Ok((Arc::new(s), targets))
     }
 
-    // 8. Verify with the new key itself (--test-passphrase doesn't open the device)
-    let cmd = format!("{sudo}{CRYPTSETUP} {CMD_LUKS_OPEN} {ARG_TEST_PASSPHRASE} {ARG_KEY_FILE}=- {ARG_KEY_SLOT} {slot} {dev}");
-    log(&cmd);
-    let verify = exec(session, &cmd, Some(keyfile), t).await?;
-    if verify.code != 0 {
-        log(&format!(
-            "! cmd={} exit={} stderr: {}",
-            cmd,
-            verify.code,
-            verify.stderr.trim()
+    async fn execute_one(
+        &self,
+        input: TargetInput,
+        session: &Self::Session,
+        passphrase: &SecretString,
+        sudo: &str,
+        timeout: Duration,
+        log: &mut dyn FnMut(&str),
+        emit: &mut dyn FnMut(Self::Event),
+    ) -> Result<Option<Self::Result>, Self::Error> {
+        let tm = &input.target;
+        let idx = input.index;
+
+        emit(EnrollEvent::TargetStart(tm.mapped_name.clone()));
+
+        // 0. Resolve device (try UUID, then fallback)
+        let dev = resolve_device(session, tm, sudo, timeout, log).await?;
+
+        // 1. Check if our key is already enrolled in any slot
+        let keyfile = self
+            .secrets
+            .keyfiles
+            .iter()
+            .find(|k| k.luks_uuid == tm.luks_uuid)
+            .ok_or(VaultError::Invariant("missing keyfile"))?;
+
+        if let Some(existing_slot) =
+            find_existing_slot(session, &dev, &keyfile.keyfile, sudo, timeout, log).await?
+        {
+            emit(EnrollEvent::SlotChosen(
+                tm.mapped_name.clone(),
+                existing_slot,
+            ));
+            emit(EnrollEvent::SlotUpdated(
+                tm.mapped_name.clone(),
+                existing_slot,
+            ));
+            emit(EnrollEvent::Verified(tm.mapped_name.clone()));
+            return Ok(Some(EnrollSshResult {
+                target: tm.clone(),
+                keyslot: existing_slot,
+            }));
+        }
+
+        // 2. Pick a free slot (or use pre-assigned keyslot if available and free)
+        let slot_info = find_or_pick_slot(session, &dev, None, sudo, timeout, log).await?;
+        let slot = match tm.keyslot {
+            Some(k) if k == slot_info.slot => k,
+            Some(_) => slot_info.slot, // pre-assigned slot not free, use the one we found
+            None => slot_info.slot,
+        };
+        emit(EnrollEvent::SlotChosen(tm.mapped_name.clone(), slot));
+
+        // 3. Stage passphrase and keyfile to tmpfs
+        let (passfile, newkeyfile) =
+            stage_passphrase_and_key(session, idx, passphrase, &keyfile.keyfile, sudo, timeout)
+                .await?;
+
+        // 4. Add key to slot
+        add_key_to_slot(
+            session,
+            &dev,
+            &passfile,
+            &newkeyfile,
+            slot,
+            sudo,
+            timeout,
+            log,
+        )
+        .await?;
+
+        emit(EnrollEvent::SlotAdded(tm.mapped_name.clone(), slot));
+
+        // 5. Verify with the new key itself
+        verify_key(session, &dev, &keyfile.keyfile, slot, sudo, timeout, log).await?;
+
+        emit(EnrollEvent::Verified(tm.mapped_name.clone()));
+        Ok(Some(EnrollSshResult {
+            target: tm.clone(),
+            keyslot: slot,
+        }))
+    }
+
+    fn on_target_filtered(&self, filter: &str, emit: &mut dyn FnMut(Self::Event)) {
+        emit(EnrollEvent::Skipped(
+            "--target".into(),
+            format!("no target matches filter '{}'", filter),
         ));
-        return Err(UnlockError::CryptsetupFailed {
-            target: tm.mapped_name.clone(),
-            code: verify.code,
-            stderr: format!("verification failed: {}", verify.stderr),
-        });
     }
-    emit(EnrollEvent::Verified(tm.mapped_name.clone()));
-    Ok(Some(EnrollResult {
-        luks_uuid: tm.luks_uuid.clone(),
-        keyslot: slot,
-    }))
-}
 
-/// Message emitted from a parallel enroll task back to the driver loop.
-enum EnrollMsg {
-    Event(EnrollEvent),
-    Verbose(String),
-}
-
-fn emit_enroll_msg(msg: EnrollMsg, on: &mut impl FnMut(EnrollEvent), verbose: &mut VerboseCb) {
-    match msg {
-        EnrollMsg::Event(e) => on(e),
-        EnrollMsg::Verbose(s) => {
-            if let Some(v) = verbose.as_mut() {
-                v(&s);
-            }
-        }
+    fn on_done(&self, emit: &mut dyn FnMut(Self::Event)) {
+        emit(EnrollEvent::Done);
     }
 }
 
@@ -250,191 +228,41 @@ fn emit_enroll_msg(msg: EnrollMsg, on: &mut impl FnMut(EnrollEvent), verbose: &m
 /// If `verbose` is provided, it will be called with each command executed on the target.
 #[allow(clippy::too_many_arguments)]
 pub async fn enroll(
-    vault: &Vault,
+    vault: &mut Vault,
     uuid: &[u8; 16],
     access: &BootedAccess,
     mode: ExecutionMode,
-    passphrase_provider: impl FnMut(&str) -> Result<SecretString, String>,
+    passphrase_provider: impl FnMut(&str) -> Result<SecretString, String> + Send,
     only_target: Option<&str>,
     mut on: impl FnMut(EnrollEvent),
-    mut verbose: VerboseCb,
+    verbose: VerboseCb,
 ) -> Result<Vec<EnrollResult>, UnlockError> {
     let p = vault.profile(uuid)?.clone();
-    let os_key = p.os_host_key.clone().ok_or(UnlockError::HostKeyNotPinned)?;
+    let secrets = vault.open_secrets(&p)?;
+    let strategy = EnrollStrategy::new(secrets);
 
-    // Resolve OS address (fallback to unlock SSH address if not set)
-    let os_host = p.os_host.as_deref().unwrap_or(&p.unlock_host);
-    let os_port = p.os_port.unwrap_or(p.unlock_port);
-
-    // Connect and authenticate using the shared helper.
-    let (s, _) = connect_and_auth(
-        os_host,
-        os_port,
-        access.connect_timeout_s,
-        Some(os_key),
-        &access.username,
-        &access.auth,
+    let ssh_results = run_execution(
+        vault,
+        uuid,
+        access,
+        mode,
+        passphrase_provider,
+        only_target,
+        &strategy,
+        &mut on,
+        verbose,
+        None::<&mut dyn FnMut(&mut Vault) -> Result<(), UnlockError>>,
     )
     .await?;
-    on(EnrollEvent::Connected);
-    on(EnrollEvent::Authenticated);
 
-    let sudo = if access.use_sudo && access.username != "root" {
-        "sudo -n "
-    } else {
-        ""
-    };
-    let t = Duration::from_secs(p.exec_timeout_s.max(MIN_EXEC_TIMEOUT_SECS) as u64);
-    let secrets = vault.open_secrets(&p)?;
-
-    // Apply target filter up front.
-    let targets: Vec<(usize, TargetMeta)> = p
-        .targets_meta
-        .iter()
-        .enumerate()
-        .filter(|(_, tm)| only_target.is_none_or(|f| f == tm.luks_uuid || f == tm.mapped_name))
-        .map(|(i, tm)| (i, tm.clone()))
+    let results: Vec<EnrollResult> = ssh_results
+        .into_iter()
+        .map(|r| EnrollResult {
+            luks_uuid: r.target.luks_uuid,
+            keyslot: r.keyslot,
+        })
         .collect();
 
-    let mut results = Vec::new();
-
-    match mode {
-        ExecutionMode::Sequential => {
-            let mut pass = make_sequential_passphrase_provider(passphrase_provider);
-            for (idx, tm) in &targets {
-                let key = secrets
-                    .keyfiles
-                    .iter()
-                    .find(|k| k.luks_uuid == tm.luks_uuid)
-                    .ok_or(VaultError::Invariant("missing keyfile"))?;
-
-                let mut log = |s: &str| {
-                    if let Some(v) = verbose.as_mut() {
-                        v(s);
-                    }
-                };
-                let mut emit = |e: EnrollEvent| on(e);
-
-                if let Some(r) = enroll_one(
-                    *idx,
-                    tm,
-                    &s,
-                    &key.keyfile,
-                    &mut pass,
-                    sudo,
-                    t,
-                    &mut log,
-                    &mut emit,
-                )
-                .await?
-                {
-                    results.push(r);
-                }
-            }
-        }
-        ExecutionMode::Parallel => {
-            // Fetch every needed passphrase up front (provider is FnMut, called once here).
-            let pass_map = make_parallel_passphrase_map(&targets, passphrase_provider)?;
-
-            if let Some(v) = verbose.as_mut() {
-                v(&format!("running {} target(s) in parallel", targets.len()));
-            }
-
-            let semaphore = Semaphore::new(MAX_CONCURRENT_TARGETS);
-            let (tx, mut rx) = mpsc::unbounded_channel::<EnrollMsg>();
-
-            let mut futs: FuturesUnordered<_> = targets
-                .iter()
-                .map(|(idx, tm)| {
-                    let idx = *idx;
-                    let tx = tx.clone();
-                    let sem = &semaphore;
-                    let pass = pass_map.get(&tm.luks_uuid).cloned();
-                    let s = &s;
-                    let secrets = &secrets;
-                    async move {
-                        let _permit = sem.acquire().await;
-                        let res: Result<Option<EnrollResult>, UnlockError> = async {
-                            let key = secrets
-                                .keyfiles
-                                .iter()
-                                .find(|k| k.luks_uuid == tm.luks_uuid)
-                                .ok_or(VaultError::Invariant("missing keyfile"))?;
-                            let pass = pass.ok_or(VaultError::Invariant("missing passphrase"))?;
-                            let mut log = |s: &str| {
-                                let _ = tx.send(EnrollMsg::Verbose(s.to_string()));
-                            };
-                            let mut emit = |e: EnrollEvent| {
-                                let _ = tx.send(EnrollMsg::Event(e));
-                            };
-                            let mut provider =
-                                |_: &str| -> Result<SecretString, String> { Ok(pass.clone()) };
-                            enroll_one(
-                                idx,
-                                tm,
-                                s,
-                                &key.keyfile,
-                                &mut provider,
-                                sudo,
-                                t,
-                                &mut log,
-                                &mut emit,
-                            )
-                            .await
-                        }
-                        .await;
-                        res
-                    }
-                })
-                .collect();
-
-            let mut first_err: Option<UnlockError> = None;
-            let mut pending = targets.len();
-
-            while pending > 0 {
-                tokio::select! {
-                    biased;
-                    Some(msg) = rx.recv() => emit_enroll_msg(msg, &mut on, &mut verbose),
-                    Some(res) = futs.next() => {
-                        pending -= 1;
-                        match res {
-                            Ok(Some(r)) => results.push(r),
-                            Ok(None) => {}
-                            Err(e) => { if first_err.is_none() { first_err = Some(e); } }
-                        }
-                    }
-                }
-            }
-
-            while let Ok(msg) = rx.try_recv() {
-                emit_enroll_msg(msg, &mut on, &mut verbose);
-            }
-
-            if let Some(e) = first_err {
-                return Err(e);
-            }
-        }
-    }
-
-    if let Some(f) = only_target {
-        if targets.is_empty() {
-            on(EnrollEvent::Skipped(
-                "--target".into(),
-                format!("no target matches filter '{}'", f),
-            ));
-        }
-    }
-
-    // Sort results by original target order for deterministic output.
-    results.sort_by_key(|r| {
-        targets
-            .iter()
-            .position(|(_, tm)| tm.luks_uuid == r.luks_uuid)
-            .unwrap_or(usize::MAX)
-    });
-
-    drop(secrets);
-    on(EnrollEvent::Done);
     Ok(results)
 }
 
@@ -444,12 +272,12 @@ mod tests {
     #[test]
     fn parse_luks2_slots() {
         let d = "LUKS header information\nVersion: 2\nKeyslots:\n  0: luks2\n\tKey: 512 bits\n  3: luks2\nTokens:\nDigests:\n  0: pbkdf2\n";
-        assert_eq!(parse_used_slots(d), vec![0, 3]);
-        assert_eq!(first_free(&[0, 3]), Some(1));
+        assert_eq!(crate::luks::parse_used_slots(d), vec![0, 3]);
+        assert_eq!(crate::luks::first_free(&[0, 3]), Some(1));
     }
     #[test]
     fn parse_luks1_slots() {
         let d = "Key Slot 0: ENABLED\nKey Slot 1: DISABLED\nKey Slot 2: ENABLED\n";
-        assert_eq!(parse_used_slots(d), vec![0, 2]);
+        assert_eq!(crate::luks::parse_used_slots(d), vec![0, 2]);
     }
 }

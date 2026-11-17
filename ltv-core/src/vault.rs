@@ -403,6 +403,7 @@ pub fn ssh_ed25519_blob(pk: &[u8; 32]) -> Vec<u8> {
 mod tests {
     use super::*;
     use crate::format::{FIXED_LEN, SLOT_LEN};
+    use crate::model::TargetMeta;
 
     fn fast() -> Argon2Params {
         Argon2Params {

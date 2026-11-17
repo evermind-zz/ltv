@@ -63,7 +63,7 @@ impl PartialEq for HostKey {
 }
 impl Eq for HostKey {}
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Debug, Default, Serialize, Deserialize, Clone)]
 pub struct TargetMeta {
     pub luks_uuid: String,
     pub fallback_path: Option<String>,
