@@ -1,3 +1,19 @@
+// LTV (LUKS Tunnel Vault) - Remote LUKS unlock over SSH
+// Copyright (C) 2024 LTV Contributors
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
 use std::{fs, path::PathBuf, env};
 use ltv_core::{constants::DEFAULT_SSH_PORT, format::Argon2Params, model::{Profile, TargetMeta, HostKey, SecretPayload, ExecutionMode, fingerprint_sha256}, net::{fetch_host_key, fetch_luks_info, probe, unlock, ProbeResult}, vault::{Vault, ssh_ed25519_blob}, enroll::EnrollEvent, rotate::RotateEvent, scripts::{render_deploy_sh, render_deploy_nopatch_sh, LTV_FILES, LTV_MODULES, LTV_PACKAGES, LTV_LUKS_WRAPPER, LTV_PATCH_INIT, LTV_COMMIT_HOOK}};
 use std::path::Path;
