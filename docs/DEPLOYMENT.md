@@ -11,18 +11,32 @@ in the `ltv-admin` binary - run `server-setup <profile>` to generate them.
 - Root access for deployment
 - Network connectivity during boot (DHCP or static)
 
+## Target Server Runtime Dependencies
+
+The following packages must be available on the target Alpine server **at boot time** (in the initramfs). They are included via the `ltv` feature files and the base Alpine feature:
+
+| Package / Binary | Purpose | Provided By |
+|------------------|---------|-------------|
+| `cryptsetup` | LUKS unlock (`luksOpen`, `luksAddKey`, `luksKillSlot`, `luksDump`, `isLuks`) | `cryptsetup` (Alpine base) |
+| `lvm` | manage LVM volumes (optional) | `apk add lvm2` (included via `lvm.files`) |
+| `dropbear` | SSH server in initramfs for remote unlock | `apk add dropbear` (included via `ltv.files`) |
+| `blkid` | Verify LUKS UUID at unlock time | `apk add blkid` |
+| `nlplug-findfs` | Device discovery & mdev integration | `mkinitfs` (Alpine base) |
+| `pidof`, `kill`, `sleep` | Process management in wrapper | `busybox` (Alpine base) |
+| `awk` | Initramfs patch script | `busybox` (Alpine base) |
+
+**Note**: `cryptsetup`, `busybox`, and `mkinitfs` are part of the standard Alpine base system. Only `dropbear` needs to be explicitly added via the `ltv` feature (handled automatically by `ltv.files`). Optionally if you need `lvm` you need to include it via `lvm` feature too.
+
 ## Deployment Artifacts
 
 `server-setup <profile> --out ./deploy-<profile>` generates:
 
 ```
 deploy-<profile>/
-├── ltv.files                     # Feature file list -> /etc/mkinitfs/features.d/
-├── ltv.modules                   # Kernel modules (empty - uses cryptsetup feature)
-├── ltv.packages                  # APK packages: dropbear
+├── ltv.files                     # ltv feature: files to be included in initramfs
 ├── ltv-luks-wrapper.sh           # Replaces nlplug-findfs, starts Dropbear, waits for resume
 ├── ltv-patch-init.sh             # Idempotent patcher for initramfs-init
-├── ltv-commit-hook.sh            # apk commit hook for persistence across updates
+├── ltv-commit-hook.sh            # apk commit hook for persistence across mkinitfs updates
 ├── authorized_keys               # Restricted client pubkey for initramfs SSH
 ├── dropbear_ed25519_host_key     # Dropbear host private key (pre-generated)
 ├── dropbear_ed25519_host_key.pub # Dropbear host public key
@@ -91,16 +105,25 @@ mkinitfs -F "virtio base cryptsetup ltv network keymap ata ide scsi usb phy ext4
 **Important**: You must **integrate** the LTV parameters into your existing kernel command line,
 not replace it entirely. Keep your existing `root=`, `rootfstype=`, `quiet`, etc. parameters.
 
-#### Syslinux (`/etc/syslinux.conf`)
+#### Extlinux (`/etc/update-extlinux.conf`)
 
+- cryptroot: 4ab553b7-7e2f-499a-aa70-8922f41ca09d is the UUID of the luks encrypted device eg. /dev/vda2. Basically
+  it is the device where the encrypted rootfs can be found but it is not the UUID of the containing root fs device.
+- cryptdm: the mapper name (in the example case named as it is it is a lvm container.
+- root=UUID=c69c840d-92e9-45d6-8fdc-5277f1f64956 this is the actual unencrypted root fs device
+
+
+Adjust those config parameters to your setup. This is a example of using LVM inside of a luks device on a VPS.
 ```conf
-DEFAULT ltv
-LABEL ltv
-    MENU_LABEL Alpine Linux with LTV
-    LINUX /boot/vmlinuz-virt
-    INITRD /boot/initramfs-ltv-6.18.59-0-virt
-    APPEND ltv=yes ip=dhcp modules=virtio_net root=UUID=<your-rootfs-uuid> quiet
+default_kernel_opts="rootfstype=ext4 cryptroot=UUID=4ab553b7-7e2f-499a-aa70-8922f41ca09d cryptdm=cryptlvm ltv=yes ip=dhcp"
+
+root=UUID=187370eb-917e-49aa-9058-ada71452b30e
+
+# virtio_net was added as network card, your server may need a different one
+modules=virtio_net,sd-mod,usb-storage,ext4
 ```
+
+Then run `update-extlinux`
 
 #### GRUB (`/etc/default/grub`)
 
@@ -125,7 +148,7 @@ reboot
 | `ltv=yes` | Enable LTV remote unlock | **Yes** |
 | `ip=dhcp` | Configure network via DHCP in initramfs | **Yes** (for remote unlock) |
 | `ip=<static>` | Static IP config (Alpine format) | Alternative to DHCP |
-| `modules=<driver>` | Load network driver early (virtio_net, e1000, vmxnet3, etc.) | Recommended |
+| `modules=<driver>` | Load network driver early (virtio_net, e1000, vmxnet3, etc.) | **Yes** |
 
 See [Alpine `mkinitfs` docs](https://wiki.alpinelinux.org/wiki/Mkinitfs) for full network options.
 
