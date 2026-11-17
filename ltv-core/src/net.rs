@@ -14,16 +14,26 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-use std::{sync::{Arc, Mutex}, time::Duration};
-use secrecy::ExposeSecret;
 use crate::constants::*;
 use async_trait::async_trait;
 use russh::{client, ChannelMsg};
 use russh_keys::key::{KeyPair, PublicKey};
 use russh_keys::PublicKeyBase64;
+use secrecy::ExposeSecret;
+use std::{
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 use tokio::time::timeout;
 
-use crate::{error::*, model::{*, BootedAccess, BootedAuth}, vault::Vault};
+use crate::{
+    error::*,
+    model::{BootedAccess, BootedAuth, *},
+    vault::Vault,
+};
+
+/// Type alias for the verbose callback used throughout the module
+type VerboseCb = Option<Box<dyn FnMut(&str) + Send>>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProbeResult {
@@ -36,9 +46,14 @@ pub enum ProbeResult {
 
 #[derive(Debug, Clone)]
 pub enum UnlockEvent {
-    Connecting, HostKeyVerified, Authenticated,
-    TargetStart(String), TargetDone(String), TargetAlreadyOpen(String),
-    ResumeSent, Disconnected,
+    Connecting,
+    HostKeyVerified,
+    Authenticated,
+    TargetStart(String),
+    TargetDone(String),
+    TargetAlreadyOpen(String),
+    ResumeSent,
+    Disconnected,
 }
 
 impl std::fmt::Display for UnlockEvent {
@@ -59,14 +74,23 @@ impl std::fmt::Display for UnlockEvent {
 pub(crate) type Seen = Arc<Mutex<Option<HostKey>>>;
 
 /// Captures the presented host key. If `expected` is Some, only that key is accepted.
-pub(crate) struct Hk { pub expected: Option<HostKey>, pub seen: Seen }
+pub(crate) struct Hk {
+    pub expected: Option<HostKey>,
+    pub seen: Seen,
+}
 
 #[async_trait]
 impl client::Handler for Hk {
     type Error = russh::Error;
     async fn check_server_key(&mut self, key: &PublicKey) -> Result<bool, Self::Error> {
-        let k = HostKey { key_type: key.name().to_string(), key_bytes: key.public_key_bytes() };
-        let ok = match &self.expected { None => true, Some(e) => e == &k };
+        let k = HostKey {
+            key_type: key.name().to_string(),
+            key_bytes: key.public_key_bytes(),
+        };
+        let ok = match &self.expected {
+            None => true,
+            Some(e) => e == &k,
+        };
         *self.seen.lock().unwrap() = Some(k);
         Ok(ok)
     }
@@ -80,13 +104,20 @@ pub(crate) fn cfg(connect_s: u16) -> Arc<client::Config> {
 }
 
 /// Connect with optional pinning. Returns session + the key the server presented.
-pub(crate) async fn connect(host: &str, port: u16, connect_s: u16, expected: Option<HostKey>)
-    -> Result<(client::Handle<Hk>, HostKey), UnlockError>
-{
+pub(crate) async fn connect(
+    host: &str,
+    port: u16,
+    connect_s: u16,
+    expected: Option<HostKey>,
+) -> Result<(client::Handle<Hk>, HostKey), UnlockError> {
     let seen: Seen = Arc::new(Mutex::new(None));
-    let h = Hk { expected: expected.clone(), seen: seen.clone() };
+    let h = Hk {
+        expected: expected.clone(),
+        seen: seen.clone(),
+    };
     let fut = client::connect(cfg(connect_s), (host, port), h);
-    let res = timeout(Duration::from_secs(connect_s as u64), fut).await
+    let res = timeout(Duration::from_secs(connect_s as u64), fut)
+        .await
         .map_err(|_| NetError::Timeout)?;
     let presented = seen.lock().unwrap().clone();
     match res {
@@ -95,7 +126,10 @@ pub(crate) async fn connect(host: &str, port: u16, connect_s: u16, expected: Opt
         Err(russh::Error::UnknownKey) => {
             let actual = presented.expect("key seen during kex");
             let expected = expected.expect("expected key required for mismatch");
-            Err(UnlockError::HostKeyMismatch(HostKeyMismatchError { expected, actual }))
+            Err(UnlockError::HostKeyMismatch(HostKeyMismatchError {
+                expected,
+                actual,
+            }))
         }
         Err(e) => Err(NetError::Connect(e.to_string()).into()),
     }
@@ -104,7 +138,12 @@ pub(crate) async fn connect(host: &str, port: u16, connect_s: u16, expected: Opt
 /// TOFU helper for the admin: whatever key host:port presents right now.
 pub async fn fetch_host_key(host: &str, port: u16, connect_s: u16) -> Result<HostKey, NetError> {
     match connect(host, port, connect_s, None).await {
-        Ok((s, k)) => { let _ = s.disconnect(russh::Disconnect::ByApplication, "", "en").await; Ok(k) }
+        Ok((s, k)) => {
+            let _ = s
+                .disconnect(russh::Disconnect::ByApplication, "", "en")
+                .await;
+            Ok(k)
+        }
         Err(UnlockError::Net(e)) => Err(e),
         Err(e) => Err(NetError::Ssh(e.to_string())),
     }
@@ -112,29 +151,60 @@ pub async fn fetch_host_key(host: &str, port: u16, connect_s: u16) -> Result<Hos
 
 /// Steps 1–2 only. No authentication, no secrets.
 /// If `verbose` is provided, it will be called with connection details.
-pub async fn probe(p: &Profile, mut verbose: Option<Box<dyn FnMut(&str) + Send>>) -> ProbeResult {
-    if let Some(v) = verbose.as_mut() { v(&format!("Connecting to {}:{} (timeout {}s)", p.unlock_host, p.unlock_port, p.connect_timeout_s)); }
+pub async fn probe(p: &Profile, mut verbose: VerboseCb) -> ProbeResult {
+    if let Some(v) = verbose.as_mut() {
+        v(&format!(
+            "Connecting to {}:{} (timeout {}s)",
+            p.unlock_host, p.unlock_port, p.connect_timeout_s
+        ));
+    }
     match connect(&p.unlock_host, p.unlock_port, p.connect_timeout_s, None).await {
         Err(UnlockError::Net(NetError::Timeout)) => ProbeResult::Unreachable("timeout".into()),
         Err(e) => ProbeResult::Unreachable(e.to_string()),
         Ok((s, k)) => {
-            if let Some(v) = verbose.as_mut() { v(&format!("SSH host key: {} {}", k.key_type, fingerprint_sha256(&k.key_bytes))); }
-            let _ = s.disconnect(russh::Disconnect::ByApplication, "", "en").await;
-            if p.unlock_host_key.as_ref() == Some(&k) { ProbeResult::WaitingInInitramfs }
-            else if p.os_host_key.as_ref() == Some(&k) { ProbeResult::BootedOs }
-            else { ProbeResult::UnknownHostKey(k) }
+            if let Some(v) = verbose.as_mut() {
+                v(&format!(
+                    "SSH host key: {} {}",
+                    k.key_type,
+                    fingerprint_sha256(&k.key_bytes)
+                ));
+            }
+            let _ = s
+                .disconnect(russh::Disconnect::ByApplication, "", "en")
+                .await;
+            if p.unlock_host_key.as_ref() == Some(&k) {
+                ProbeResult::WaitingInInitramfs
+            } else if p.os_host_key.as_ref() == Some(&k) {
+                ProbeResult::BootedOs
+            } else {
+                ProbeResult::UnknownHostKey(k)
+            }
         }
     }
 }
 
-pub(crate) struct ExecResult { pub code: u32, pub stdout: String, pub stderr: String }
+pub(crate) struct ExecResult {
+    pub code: u32,
+    pub stdout: String,
+    pub stderr: String,
+}
 
-pub(crate) async fn exec<Hk: russh::client::Handler>(session: &client::Handle<Hk>, cmd: &str, stdin: Option<&[u8]>, t: Duration)
-    -> Result<ExecResult, NetError>
-{
-    let mut ch = session.channel_open_session().await.map_err(|e| NetError::Ssh(e.to_string()))?;
-    ch.exec(true, cmd).await.map_err(|e| NetError::Ssh(e.to_string()))?;
-    if let Some(d) = stdin { ch.data(d).await.map_err(|e| NetError::Ssh(e.to_string()))?; }
+pub(crate) async fn exec<Hk: russh::client::Handler>(
+    session: &client::Handle<Hk>,
+    cmd: &str,
+    stdin: Option<&[u8]>,
+    t: Duration,
+) -> Result<ExecResult, NetError> {
+    let mut ch = session
+        .channel_open_session()
+        .await
+        .map_err(|e| NetError::Ssh(e.to_string()))?;
+    ch.exec(true, cmd)
+        .await
+        .map_err(|e| NetError::Ssh(e.to_string()))?;
+    if let Some(d) = stdin {
+        ch.data(d).await.map_err(|e| NetError::Ssh(e.to_string()))?;
+    }
     ch.eof().await.map_err(|e| NetError::Ssh(e.to_string()))?;
 
     let (mut out, mut err, mut code) = (Vec::new(), Vec::new(), None);
@@ -158,7 +228,9 @@ pub(crate) async fn exec<Hk: russh::client::Handler>(session: &client::Handle<Hk
 }
 
 pub(crate) fn keypair_from_seed(seed: &[u8; 32]) -> Arc<KeyPair> {
-    Arc::new(KeyPair::Ed25519(ed25519_dalek::SigningKey::from_bytes(seed)))
+    Arc::new(KeyPair::Ed25519(ed25519_dalek::SigningKey::from_bytes(
+        seed,
+    )))
 }
 
 /// Stage binary data to a tmpfs file on the remote (umask 077, mkdir -p).
@@ -176,11 +248,16 @@ pub(crate) async fn tmpfs_stage<Hk: russh::client::Handler>(
         .and_then(|p| p.to_str())
         .filter(|d| !d.is_empty())
         .unwrap_or(TMPFS_BASE);
-    let cmd = format!("{}sh -c 'umask {UMASK_TMPFS} && mkdir -p {dir} && cat > {path}'", sudo);
+    let cmd = format!(
+        "{}sh -c 'umask {UMASK_TMPFS} && mkdir -p {dir} && cat > {path}'",
+        sudo
+    );
     let r = exec(session, &cmd, Some(data), timeout).await?;
     if r.code != 0 {
         return Err(NetError::Ssh(format!(
-            "tmpfs stage failed: exit {}: {}", r.code, r.stderr.trim()
+            "tmpfs stage failed: exit {}: {}",
+            r.code,
+            r.stderr.trim()
         )));
     }
     Ok(())
@@ -194,7 +271,9 @@ pub(crate) async fn tmpfs_cleanup<Hk: russh::client::Handler>(
     sudo: &str,
     timeout: Duration,
 ) -> Result<(), NetError> {
-    if paths.is_empty() { return Ok(()); }
+    if paths.is_empty() {
+        return Ok(());
+    }
     let cmd = format!("{}rm -f {}", sudo, paths.join(" "));
     let _ = exec(session, &cmd, None, timeout).await;
     Ok(())
@@ -213,10 +292,21 @@ pub(crate) async fn connect_and_auth(
 ) -> Result<(client::Handle<Hk>, HostKey), UnlockError> {
     let (mut session, presented) = connect(host, port, connect_timeout, expected_key).await?;
     let ok = match auth {
-        BootedAuth::Password(pw) => session.authenticate_password(username, pw.expose_secret()).await,
-        BootedAuth::Ed25519Seed(seed) => session.authenticate_publickey(username, keypair_from_seed(seed)).await,
-    }.map_err(|e| NetError::Ssh(e.to_string()))?;
-    if !ok { return Err(UnlockError::AuthRejected); }
+        BootedAuth::Password(pw) => {
+            session
+                .authenticate_password(username, pw.expose_secret())
+                .await
+        }
+        BootedAuth::Ed25519Seed(seed) => {
+            session
+                .authenticate_publickey(username, keypair_from_seed(seed))
+                .await
+        }
+    }
+    .map_err(|e| NetError::Ssh(e.to_string()))?;
+    if !ok {
+        return Err(UnlockError::AuthRejected);
+    }
     Ok((session, presented))
 }
 
@@ -228,7 +318,7 @@ pub struct FetchedLuksInfo {
     pub cipher: String,
     pub key_size: u32,
     pub header_version: String,
-    pub mapper_name: Option<String>,  // active dm-crypt mapping if decrypted
+    pub mapper_name: Option<String>, // active dm-crypt mapping if decrypted
 }
 
 /// Connect to the booted OS and discover all LUKS volumes.
@@ -236,8 +326,11 @@ pub struct FetchedLuksInfo {
 /// Auth: either the client's Ed25519 key (from vault) or password via BootedAuth.
 /// If `verbose` is provided, it will be called with each command executed on the target.
 pub async fn fetch_luks_info(
-    vault: &Vault, uuid: &[u8; 16], access: &BootedAccess, _only_mapped: Option<&str>,
-    mut verbose: Option<Box<dyn FnMut(&str) + Send>>,
+    vault: &Vault,
+    uuid: &[u8; 16],
+    access: &BootedAccess,
+    _only_mapped: Option<&str>,
+    mut verbose: VerboseCb,
 ) -> Result<Vec<FetchedLuksInfo>, UnlockError> {
     let p = vault.profile(uuid)?.clone();
     let os_key = p.os_host_key.clone().ok_or(UnlockError::HostKeyNotPinned)?;
@@ -246,18 +339,43 @@ pub async fn fetch_luks_info(
     let os_host = p.os_host.as_deref().unwrap_or(&p.unlock_host);
     let os_port = p.os_port.unwrap_or(p.unlock_port);
 
-    let (mut s, _) = connect_and_auth(os_host, os_port, access.connect_timeout_s, Some(os_key), &access.username, &access.auth).await?;
+    let (s, _) = connect_and_auth(
+        os_host,
+        os_port,
+        access.connect_timeout_s,
+        Some(os_key),
+        &access.username,
+        &access.auth,
+    )
+    .await?;
 
-    let sudo = if access.use_sudo && access.username != "root" { "sudo -n " } else { "" };
+    let sudo = if access.use_sudo && access.username != "root" {
+        "sudo -n "
+    } else {
+        ""
+    };
     let t = Duration::from_secs(p.exec_timeout_s.max(30) as u64);
 
     // Find all LUKS devices via lsblk (works on Alpine with util-linux)
     let cmd = format!("{sudo}lsblk -J -o NAME,UUID,TYPE,FSTYPE,MOUNTPOINT");
-    if let Some(v) = verbose.as_mut() { v(&cmd); }
-    let r = exec(&mut s, &cmd, None, t).await?;
+    if let Some(v) = verbose.as_mut() {
+        v(&cmd);
+    }
+    let r = exec(&s, &cmd, None, t).await?;
     if r.code != 0 {
-        if let Some(v) = verbose.as_mut() { v(&format!("  [fetch] ! cmd={} exit={} stderr: {}", &cmd, r.code, r.stderr.trim())); }
-        return Err(UnlockError::CryptsetupFailed { target: "discovery".into(), code: r.code, stderr: r.stderr });
+        if let Some(v) = verbose.as_mut() {
+            v(&format!(
+                "  [fetch] ! cmd={} exit={} stderr: {}",
+                cmd,
+                r.code,
+                r.stderr.trim()
+            ));
+        }
+        return Err(UnlockError::CryptsetupFailed {
+            target: "discovery".into(),
+            code: r.code,
+            stderr: r.stderr,
+        });
     }
 
     // Parse JSON output
@@ -265,8 +383,14 @@ pub async fn fetch_luks_info(
     let json: Value = match serde_json::from_str(&r.stdout) {
         Ok(v) => v,
         Err(e) => {
-            if let Some(v) = verbose.as_mut() { v(&format!("  [fetch] JSON parse error: {}", e)); }
-            return Err(UnlockError::CryptsetupFailed { target: "discovery".into(), code: 1, stderr: format!("JSON parse: {}", e) });
+            if let Some(v) = verbose.as_mut() {
+                v(&format!("  [fetch] JSON parse error: {}", e));
+            }
+            return Err(UnlockError::CryptsetupFailed {
+                target: "discovery".into(),
+                code: 1,
+                stderr: format!("JSON parse: {}", e),
+            });
         }
     };
 
@@ -324,20 +448,39 @@ pub async fn fetch_luks_info(
 
         // Get LUKS details
         let cmd = format!("{sudo}{CRYPTSETUP} {CMD_LUKS_DUMP} UUID={}", uuid);
-        if let Some(v) = verbose.as_mut() { v(&cmd); }
-        let dump = exec(&mut s, &cmd, None, t).await?;
+        if let Some(v) = verbose.as_mut() {
+            v(&cmd);
+        }
+        let dump = exec(&s, &cmd, None, t).await?;
         if dump.code != 0 {
-            if let Some(v) = verbose.as_mut() { v(&format!("  [fetch] ! cmd={} exit={} stderr: {}", &cmd, dump.code, dump.stderr.trim())); }
+            if let Some(v) = verbose.as_mut() {
+                v(&format!(
+                    "  [fetch] ! cmd={} exit={} stderr: {}",
+                    cmd,
+                    dump.code,
+                    dump.stderr.trim()
+                ));
+            }
         } else {
             let mut cipher = String::new();
             let mut key_size = 0;
             let mut version = String::new();
             for dl in dump.stdout.lines() {
                 let dl = dl.trim();
-                if dl.starts_with("cipher:") { cipher = dl["cipher:".len()..].trim().to_string(); }
-                else if dl.starts_with("Cipher:") { cipher = dl["Cipher:".len()..].trim().to_string(); }
-                else if dl.starts_with("Key:") { key_size = dl["Key:".len()..].trim().split_whitespace().next().unwrap_or("0").to_string().parse().unwrap_or(0); }
-                else if dl.starts_with("Version:") { version = dl["Version:".len()..].trim().to_string(); }
+                if let Some(stripped) = dl.strip_prefix("cipher:") {
+                    cipher = stripped.trim().to_string();
+                } else if let Some(stripped) = dl.strip_prefix("Cipher:") {
+                    cipher = stripped.trim().to_string();
+                } else if let Some(stripped) = dl.strip_prefix("Key:") {
+                    key_size = stripped
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or("0")
+                        .parse()
+                        .unwrap_or(0);
+                } else if let Some(stripped) = dl.strip_prefix("Version:") {
+                    version = stripped.trim().to_string();
+                }
             }
             results.push(FetchedLuksInfo {
                 luks_uuid: uuid.to_string(),
@@ -350,20 +493,33 @@ pub async fn fetch_luks_info(
         }
     }
 
-    let _ = s.disconnect(russh::Disconnect::ByApplication, "done", "en").await;
+    let _ = s
+        .disconnect(russh::Disconnect::ByApplication, "done", "en")
+        .await;
     Ok(results)
 }
- 
+
 pub async fn unlock(
-    vault: &Vault, uuid: &[u8; 16], mode: ExecutionMode,
+    vault: &Vault,
+    uuid: &[u8; 16],
+    mode: ExecutionMode,
     mut on: impl FnMut(UnlockEvent),
-    mut verbose: Option<Box<dyn FnMut(&str) + Send>>,
+    mut verbose: VerboseCb,
 ) -> Result<(), UnlockError> {
     let p = vault.profile(uuid)?.clone();
-    let expected = p.unlock_host_key.clone().ok_or(UnlockError::HostKeyNotPinned)?;
+    let expected = p
+        .unlock_host_key
+        .clone()
+        .ok_or(UnlockError::HostKeyNotPinned)?;
     on(UnlockEvent::Connecting);
 
-    let connect_result = connect(&p.unlock_host, p.unlock_port, p.connect_timeout_s, Some(expected)).await;
+    let connect_result = connect(
+        &p.unlock_host,
+        p.unlock_port,
+        p.connect_timeout_s,
+        Some(expected),
+    )
+    .await;
     let (mut session, _) = match connect_result {
         Ok(r) => r,
         Err(UnlockError::HostKeyMismatch(e)) => {
@@ -378,10 +534,14 @@ pub async fn unlock(
     };
     on(UnlockEvent::HostKeyVerified);
 
-    let secrets = vault.open_secrets(&p)?;           // JIT, ZeroizeOnDrop
-    let ok = session.authenticate_publickey(&p.username, keypair_from_seed(&secrets.client_private_seed))
-        .await.map_err(|e| NetError::Ssh(e.to_string()))?;
-    if !ok { return Err(UnlockError::AuthRejected); }
+    let secrets = vault.open_secrets(&p)?; // JIT, ZeroizeOnDrop
+    let ok = session
+        .authenticate_publickey(&p.username, keypair_from_seed(&secrets.client_private_seed))
+        .await
+        .map_err(|e| NetError::Ssh(e.to_string()))?;
+    if !ok {
+        return Err(UnlockError::AuthRejected);
+    }
     on(UnlockEvent::Authenticated);
 
     let t = Duration::from_secs(p.exec_timeout_s as u64);
@@ -392,32 +552,53 @@ pub async fn unlock(
     match mode {
         ExecutionMode::Sequential => {
             for (idx, tm) in targets.iter().enumerate() {
-                process_unlock_target(idx, &mut session, tm, &secrets, sudo, t, &mut on, &mut verbose).await?;
+                process_unlock_target(idx, &session, tm, &secrets, sudo, t, &mut on, &mut verbose)
+                    .await?;
             }
         }
         ExecutionMode::Parallel => {
-            process_unlock_targets_parallel(&targets, &session, &secrets, sudo, t, &mut on, &mut verbose).await?;
+            process_unlock_targets_parallel(
+                &targets,
+                &session,
+                &secrets,
+                sudo,
+                t,
+                &mut on,
+                &mut verbose,
+            )
+            .await?;
         }
     }
 
     // Signal completion to ltv-luks-wrapper on initramfs
     let resume_cmd = "touch /run/ltv/resume";
-    if let Some(v) = verbose.as_mut() { v(&format!("  [unlock] $ {}", resume_cmd)); }
-    let r = exec(&mut session, resume_cmd, None, t).await?;
+    if let Some(v) = verbose.as_mut() {
+        v(&format!("  [unlock] $ {}", resume_cmd));
+    }
+    let r = exec(&session, resume_cmd, None, t).await?;
     if r.code != 0 {
-        if let Some(v) = verbose.as_mut() { v(&format!("  [unlock] ! cmd={} exit={} stderr: {}", resume_cmd, r.code, r.stderr.trim())); }
+        if let Some(v) = verbose.as_mut() {
+            v(&format!(
+                "  [unlock] ! cmd={} exit={} stderr: {}",
+                resume_cmd,
+                r.code,
+                r.stderr.trim()
+            ));
+        }
         return Err(UnlockError::ResumeFailed(r.stderr));
     }
     on(UnlockEvent::ResumeSent);
 
-    let _ = session.disconnect(russh::Disconnect::ByApplication, "done", "en").await;
+    let _ = session
+        .disconnect(russh::Disconnect::ByApplication, "done", "en")
+        .await;
     drop(secrets);
     on(UnlockEvent::Disconnected);
     Ok(())
 }
 
-
 /// Sequential helper: processes one target on the given session.
+#[allow(clippy::too_many_arguments)]
 async fn process_unlock_target(
     idx: usize,
     session: &client::Handle<Hk>,
@@ -426,17 +607,24 @@ async fn process_unlock_target(
     sudo: &str,
     t: Duration,
     on: &mut dyn FnMut(UnlockEvent),
-    verbose: &mut Option<Box<dyn FnMut(&str) + Send>>,
+    verbose: &mut VerboseCb,
 ) -> Result<(), UnlockError> {
     on(UnlockEvent::TargetStart(tm.mapped_name.clone()));
-    let key = secrets.keyfiles.iter().find(|k| k.luks_uuid == tm.luks_uuid)
+    let key = secrets
+        .keyfiles
+        .iter()
+        .find(|k| k.luks_uuid == tm.luks_uuid)
         .ok_or(VaultError::Invariant("missing keyfile"))?;
 
     let keyfile = target_keyfile(idx);
 
     // Stage keyfile in tmpfs (binary safe, avoids stdin newline truncation)
     if let Some(v) = verbose.as_mut() {
-        v(&format!("  [unlock] $ sh -c 'umask {UMASK_TMPFS} && mkdir -p {} && cat > {}'", target_tmpfs_dir(idx), keyfile));
+        v(&format!(
+            "  [unlock] $ sh -c 'umask {UMASK_TMPFS} && mkdir -p {} && cat > {}'",
+            target_tmpfs_dir(idx),
+            keyfile
+        ));
     }
     tmpfs_stage(session, &keyfile, &key.keyfile, sudo, t).await?;
 
@@ -449,31 +637,60 @@ async fn process_unlock_target(
     tmpfs_stage(session, &order_file, idx.to_string().as_bytes(), sudo, t).await?;
 
     // Use tmpfs file for unlock
-    let mut cmd = format!("{CRYPTSETUP} {CMD_LUKS_OPEN} {ARG_KEY_FILE}={} UUID={} {}", keyfile, tm.luks_uuid, tm.mapped_name);
-    if let Some(v) = verbose.as_mut() { v(&cmd); }
+    let mut cmd = format!(
+        "{CRYPTSETUP} {CMD_LUKS_OPEN} {ARG_KEY_FILE}={} UUID={} {}",
+        keyfile, tm.luks_uuid, tm.mapped_name
+    );
+    if let Some(v) = verbose.as_mut() {
+        v(&cmd);
+    }
     let mut r = exec(session, &cmd, None, t).await?;
     if r.code != 0 && r.stderr.to_lowercase().contains("not exist") {
         if let Some(fp) = &tm.fallback_path {
-            cmd = format!("{CRYPTSETUP} {CMD_LUKS_OPEN} {ARG_KEY_FILE}={} {} {}", keyfile, fp, tm.mapped_name);
-            if let Some(v) = verbose.as_mut() { v(&cmd); }
+            cmd = format!(
+                "{CRYPTSETUP} {CMD_LUKS_OPEN} {ARG_KEY_FILE}={} {} {}",
+                keyfile, fp, tm.mapped_name
+            );
+            if let Some(v) = verbose.as_mut() {
+                v(&cmd);
+            }
             r = exec(session, &cmd, None, t).await?;
         }
     }
     if r.code != 0 {
-        if let Some(v) = verbose.as_mut() { v(&format!("  [unlock] ! cmd={} exit={} stderr: {}", &cmd, r.code, r.stderr.trim())); }
+        if let Some(v) = verbose.as_mut() {
+            v(&format!(
+                "  [unlock] ! cmd={} exit={} stderr: {}",
+                cmd,
+                r.code,
+                r.stderr.trim()
+            ));
+        }
     }
 
     // Cleanup keyfile and metadata files
     let mapper_file = format!("{}/mapper", target_tmpfs_dir(idx));
     let uuid_file = format!("{}/uuid", target_tmpfs_dir(idx));
     let order_file = format!("{}/order", target_tmpfs_dir(idx));
-    tmpfs_cleanup(session, &[&keyfile, &mapper_file, &uuid_file, &order_file], sudo, t).await?;
+    tmpfs_cleanup(
+        session,
+        &[&keyfile, &mapper_file, &uuid_file, &order_file],
+        sudo,
+        t,
+    )
+    .await?;
 
     match r.code {
         0 => on(UnlockEvent::TargetDone(tm.mapped_name.clone())),
         2 => return Err(UnlockError::KeyRejected(tm.mapped_name.clone())),
         5 => on(UnlockEvent::TargetAlreadyOpen(tm.mapped_name.clone())),
-        c => return Err(UnlockError::CryptsetupFailed { target: tm.mapped_name.clone(), code: c, stderr: r.stderr }),
+        c => {
+            return Err(UnlockError::CryptsetupFailed {
+                target: tm.mapped_name.clone(),
+                code: c,
+                stderr: r.stderr,
+            })
+        }
     }
     Ok(())
 }
@@ -494,70 +711,114 @@ async fn process_unlock_targets_parallel(
     sudo: &str,
     t: Duration,
     on: &mut dyn FnMut(UnlockEvent),
-    verbose: &mut Option<Box<dyn FnMut(&str) + Send>>,
+    verbose: &mut VerboseCb,
 ) -> Result<(), UnlockError> {
     use futures::stream::{FuturesUnordered, StreamExt};
     use tokio::sync::{mpsc, Semaphore};
 
-    if let Some(v) = verbose.as_mut() { v(&format!("running {} target(s) in parallel", targets.len())); }
+    if let Some(v) = verbose.as_mut() {
+        v(&format!("running {} target(s) in parallel", targets.len()));
+    }
 
     let semaphore = Semaphore::new(MAX_CONCURRENT_TARGETS);
     let (tx, mut rx) = mpsc::unbounded_channel::<UnlockMsg>();
 
-    let mut futs: FuturesUnordered<_> = targets.iter().enumerate().map(|(idx, tm)| {
-        let tx = tx.clone();
-        let sem = &semaphore;
-        async move {
-            let _permit = sem.acquire().await;
-            let res: Result<(), UnlockError> = async {
-                let key = secrets.keyfiles.iter().find(|k| k.luks_uuid == tm.luks_uuid)
-                    .ok_or(VaultError::Invariant("missing keyfile"))?;
-                let keyfile = target_keyfile(idx);
+    let mut futs: FuturesUnordered<_> = targets
+        .iter()
+        .enumerate()
+        .map(|(idx, tm)| {
+            let tx = tx.clone();
+            let sem = &semaphore;
+            async move {
+                let _permit = sem.acquire().await;
+                let res: Result<(), UnlockError> = async {
+                    let key = secrets
+                        .keyfiles
+                        .iter()
+                        .find(|k| k.luks_uuid == tm.luks_uuid)
+                        .ok_or(VaultError::Invariant("missing keyfile"))?;
+                    let keyfile = target_keyfile(idx);
 
-                let stage_cmd = format!(
-                    "sh -c 'umask {UMASK_TMPFS} && mkdir -p {} && cat > {}'",
-                    target_tmpfs_dir(idx), keyfile);
-                let _ = tx.send(UnlockMsg::Verbose(stage_cmd));
-                let _ = tx.send(UnlockMsg::Event(UnlockEvent::TargetStart(tm.mapped_name.clone())));
-                tmpfs_stage(session, &keyfile, &key.keyfile, sudo, t).await?;
+                    let stage_cmd = format!(
+                        "sh -c 'umask {UMASK_TMPFS} && mkdir -p {} && cat > {}'",
+                        target_tmpfs_dir(idx),
+                        keyfile
+                    );
+                    let _ = tx.send(UnlockMsg::Verbose(stage_cmd));
+                    let _ = tx.send(UnlockMsg::Event(UnlockEvent::TargetStart(
+                        tm.mapped_name.clone(),
+                    )));
+                    tmpfs_stage(session, &keyfile, &key.keyfile, sudo, t).await?;
 
-                // Stage metadata for ltv-luks-wrapper (mapper name, uuid, order)
-                let mapper_file = format!("{}/mapper", target_tmpfs_dir(idx));
-                let uuid_file = format!("{}/uuid", target_tmpfs_dir(idx));
-                let order_file = format!("{}/order", target_tmpfs_dir(idx));
-                tmpfs_stage(session, &mapper_file, tm.mapped_name.as_bytes(), sudo, t).await?;
-                tmpfs_stage(session, &uuid_file, tm.luks_uuid.as_bytes(), sudo, t).await?;
-                tmpfs_stage(session, &order_file, idx.to_string().as_bytes(), sudo, t).await?;
+                    // Stage metadata for ltv-luks-wrapper (mapper name, uuid, order)
+                    let mapper_file = format!("{}/mapper", target_tmpfs_dir(idx));
+                    let uuid_file = format!("{}/uuid", target_tmpfs_dir(idx));
+                    let order_file = format!("{}/order", target_tmpfs_dir(idx));
+                    tmpfs_stage(session, &mapper_file, tm.mapped_name.as_bytes(), sudo, t).await?;
+                    tmpfs_stage(session, &uuid_file, tm.luks_uuid.as_bytes(), sudo, t).await?;
+                    tmpfs_stage(session, &order_file, idx.to_string().as_bytes(), sudo, t).await?;
 
-                let mut cmd = format!("{CRYPTSETUP} {CMD_LUKS_OPEN} {ARG_KEY_FILE}={} UUID={} {}", keyfile, tm.luks_uuid, tm.mapped_name);
-                let _ = tx.send(UnlockMsg::Verbose(cmd.clone()));
-                let mut r = exec(session, &cmd, None, t).await?;
-                if r.code != 0 && r.stderr.to_lowercase().contains("not exist") {
-                    if let Some(fp) = &tm.fallback_path {
-                        cmd = format!("{CRYPTSETUP} {CMD_LUKS_OPEN} {ARG_KEY_FILE}={} {} {}", keyfile, fp, tm.mapped_name);
-                        let _ = tx.send(UnlockMsg::Verbose(cmd.clone()));
-                        r = exec(session, &cmd, None, t).await?;
+                    let mut cmd = format!(
+                        "{CRYPTSETUP} {CMD_LUKS_OPEN} {ARG_KEY_FILE}={} UUID={} {}",
+                        keyfile, tm.luks_uuid, tm.mapped_name
+                    );
+                    let _ = tx.send(UnlockMsg::Verbose(cmd.clone()));
+                    let mut r = exec(session, &cmd, None, t).await?;
+                    if r.code != 0 && r.stderr.to_lowercase().contains("not exist") {
+                        if let Some(fp) = &tm.fallback_path {
+                            cmd = format!(
+                                "{CRYPTSETUP} {CMD_LUKS_OPEN} {ARG_KEY_FILE}={} {} {}",
+                                keyfile, fp, tm.mapped_name
+                            );
+                            let _ = tx.send(UnlockMsg::Verbose(cmd.clone()));
+                            r = exec(session, &cmd, None, t).await?;
+                        }
+                    }
+                    if r.code != 0 {
+                        let _ = tx.send(UnlockMsg::Verbose(format!(
+                            "! cmd={} exit={} stderr: {}",
+                            cmd,
+                            r.code,
+                            r.stderr.trim()
+                        )));
+                    }
+                    let mapper_file = format!("{}/mapper", target_tmpfs_dir(idx));
+                    let uuid_file = format!("{}/uuid", target_tmpfs_dir(idx));
+                    let order_file = format!("{}/order", target_tmpfs_dir(idx));
+                    let _ = tmpfs_cleanup(
+                        session,
+                        &[&keyfile, &mapper_file, &uuid_file, &order_file],
+                        sudo,
+                        t,
+                    )
+                    .await;
+
+                    match r.code {
+                        0 => {
+                            let _ = tx.send(UnlockMsg::Event(UnlockEvent::TargetDone(
+                                tm.mapped_name.clone(),
+                            )));
+                            Ok(())
+                        }
+                        2 => Err(UnlockError::KeyRejected(tm.mapped_name.clone())),
+                        5 => {
+                            let _ = tx.send(UnlockMsg::Event(UnlockEvent::TargetAlreadyOpen(
+                                tm.mapped_name.clone(),
+                            )));
+                            Ok(())
+                        }
+                        c => Err(UnlockError::CryptsetupFailed {
+                            target: tm.mapped_name.clone(),
+                            code: c,
+                            stderr: r.stderr,
+                        }),
                     }
                 }
-                if r.code != 0 {
-                    let _ = tx.send(UnlockMsg::Verbose(format!(
-                        "! cmd={} exit={} stderr: {}", &cmd, r.code, r.stderr.trim())));
-                }
-                let mapper_file = format!("{}/mapper", target_tmpfs_dir(idx));
-                let uuid_file = format!("{}/uuid", target_tmpfs_dir(idx));
-                let order_file = format!("{}/order", target_tmpfs_dir(idx));
-                let _ = tmpfs_cleanup(session, &[&keyfile, &mapper_file, &uuid_file, &order_file], sudo, t).await;
-
-                match r.code {
-                    0 => { let _ = tx.send(UnlockMsg::Event(UnlockEvent::TargetDone(tm.mapped_name.clone()))); Ok(()) }
-                    2 => Err(UnlockError::KeyRejected(tm.mapped_name.clone())),
-                    5 => { let _ = tx.send(UnlockMsg::Event(UnlockEvent::TargetAlreadyOpen(tm.mapped_name.clone()))); Ok(()) }
-                    c => Err(UnlockError::CryptsetupFailed { target: tm.mapped_name.clone(), code: c, stderr: r.stderr }),
-                }
-            }.await;
-            res
-        }
-    }).collect();
+                .await;
+                res
+            }
+        })
+        .collect();
 
     let mut first_err: Option<UnlockError> = None;
     let mut pending = targets.len();
@@ -582,7 +843,11 @@ async fn process_unlock_targets_parallel(
     while let Ok(msg) = rx.try_recv() {
         match msg {
             UnlockMsg::Event(e) => on(e),
-            UnlockMsg::Verbose(s) => { if let Some(v) = verbose.as_mut() { v(&s); } }
+            UnlockMsg::Verbose(s) => {
+                if let Some(v) = verbose.as_mut() {
+                    v(&s);
+                }
+            }
         }
     }
 

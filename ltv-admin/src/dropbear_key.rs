@@ -14,18 +14,19 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-use crate::fingerprint_sha256;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use rand::rngs::OsRng;
 use std::io::{self, Write};
+
+#[cfg(test)]
+use ltv_core::fingerprint_sha256;
 
 /// Dropbear Ed25519 private key format (matches dropbear's buf_put_ed25519_priv_key):
 /// - 4 bytes: length of "ssh-ed25519" (11, big-endian)
 /// - 11 bytes: "ssh-ed25519" (NO null terminator)
 /// - 4 bytes: length of private key data (64, big-endian)
 /// - 64 bytes: private key data (32 bytes seed + 32 bytes public key)
-/// Total: 83 bytes
-
+///   Total: 83 bytes
 const DROPBEAR_KEY_TYPE: &str = "ssh-ed25519";
 const DROPBEAR_KEY_TYPE_LEN: u32 = 11;
 const DROPBEAR_PRIVKEY_DATA_LEN: u32 = 64;
@@ -36,12 +37,16 @@ pub fn generate_ed25519_keypair() -> SigningKey {
 }
 
 /// Generate a deterministic Ed25519 keypair from a 32-byte seed (for testing)
+#[allow(dead_code)]
 pub fn generate_ed25519_keypair_from_seed(seed: &[u8; 32]) -> SigningKey {
     SigningKey::from_bytes(seed)
 }
 
 /// Write a Dropbear-format Ed25519 private key to a writer
-pub fn write_dropbear_ed25519_private_key<W: Write>(writer: &mut W, signing_key: &SigningKey) -> io::Result<()> {
+pub fn write_dropbear_ed25519_private_key<W: Write>(
+    writer: &mut W,
+    signing_key: &SigningKey,
+) -> io::Result<()> {
     let verifying_key = signing_key.verifying_key();
     let seed = signing_key.to_bytes();
     let pubkey = verifying_key.as_bytes();
@@ -60,6 +65,7 @@ pub fn write_dropbear_ed25519_private_key<W: Write>(writer: &mut W, signing_key:
 }
 
 /// Read a Dropbear-format Ed25519 private key from a reader
+#[allow(dead_code)]
 pub fn read_dropbear_ed25519_private_key<R: io::Read>(reader: &mut R) -> io::Result<SigningKey> {
     // Read key type length (4 bytes)
     let mut len_buf = [0u8; 4];
@@ -73,7 +79,10 @@ pub fn read_dropbear_ed25519_private_key<R: io::Read>(reader: &mut R) -> io::Res
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid key type utf-8"))?;
 
     if key_type != DROPBEAR_KEY_TYPE {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, format!("unsupported key type: {}", key_type)));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unsupported key type: {}", key_type),
+        ));
     }
 
     // Read private key data length (4 bytes)
@@ -81,7 +90,10 @@ pub fn read_dropbear_ed25519_private_key<R: io::Read>(reader: &mut R) -> io::Res
     let privkey_data_len = u32::from_be_bytes(len_buf) as usize;
 
     if privkey_data_len != DROPBEAR_PRIVKEY_DATA_LEN as usize {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, format!("unexpected private key data length: {}", privkey_data_len)));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unexpected private key data length: {}", privkey_data_len),
+        ));
     }
 
     // Read private key data (64 bytes = 32 seed + 32 public key)
@@ -97,7 +109,10 @@ pub fn read_dropbear_ed25519_private_key<R: io::Read>(reader: &mut R) -> io::Res
     let signing_key = SigningKey::from_bytes(&seed);
     let verifying_key = signing_key.verifying_key();
     if verifying_key.as_bytes() != stored_pubkey {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "public key in private key file does not match seed"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "public key in private key file does not match seed",
+        ));
     }
 
     Ok(signing_key)
@@ -134,7 +149,10 @@ mod tests {
 
         // Verify keys match
         assert_eq!(signing_key.to_bytes(), read_key.to_bytes());
-        assert_eq!(signing_key.verifying_key().as_bytes(), read_key.verifying_key().as_bytes());
+        assert_eq!(
+            signing_key.verifying_key().as_bytes(),
+            read_key.verifying_key().as_bytes()
+        );
     }
 
     #[test]
@@ -153,7 +171,10 @@ mod tests {
 
         // Verify keys match
         assert_eq!(signing_key.to_bytes(), read_key.to_bytes());
-        assert_eq!(signing_key.verifying_key().as_bytes(), read_key.verifying_key().as_bytes());
+        assert_eq!(
+            signing_key.verifying_key().as_bytes(),
+            read_key.verifying_key().as_bytes()
+        );
     }
 
     #[test]
@@ -204,7 +225,7 @@ mod tests {
         assert_eq!(&buf[0..4], &11u32.to_be_bytes());
         assert_eq!(&buf[4..15], b"ssh-ed25519");
         assert_eq!(&buf[15..19], &64u32.to_be_bytes()); // private key data length
-        
+
         // Private key data
         assert_eq!(&buf[19..51], &signing_key.to_bytes()); // seed
         assert_eq!(&buf[51..83], signing_key.verifying_key().as_bytes()); // public key
@@ -213,10 +234,10 @@ mod tests {
     #[test]
     #[ignore] // Requires dropbearkey binary in PATH
     fn test_dropbearkey_compatibility() {
+        use base64::Engine;
         use std::fs::File;
         use std::io::Write;
         use std::process::Command;
-        use base64::Engine;
 
         // Use a fixed seed for reproducible testing
         let seed = [42u8; 32];
@@ -239,29 +260,36 @@ mod tests {
             .output()
             .expect("dropbearkey not found in PATH");
 
-        assert!(output.status.success(), "dropbearkey failed: {}", String::from_utf8_lossy(&output.stderr));
+        assert!(
+            output.status.success(),
+            "dropbearkey failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         println!("dropbearkey output: {}", stdout);
 
         // Parse the public key line
-        let pub_key_line = stdout.lines()
+        let pub_key_line = stdout
+            .lines()
             .find(|l| l.starts_with("ssh-ed25519 "))
             .expect("no public key in dropbearkey output");
 
         let pub_key_parts: Vec<&str> = pub_key_line.split_whitespace().collect();
         let pub_b64 = pub_key_parts.get(1).expect("invalid public key format");
-        let actual_pubkey = base64::engine::general_purpose::STANDARD.decode(pub_b64)
+        let actual_pubkey = base64::engine::general_purpose::STANDARD
+            .decode(pub_b64)
             .expect("invalid base64 in public key");
 
         // Verify the public key matches (should be the full 51-byte SSH wire format)
         assert_eq!(actual_pubkey, expected_blob, "public key mismatch");
 
         // Parse the fingerprint line
-        let fp_line = stdout.lines()
+        let fp_line = stdout
+            .lines()
             .find(|l| l.starts_with("Fingerprint: "))
             .expect("no fingerprint in dropbearkey output");
-        
+
         let actual_fp = fp_line.strip_prefix("Fingerprint: ").unwrap().trim();
         assert_eq!(actual_fp, expected_fp, "fingerprint mismatch");
 

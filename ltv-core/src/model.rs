@@ -42,7 +42,7 @@ pub struct Profile {
     pub unlock_host_key: Option<HostKey>,
     pub os_host_key: Option<HostKey>,
     pub host_key_pinned_at: u64,
-    pub client_public_key: Vec<u8>,          // ssh wire blob
+    pub client_public_key: Vec<u8>, // ssh wire blob
     pub targets_meta: Vec<TargetMeta>,
     pub connect_timeout_s: u16,
     pub exec_timeout_s: u16,
@@ -51,7 +51,10 @@ pub struct Profile {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct HostKey { pub key_type: String, pub key_bytes: Vec<u8> }
+pub struct HostKey {
+    pub key_type: String,
+    pub key_bytes: Vec<u8>,
+}
 
 impl PartialEq for HostKey {
     fn eq(&self, other: &Self) -> bool {
@@ -71,37 +74,38 @@ pub struct TargetMeta {
 }
 
 /// Execution mode for multi-target operations (unlock, enroll, rotate).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum ExecutionMode {
     /// Process targets sequentially (one at a time)
     Sequential,
     /// Process targets in parallel (concurrent SSH channels)
+    #[default]
     Parallel,
-}
-
-impl Default for ExecutionMode {
-    fn default() -> Self { ExecutionMode::Parallel }
 }
 
 // ---------- JIT-decrypted, zeroized ----------
 #[derive(Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 pub struct SecretPayload {
-    pub client_private_seed: [u8; 32],      // Ed25519 seed
+    pub client_private_seed: [u8; 32], // Ed25519 seed
     pub keyfiles: Vec<TargetKey>,
 }
 
 #[derive(Serialize, Deserialize, Zeroize, ZeroizeOnDrop, Clone)]
-pub struct TargetKey { pub luks_uuid: String, pub keyfile: Vec<u8> }
+pub struct TargetKey {
+    pub luks_uuid: String,
+    pub keyfile: Vec<u8>,
+}
 
 pub fn fingerprint_sha256(blob: &[u8]) -> String {
     use sha2::{Digest, Sha256};
-    
+
     let d = Sha256::digest(blob);
     // base64 without padding, like OpenSSH
-    format!("SHA256:{}", base64::engine::general_purpose::STANDARD_NO_PAD.encode(d))
+    format!(
+        "SHA256:{}",
+        base64::engine::general_purpose::STANDARD_NO_PAD.encode(d)
+    )
 }
-
-
 
 /// How to reach the *booted* OS (not the initramfs) for enroll/fetch operations.
 #[derive(Debug, Clone)]

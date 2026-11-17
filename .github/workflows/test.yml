@@ -60,4 +60,4 @@ jobs:
           components: rustfmt
 
       - name: Check format
-        run: cargo fmt --check --workspace
+        run: cargo fmt --check

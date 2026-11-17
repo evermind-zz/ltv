@@ -14,14 +14,26 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-use std::{fs, path::PathBuf, env};
-use ltv_core::{constants::DEFAULT_SSH_PORT, format::Argon2Params, model::{Profile, TargetMeta, HostKey, SecretPayload, ExecutionMode, fingerprint_sha256}, net::{fetch_host_key, fetch_luks_info, probe, unlock, ProbeResult}, vault::{Vault, ssh_ed25519_blob}, enroll::EnrollEvent, rotate::RotateEvent, scripts::{render_deploy_sh, render_deploy_nopatch_sh, LTV_FILES, LTV_MODULES, LTV_PACKAGES, LTV_LUKS_WRAPPER, LTV_PATCH_INIT, LTV_COMMIT_HOOK}};
-use std::path::Path;
-use rustyline::{error::ReadlineError, DefaultEditor};
-use secrecy::{ExposeSecret};
-use getopts::Options;
 use base64::Engine;
 use ed25519_dalek::SigningKey;
+use getopts::Options;
+use ltv_core::{
+    constants::DEFAULT_SSH_PORT,
+    enroll::EnrollEvent,
+    format::Argon2Params,
+    model::{fingerprint_sha256, ExecutionMode, HostKey, Profile, SecretPayload, TargetMeta},
+    net::{fetch_host_key, fetch_luks_info, probe, unlock, ProbeResult},
+    rotate::RotateEvent,
+    scripts::{
+        render_deploy_nopatch_sh, render_deploy_sh, LTV_COMMIT_HOOK, LTV_FILES, LTV_LUKS_WRAPPER,
+        LTV_MODULES, LTV_PACKAGES, LTV_PATCH_INIT,
+    },
+    vault::{ssh_ed25519_blob, Vault},
+};
+use rustyline::{error::ReadlineError, DefaultEditor};
+use secrecy::ExposeSecret;
+use std::path::Path;
+use std::{env, fs, path::PathBuf};
 
 mod constants;
 mod dropbear_key;
@@ -29,14 +41,16 @@ mod error;
 mod util;
 
 use constants::*;
-use dropbear_key::{generate_ed25519_keypair, write_dropbear_ed25519_private_key, ssh_ed25519_public_key_blob};
+use dropbear_key::{
+    generate_ed25519_keypair, ssh_ed25519_public_key_blob, write_dropbear_ed25519_private_key,
+};
 use error::{AdminError, AdminResult};
 use util::*;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-struct State { 
-    path: Option<PathBuf>, 
+struct State {
+    path: Option<PathBuf>,
     vault: Option<Vault>,
     vault_name: Option<String>,
     verbose: bool,
@@ -74,7 +88,9 @@ fn save_atomic(st: &mut State) -> AdminResult<()> {
     let bytes = v.save().map_err(AdminError::Vault)?;
     let tmp = path.with_extension("ltv.tmp");
     fs::write(&tmp, &bytes).map_err(AdminError::Io)?;
-    if path.exists() { let _ = fs::copy(&path, path.with_extension("ltv.bak")); }
+    if path.exists() {
+        let _ = fs::copy(&path, path.with_extension("ltv.bak"));
+    }
     fs::rename(&tmp, &path).map_err(AdminError::Io)?;
     println!("saved {}", path.display());
     Ok(())
@@ -82,11 +98,17 @@ fn save_atomic(st: &mut State) -> AdminResult<()> {
 
 /// Save vault to disk given path and vault reference (for use in callbacks)
 fn save_vault_atomic(path: &Path, vault: &mut Vault) -> Result<(), ltv_core::error::UnlockError> {
-    let bytes = vault.save().map_err(|e| ltv_core::error::UnlockError::Vault(e))?;
+    let bytes = vault.save().map_err(ltv_core::error::UnlockError::Vault)?;
     let tmp = path.with_extension("ltv.tmp");
-    std::fs::write(&tmp, &bytes).map_err(|e| ltv_core::error::UnlockError::Vault(ltv_core::error::VaultError::Serde(e.to_string())))?;
-    if path.exists() { let _ = std::fs::copy(path, path.with_extension("ltv.bak")); }
-    std::fs::rename(&tmp, path).map_err(|e| ltv_core::error::UnlockError::Vault(ltv_core::error::VaultError::Serde(e.to_string())))?;
+    std::fs::write(&tmp, &bytes).map_err(|e| {
+        ltv_core::error::UnlockError::Vault(ltv_core::error::VaultError::Serde(e.to_string()))
+    })?;
+    if path.exists() {
+        let _ = std::fs::copy(path, path.with_extension("ltv.bak"));
+    }
+    std::fs::rename(&tmp, path).map_err(|e| {
+        ltv_core::error::UnlockError::Vault(ltv_core::error::VaultError::Serde(e.to_string()))
+    })?;
     println!("saved {}", path.display());
     Ok(())
 }
@@ -113,7 +135,9 @@ fn target_diff(
     live_device: &str,
 ) -> Option<TargetDiff> {
     let mapper = match live_mapper {
-        Some(new) if new != existing.mapped_name => Some((existing.mapped_name.clone(), new.to_string())),
+        Some(new) if new != existing.mapped_name => {
+            Some((existing.mapped_name.clone(), new.to_string()))
+        }
         _ => None,
     };
     let device = if existing.fallback_path.as_deref() != Some(live_device) {
@@ -124,7 +148,12 @@ fn target_diff(
     if mapper.is_none() && device.is_none() {
         None
     } else {
-        Some(TargetDiff { idx, luks_uuid: luks_uuid.to_string(), mapper, device })
+        Some(TargetDiff {
+            idx,
+            luks_uuid: luks_uuid.to_string(),
+            mapper,
+            device,
+        })
     }
 }
 
@@ -132,25 +161,54 @@ fn cmd_add(st: &mut State) -> AdminResult<()> {
     let v = require_vault_mut(st)?;
     let name = ask("Profile name: ");
     let unlock_host = ask("Unlock SSH host (IP/hostname): ");
-    let unlock_port: u16 = ask_or("Unlock SSH port", &DEFAULT_SSH_PORT.to_string()).parse().map_err(|_| AdminError::InvalidArgument("bad port".into()))?;
+    let unlock_port: u16 = ask_or("Unlock SSH port", &DEFAULT_SSH_PORT.to_string())
+        .parse()
+        .map_err(|_| AdminError::InvalidArgument("bad port".into()))?;
     let os_host = ask("OS SSH host (IP/hostname, blank = same as unlock SSH): ");
     let os_port_str = ask("OS SSH port (blank = same as unlock SSH): ");
-    let os_host = if os_host.is_empty() { None } else { Some(os_host) };
-    let os_port = if os_port_str.is_empty() { None } else { Some(os_port_str.parse().map_err(|_| AdminError::InvalidArgument("bad OS port".into()))?) };
+    let os_host = if os_host.is_empty() {
+        None
+    } else {
+        Some(os_host)
+    };
+    let os_port = if os_port_str.is_empty() {
+        None
+    } else {
+        Some(
+            os_port_str
+                .parse()
+                .map_err(|_| AdminError::InvalidArgument("bad OS port".into()))?,
+        )
+    };
     let user = ask_or("Username", "root");
     let notes = ask("Notes (optional): ");
-    let uuid = v.add_profile(&name, &unlock_host, unlock_port, &user, os_host, os_port).map_err(AdminError::Vault)?;
+    let uuid = v
+        .add_profile(&name, &unlock_host, unlock_port, &user, os_host, os_port)
+        .map_err(AdminError::Vault)?;
     if !notes.is_empty() {
-        v.update_profile(&uuid, |p| p.notes = notes.clone()).map_err(AdminError::Vault)?;
+        v.update_profile(&uuid, |p| p.notes = notes.clone())
+            .map_err(AdminError::Vault)?;
     }
     loop {
         let luks_uuid = ask("LUKS UUID (blank = done): ");
-        if luks_uuid.is_empty() { break; }
+        if luks_uuid.is_empty() {
+            break;
+        }
         let fallback = ask("Fallback device path (optional): ");
         let mapped = ask_or("Mapper name", "cryptroot");
         let order: u8 = ask_or("Order", "0").parse().unwrap_or(0);
-        let meta = TargetMeta { luks_uuid, fallback_path: if fallback.is_empty() { None } else { Some(fallback) },
-                        mapped_name: mapped, order, keyslot: None, token_id: None };
+        let meta = TargetMeta {
+            luks_uuid,
+            fallback_path: if fallback.is_empty() {
+                None
+            } else {
+                Some(fallback)
+            },
+            mapped_name: mapped,
+            order,
+            keyslot: None,
+            token_id: None,
+        };
         v.add_target(&uuid, meta, None).map_err(AdminError::Vault)?;
         println!("  target added, 64-byte keyfile generated.");
     }
@@ -161,11 +219,13 @@ async fn cmd_server_setup(st: &mut State, name: &str, args: &[&str]) -> AdminRes
     let mut opts = Options::new();
     opts.optopt("o", "out", "output directory", "DIR");
     let matches = opts.parse(args).map_err(AdminError::from)?;
-    let out_dir = matches.opt_str("o").unwrap_or_else(|| format!("./ltv-deploy-{}", name));
+    let out_dir = matches
+        .opt_str("o")
+        .unwrap_or_else(|| format!("./ltv-deploy-{}", name));
 
     let vault_path = st.path.clone();
     let v = require_vault_mut(st)?;
-    let p = find_profile(&v, name)?.clone();
+    let p = find_profile(v, name)?.clone();
 
     // Generate deployment artifacts directory early for key generation
     let deploy_dir = Path::new(&out_dir);
@@ -185,7 +245,9 @@ async fn cmd_server_setup(st: &mut State, name: &str, args: &[&str]) -> AdminRes
 
     // Set permissions on private key
     use std::os::unix::fs::PermissionsExt;
-    let mut perms = fs::metadata(&key_path).map_err(AdminError::Io)?.permissions();
+    let mut perms = fs::metadata(&key_path)
+        .map_err(AdminError::Io)?
+        .permissions();
     perms.set_mode(0o600);
     fs::set_permissions(&key_path, perms).map_err(AdminError::Io)?;
 
@@ -201,15 +263,22 @@ async fn cmd_server_setup(st: &mut State, name: &str, args: &[&str]) -> AdminRes
     let pub_b64 = base64::engine::general_purpose::STANDARD.encode(verifying_key.as_bytes());
     let pub_key_line = format!("ssh-ed25519 {} ltv:{}", pub_b64, p.name);
     fs::write(&pub_key_path, &pub_key_line).map_err(AdminError::Io)?;
-    let mut perms = fs::metadata(&pub_key_path).map_err(AdminError::Io)?.permissions();
+    let mut perms = fs::metadata(&pub_key_path)
+        .map_err(AdminError::Io)?
+        .permissions();
     perms.set_mode(0o644);
     fs::set_permissions(&pub_key_path, perms).map_err(AdminError::Io)?;
 
     // Always pin the freshly generated unlock SSH host key (overwrite any stale value)
-    v.set_host_key(&p.uuid, HostKey {
-        key_type: "ssh-ed25519".into(),
-        key_bytes: host_key_public_bytes,
-    }, false).map_err(AdminError::Vault)?;
+    v.set_host_key(
+        &p.uuid,
+        HostKey {
+            key_type: "ssh-ed25519".into(),
+            key_bytes: host_key_public_bytes,
+        },
+        false,
+    )
+    .map_err(AdminError::Vault)?;
     // Save vault immediately so the pinned key persists
     if let Some(path) = vault_path {
         let bytes = v.save().map_err(AdminError::Vault)?;
@@ -226,44 +295,63 @@ async fn cmd_server_setup(st: &mut State, name: &str, args: &[&str]) -> AdminRes
     // Template the port into the wrapper (replaces ${LTV_PORT:-22} with actual port)
     let wrapper = LTV_LUKS_WRAPPER.replace("${LTV_PORT:-22}", &p.unlock_port.to_string());
     fs::write(deploy_dir.join("ltv-luks-wrapper.sh"), wrapper).map_err(AdminError::Io)?;
-    let mut perms = fs::metadata(deploy_dir.join("ltv-luks-wrapper.sh")).map_err(AdminError::Io)?.permissions();
+    let mut perms = fs::metadata(deploy_dir.join("ltv-luks-wrapper.sh"))
+        .map_err(AdminError::Io)?
+        .permissions();
     perms.set_mode(0o755);
     fs::set_permissions(deploy_dir.join("ltv-luks-wrapper.sh"), perms).map_err(AdminError::Io)?;
 
     // 3. patch script + commit hook (idempotent re-patch after mkinitfs upgrade)
     fs::write(deploy_dir.join("ltv-patch-init.sh"), LTV_PATCH_INIT).map_err(AdminError::Io)?;
-    let mut perms = fs::metadata(deploy_dir.join("ltv-patch-init.sh")).map_err(AdminError::Io)?.permissions();
+    let mut perms = fs::metadata(deploy_dir.join("ltv-patch-init.sh"))
+        .map_err(AdminError::Io)?
+        .permissions();
     perms.set_mode(0o755);
     fs::set_permissions(deploy_dir.join("ltv-patch-init.sh"), perms).map_err(AdminError::Io)?;
 
     fs::write(deploy_dir.join("ltv-commit-hook.sh"), LTV_COMMIT_HOOK).map_err(AdminError::Io)?;
-    let mut perms = fs::metadata(deploy_dir.join("ltv-commit-hook.sh")).map_err(AdminError::Io)?.permissions();
+    let mut perms = fs::metadata(deploy_dir.join("ltv-commit-hook.sh"))
+        .map_err(AdminError::Io)?
+        .permissions();
     perms.set_mode(0o755);
     fs::set_permissions(deploy_dir.join("ltv-commit-hook.sh"), perms).map_err(AdminError::Io)?;
 
     // 4. authorized_keys (runtime generated from vault)
     let auth_keys = v.authorized_keys_line(&p);
     // Ensure trailing newline for authorized_keys
-    let auth_keys = if auth_keys.ends_with('\n') { auth_keys } else { format!("{}\n", auth_keys) };
+    let auth_keys = if auth_keys.ends_with('\n') {
+        auth_keys
+    } else {
+        format!("{}\n", auth_keys)
+    };
     fs::write(deploy_dir.join("authorized_keys"), auth_keys).map_err(AdminError::Io)?;
 
     // 5. deploy.sh (with kernel version template)
-    let kernel_version = std::process::Command::new("uname").arg("-r").output().map_err(AdminError::Io)?.stdout;
+    let kernel_version = std::process::Command::new("uname")
+        .arg("-r")
+        .output()
+        .map_err(AdminError::Io)?
+        .stdout;
     let kernel_version = String::from_utf8_lossy(&kernel_version).trim().to_string();
     let deploy_sh = render_deploy_sh(&kernel_version);
     fs::write(deploy_dir.join("deploy.sh"), deploy_sh).map_err(AdminError::Io)?;
-    let mut perms = fs::metadata(deploy_dir.join("deploy.sh")).map_err(AdminError::Io)?.permissions();
+    let mut perms = fs::metadata(deploy_dir.join("deploy.sh"))
+        .map_err(AdminError::Io)?
+        .permissions();
     perms.set_mode(0o755);
     fs::set_permissions(deploy_dir.join("deploy.sh"), perms).map_err(AdminError::Io)?;
 
     // 7. deploy_nopatch.sh (alternative without patching)
     let deploy_nopatch_sh = render_deploy_nopatch_sh(&kernel_version);
     fs::write(deploy_dir.join("deploy_nopatch.sh"), deploy_nopatch_sh).map_err(AdminError::Io)?;
-    let mut perms = fs::metadata(deploy_dir.join("deploy_nopatch.sh")).map_err(AdminError::Io)?.permissions();
+    let mut perms = fs::metadata(deploy_dir.join("deploy_nopatch.sh"))
+        .map_err(AdminError::Io)?
+        .permissions();
     perms.set_mode(0o755);
     fs::set_permissions(deploy_dir.join("deploy_nopatch.sh"), perms).map_err(AdminError::Io)?;
     // 8. README
-    let readme = format!(r#"# LTV Deployment Artifacts for profile: {}
+    let readme = format!(
+        r#"# LTV Deployment Artifacts for profile: {}
 
 ## Files
 
@@ -305,14 +393,15 @@ After deployment and reboot:
     ltv-admin> unlock {}
 
 # This will push keyfiles to initramfs Dropbear via SSH (full shell, not push-to-stdin yet)
-"#, p.name, p.name);
+"#,
+        p.name, p.name
+    );
     fs::write(deploy_dir.join("README.md"), readme).map_err(AdminError::Io)?;
 
     println!("Deployment artifacts written to {}", deploy_dir.display());
     println!("Run: sudo sh {}/deploy.sh on the target server", out_dir);
     Ok(())
 }
-
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -323,7 +412,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     opts.optflag("v", "version", "Show version");
     let matches = match opts.parse(&args[1..]) {
         Ok(m) => m,
-        Err(e) => { eprintln!("{}", e); std::process::exit(1); }
+        Err(e) => {
+            eprintln!("{}", e);
+            std::process::exit(1);
+        }
     };
 
     if matches.opt_present("h") {
@@ -335,14 +427,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    let mut st = State { path: None, vault: None, vault_name: None, verbose: false };
+    let mut st = State {
+        path: None,
+        vault: None,
+        vault_name: None,
+        verbose: false,
+    };
     let mut rl = DefaultEditor::new()?;
 
     println!("ltv-admin — LUKS SSH Unlock Admin v{}", VERSION);
     println!("Type 'help' for commands.");
 
     loop {
-        let dirty = st.vault.as_ref().map_or(false, |v| v.is_dirty());
+        let dirty = st.vault.as_ref().is_some_and(|v| v.is_dirty());
         let prompt = if let Some(name) = &st.vault_name {
             format!("ltv-admin({}{name})> ", if dirty { "*" } else { "" })
         } else {
@@ -350,19 +447,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
         let line = match rl.readline(&prompt) {
             Ok(l) => l.trim().to_string(),
-            Err(ReadlineError::Interrupted) => { println!("^C"); continue; }
+            Err(ReadlineError::Interrupted) => {
+                println!("^C");
+                continue;
+            }
             Err(ReadlineError::Eof) => break,
             Err(e) => return Err(e.into()),
         };
-        if line.is_empty() { continue; }
+        if line.is_empty() {
+            continue;
+        }
         let _ = rl.add_history_entry(&line);
 
         let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.is_empty() { continue; }
+        if parts.is_empty() {
+            continue;
+        }
 
         match handle_command(&mut st, &parts).await {
             Ok(true) => break,
-            Ok(false) => {},
+            Ok(false) => {}
             Err(e) => eprintln!("Error: {}", e),
         }
     }
@@ -372,21 +476,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 async fn handle_command(st: &mut State, parts: &[&str]) -> AdminResult<bool> {
     match parts[0] {
         "quit" | "exit" => {
-            if st.vault.as_ref().map_or(false, |v| v.is_dirty()) {
-                if ask("Unsaved changes. Save? [Y/n]: ").to_lowercase() != "n" { save_atomic(st)?; }
+            if st.vault.as_ref().is_some_and(|v| v.is_dirty())
+                && ask("Unsaved changes. Save? [Y/n]: ").to_lowercase() != "n"
+            {
+                save_atomic(st)?;
             }
             return Ok(true);
         }
-        "help" => { print_help(); }
+        "help" => {
+            print_help();
+        }
         "verbose" => handle_verbose(st, parts)?,
         "create" => handle_create(st, parts)?,
         "open" => handle_open(st, parts)?,
-        "save" => { save_atomic(st)?; }
-        "close" => { close_vault(st)?; }
+        "save" => {
+            save_atomic(st)?;
+        }
+        "close" => {
+            close_vault(st)?;
+        }
         "status" => handle_status(st)?,
         "ls" => handle_ls(st)?,
         "show" => handle_show(st, parts)?,
-        "add" => { cmd_add(st)?; }
+        "add" => {
+            cmd_add(st)?;
+        }
         "rm" => handle_rm(st, parts)?,
         "edit" => handle_edit(st, parts)?,
         "target" => handle_target(st, parts)?,
@@ -402,13 +516,19 @@ async fn handle_command(st: &mut State, parts: &[&str]) -> AdminResult<bool> {
         "dump-keys" => handle_dump_keys(st, parts)?,
         "rotate-key" => handle_rotate(st, parts).await?,
         "copy-profile" => handle_copy_profile(st, parts).await?,
-        _ => return Err(AdminError::InvalidArgument(format!("unknown command: {}. Type 'help' for list.", parts[0]))),
+        _ => {
+            return Err(AdminError::InvalidArgument(format!(
+                "unknown command: {}. Type 'help' for list.",
+                parts[0]
+            )))
+        }
     }
     Ok(false)
 }
 
 fn print_help() {
-    println!(r#"Commands:
+    println!(
+        r#"Commands:
   create <file>                  Create new vault file, prompts passphrase twice
   open <file>                    Open existing vault file
   save                           Save changes to vault file (atomic write)
@@ -444,7 +564,8 @@ fn print_help() {
                                   --keep: identical copy (same client key + host keys)
   verbose [on|off|toggle]        Toggle verbose output for enroll/fetch/unlock/probe
   quit | exit                    Exit (prompts to save if dirty)
-"#);
+"#
+    );
 }
 
 fn print_usage(program: &str) {
@@ -463,7 +584,7 @@ fn handle_verbose(st: &mut State, parts: &[&str]) -> AdminResult<()> {
     let mut opts = Options::new();
     opts.optflag("h", "help", "show help");
     let matches = opts.parse(&parts[1..]).map_err(AdminError::from)?;
-    
+
     if matches.opt_present("h") || matches.free.is_empty() {
         st.verbose = !st.verbose;
     } else {
@@ -471,7 +592,11 @@ fn handle_verbose(st: &mut State, parts: &[&str]) -> AdminResult<()> {
             "on" => st.verbose = true,
             "off" => st.verbose = false,
             "toggle" => st.verbose = !st.verbose,
-            _ => return Err(AdminError::InvalidArgument("Usage: verbose [on|off|toggle]".into())),
+            _ => {
+                return Err(AdminError::InvalidArgument(
+                    "Usage: verbose [on|off|toggle]".into(),
+                ))
+            }
         }
     }
     println!("Verbose: {}", if st.verbose { "on" } else { "off" });
@@ -482,28 +607,39 @@ fn handle_create(st: &mut State, parts: &[&str]) -> AdminResult<()> {
     let mut opts = Options::new();
     opts.optflag("h", "help", "show help");
     let matches = opts.parse(&parts[1..]).map_err(AdminError::from)?;
-    
-    if matches.free.is_empty() { return Err(AdminError::InvalidArgument("Usage: create <file>".into())); }
+
+    if matches.free.is_empty() {
+        return Err(AdminError::InvalidArgument("Usage: create <file>".into()));
+    }
     let f = matches.free[0].clone();
     let path = PathBuf::from(&f);
-    
+
     // Close current vault if open (with dirty check)
     if st.vault.is_some() {
         close_vault(st)?;
     }
-    
+
     // Check if file already exists
     if path.exists() {
         let confirm = ask(&format!("File '{}' already exists. Overwrite? [y/N]: ", f));
-        if confirm.to_lowercase() != "y" { return Err(AdminError::Aborted); }
+        if confirm.to_lowercase() != "y" {
+            return Err(AdminError::Aborted);
+        }
     }
-    
-    let p1 = prompt_passphrase(PROMPT_NEW_PASSPHRASE)?; 
+
+    let p1 = prompt_passphrase(PROMPT_NEW_PASSPHRASE)?;
     let p2 = prompt_passphrase(PROMPT_REPEAT_PASSPHRASE)?;
-    if p1.expose_secret() != p2.expose_secret() { return Err(AdminError::PassphrasesDiffer); }
+    if p1.expose_secret() != p2.expose_secret() {
+        return Err(AdminError::PassphrasesDiffer);
+    }
     st.vault = Some(Vault::create(&p1, Argon2Params::default()).map_err(AdminError::Vault)?);
     st.path = Some(path);
-    st.vault_name = st.path.as_ref().and_then(|p| p.file_stem()).and_then(|s| s.to_str()).map(|s| s.to_string());
+    st.vault_name = st
+        .path
+        .as_ref()
+        .and_then(|p| p.file_stem())
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_string());
     save_atomic(st)?;
     Ok(())
 }
@@ -512,22 +648,28 @@ fn handle_open(st: &mut State, parts: &[&str]) -> AdminResult<()> {
     let mut opts = Options::new();
     opts.optflag("h", "help", "show help");
     let matches = opts.parse(&parts[1..]).map_err(AdminError::from)?;
-    
-    if matches.free.is_empty() { return Err(AdminError::InvalidArgument("Usage: open <file>".into())); }
+
+    if matches.free.is_empty() {
+        return Err(AdminError::InvalidArgument("Usage: open <file>".into()));
+    }
     let f = matches.free[0].clone();
-    
+
     // Close current vault if open (with dirty check)
     if st.vault.is_some() {
         close_vault(st)?;
     }
-    
+
     let bytes = fs::read(&f).map_err(AdminError::Io)?;
     let pass = prompt_passphrase(PROMPT_VAULT_PASSPHRASE)?;
     let v = Vault::open(&bytes, &pass).map_err(|_| AdminError::IncorrectPassphrase)?;
     println!("opened: {} profiles", v.inventory.profiles.len());
     let path = PathBuf::from(f);
-    st.vault_name = path.file_stem().and_then(|s| s.to_str()).map(|s| s.to_string());
-    st.vault = Some(v); st.path = Some(path);
+    st.vault_name = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_string());
+    st.vault = Some(v);
+    st.path = Some(path);
     Ok(())
 }
 
@@ -536,9 +678,11 @@ fn close_vault(st: &mut State) -> AdminResult<()> {
         if v.is_dirty() {
             let choice = ask("Unsaved changes. Save before closing? [Y/n/d]: ").to_lowercase();
             match choice.as_str() {
-                "n" | "no" => {}, // discard changes
-                "d" | "discard" => {}, // explicit discard
-                _ => { save_atomic(st)?; } // default: save
+                "n" | "no" => {}      // discard changes
+                "d" | "discard" => {} // explicit discard
+                _ => {
+                    save_atomic(st)?;
+                } // default: save
             }
         }
     }
@@ -551,7 +695,12 @@ fn close_vault(st: &mut State) -> AdminResult<()> {
 
 fn handle_status(st: &State) -> AdminResult<()> {
     match (&st.path, &st.vault) {
-        (Some(p), Some(v)) => println!("{} — {} profiles, dirty={}", p.display(), v.inventory.profiles.len(), v.is_dirty()),
+        (Some(p), Some(v)) => println!(
+            "{} — {} profiles, dirty={}",
+            p.display(),
+            v.inventory.profiles.len(),
+            v.is_dirty()
+        ),
         _ => println!("no vault open"),
     }
     Ok(())
@@ -559,13 +708,27 @@ fn handle_status(st: &State) -> AdminResult<()> {
 
 fn handle_ls(st: &State) -> AdminResult<()> {
     let v = st.vault_ref()?;
-    println!("{:<16} {:<21} {:<21} {:>7}  {}", "NAME", "UNLOCK SSH", "OS SSH", "TARGETS", "UNLOCK HOSTKEY");
+    println!(
+        "{:<16} {:<21} {:<21} {:>7}  UNLOCK HOSTKEY",
+        "NAME", "UNLOCK SSH", "OS SSH", "TARGETS"
+    );
     for p in &v.inventory.profiles {
         let unlock_ssh = format!("{}:{}", p.unlock_host, p.unlock_port);
         let (os_h, os_p) = os_ssh_addr(p);
         let os_ssh = format!("{}:{}", os_h, os_p);
-        let hostkey = if p.unlock_host_key.is_some() { "pinned" } else { "MISSING" };
-        println!("{:<16} {:<21} {:<21} {:>7}  {}", p.name, unlock_ssh, os_ssh, p.targets_meta.len(), hostkey);
+        let hostkey = if p.unlock_host_key.is_some() {
+            "pinned"
+        } else {
+            "MISSING"
+        };
+        println!(
+            "{:<16} {:<21} {:<21} {:>7}  {}",
+            p.name,
+            unlock_ssh,
+            os_ssh,
+            p.targets_meta.len(),
+            hostkey
+        );
     }
     Ok(())
 }
@@ -574,8 +737,10 @@ fn handle_show(st: &State, parts: &[&str]) -> AdminResult<()> {
     let mut opts = Options::new();
     opts.optflag("h", "help", "show help");
     let matches = opts.parse(&parts[1..]).map_err(AdminError::from)?;
-    
-    if matches.free.is_empty() { return Err(AdminError::InvalidArgument("Usage: show <profile>".into())); }
+
+    if matches.free.is_empty() {
+        return Err(AdminError::InvalidArgument("Usage: show <profile>".into()));
+    }
     let n = &matches.free[0];
     let (v, p) = st.vault_and_profile_ref(n)?;
     let (os_host, os_port) = os_ssh_addr(p);
@@ -584,13 +749,43 @@ fn handle_show(st: &State, parts: &[&str]) -> AdminResult<()> {
     } else {
         format!("{}:{}", os_host, os_port)
     };
-    println!("name: {}\nunlock SSH: {}:{} user {}\nOS SSH: {}\nuuid: {}", p.name, p.unlock_host, p.unlock_port, p.username, os_addr, uuid::Uuid::from_bytes(p.uuid));
-    println!("notes: {}", if p.notes.is_empty() { "(none)" } else { &p.notes });
-    if let Some(k) = &p.unlock_host_key { println!("unlock SSH hostkey: {} {}", k.key_type, fingerprint_sha256(&k.key_bytes)); }
-    if let Some(k) = &p.os_host_key { println!("OS SSH hostkey: {} {}", k.key_type, fingerprint_sha256(&k.key_bytes)); }
-    for t in &p.targets_meta { 
+    println!(
+        "name: {}\nunlock SSH: {}:{} user {}\nOS SSH: {}\nuuid: {}",
+        p.name,
+        p.unlock_host,
+        p.unlock_port,
+        p.username,
+        os_addr,
+        uuid::Uuid::from_bytes(p.uuid)
+    );
+    println!(
+        "notes: {}",
+        if p.notes.is_empty() {
+            "(none)"
+        } else {
+            &p.notes
+        }
+    );
+    if let Some(k) = &p.unlock_host_key {
+        println!(
+            "unlock SSH hostkey: {} {}",
+            k.key_type,
+            fingerprint_sha256(&k.key_bytes)
+        );
+    }
+    if let Some(k) = &p.os_host_key {
+        println!(
+            "OS SSH hostkey: {} {}",
+            k.key_type,
+            fingerprint_sha256(&k.key_bytes)
+        );
+    }
+    for t in &p.targets_meta {
         let fallback = t.fallback_path.as_deref().unwrap_or("none");
-        println!("  target {} UUID={} fallback={} slot={:?}", t.mapped_name, t.luks_uuid, fallback, t.keyslot); 
+        println!(
+            "  target {} UUID={} fallback={} slot={:?}",
+            t.mapped_name, t.luks_uuid, fallback, t.keyslot
+        );
     }
     println!("client public key: {}", v.export_public_key(p));
     Ok(())
@@ -600,11 +795,15 @@ fn handle_rm(st: &mut State, parts: &[&str]) -> AdminResult<()> {
     let mut opts = Options::new();
     opts.optflag("h", "help", "show help");
     let matches = opts.parse(&parts[1..]).map_err(AdminError::from)?;
-    
-    if matches.free.is_empty() { return Err(AdminError::InvalidArgument("Usage: rm <profile>".into())); }
+
+    if matches.free.is_empty() {
+        return Err(AdminError::InvalidArgument("Usage: rm <profile>".into()));
+    }
     let n = &matches.free[0];
     let (v, uuid) = st.vault_and_profile(n)?;
-    if ask(&format!("Remove '{}'? type YES: ", n)) == "YES" { v.remove_profile(&uuid).map_err(AdminError::Vault)?; }
+    if ask(&format!("Remove '{}'? type YES: ", n)) == "YES" {
+        v.remove_profile(&uuid).map_err(AdminError::Vault)?;
+    }
     Ok(())
 }
 
@@ -612,7 +811,7 @@ fn handle_edit(st: &mut State, parts: &[&str]) -> AdminResult<()> {
     let mut opts = Options::new();
     opts.optflag("h", "help", "show help");
     let matches = opts.parse(&parts[1..]).map_err(AdminError::from)?;
-    
+
     // Show help if no profile given or --help flag
     if matches.free.is_empty() || matches.opt_present("h") {
         println!("Usage: edit <profile> [field=value ...]");
@@ -634,7 +833,7 @@ fn handle_edit(st: &mut State, parts: &[&str]) -> AdminResult<()> {
         println!("  edit myvault notes=rack4");
         return Ok(());
     }
-    
+
     let n = &matches.free[0];
     let rest = &matches.free[1..];
     let (v, uuid) = st.vault_and_profile(n)?;
@@ -643,20 +842,70 @@ fn handle_edit(st: &mut State, parts: &[&str]) -> AdminResult<()> {
     for arg in rest {
         if let Some((k, v)) = arg.split_once('=') {
             match k {
-                "name" => { p.name = v.into(); changed = true; }
-                "unlock_host" => { p.unlock_host = v.into(); changed = true; }
-                "unlock_port" => { p.unlock_port = v.parse().map_err(|_| AdminError::InvalidArgument("bad port".into()))?; changed = true; }
-                "os_host" => { p.os_host = if v.is_empty() { None } else { Some(v.into()) }; changed = true; }
-                "os_port" => { p.os_port = if v.is_empty() { None } else { Some(v.parse().map_err(|_| AdminError::InvalidArgument("bad OS port".into()))?) }; changed = true; }
-                "user" | "username" => { p.username = v.into(); changed = true; }
-                "notes" => { p.notes = v.into(); changed = true; }
-                "connect_timeout" => { p.connect_timeout_s = v.parse().map_err(|_| AdminError::InvalidArgument("bad timeout".into()))?; changed = true; }
-                "exec_timeout" => { p.exec_timeout_s = v.parse().map_err(|_| AdminError::InvalidArgument("bad timeout".into()))?; changed = true; }
-                _ => return Err(AdminError::InvalidArgument(format!("unknown field: {k}. Run 'edit --help' for available fields."))),
+                "name" => {
+                    p.name = v.into();
+                    changed = true;
+                }
+                "unlock_host" => {
+                    p.unlock_host = v.into();
+                    changed = true;
+                }
+                "unlock_port" => {
+                    p.unlock_port = v
+                        .parse()
+                        .map_err(|_| AdminError::InvalidArgument("bad port".into()))?;
+                    changed = true;
+                }
+                "os_host" => {
+                    p.os_host = if v.is_empty() { None } else { Some(v.into()) };
+                    changed = true;
+                }
+                "os_port" => {
+                    p.os_port = if v.is_empty() {
+                        None
+                    } else {
+                        Some(
+                            v.parse()
+                                .map_err(|_| AdminError::InvalidArgument("bad OS port".into()))?,
+                        )
+                    };
+                    changed = true;
+                }
+                "user" | "username" => {
+                    p.username = v.into();
+                    changed = true;
+                }
+                "notes" => {
+                    p.notes = v.into();
+                    changed = true;
+                }
+                "connect_timeout" => {
+                    p.connect_timeout_s = v
+                        .parse()
+                        .map_err(|_| AdminError::InvalidArgument("bad timeout".into()))?;
+                    changed = true;
+                }
+                "exec_timeout" => {
+                    p.exec_timeout_s = v
+                        .parse()
+                        .map_err(|_| AdminError::InvalidArgument("bad timeout".into()))?;
+                    changed = true;
+                }
+                _ => {
+                    return Err(AdminError::InvalidArgument(format!(
+                        "unknown field: {k}. Run 'edit --help' for available fields."
+                    )))
+                }
             }
         }
     }
-    if changed { v.update_profile(&uuid, |p2| *p2 = p).map_err(AdminError::Vault)?; println!("profile updated"); } else { println!("no changes"); }
+    if changed {
+        v.update_profile(&uuid, |p2| *p2 = p)
+            .map_err(AdminError::Vault)?;
+        println!("profile updated");
+    } else {
+        println!("no changes");
+    }
     Ok(())
 }
 
@@ -664,33 +913,63 @@ fn handle_target(st: &mut State, parts: &[&str]) -> AdminResult<()> {
     let mut opts = Options::new();
     opts.optflag("h", "help", "show help");
     let matches = opts.parse(&parts[1..]).map_err(AdminError::from)?;
-    
-    if matches.free.is_empty() { return Err(AdminError::InvalidArgument("Usage: target add|rm <profile> ...".into())); }
+
+    if matches.free.is_empty() {
+        return Err(AdminError::InvalidArgument(
+            "Usage: target add|rm <profile> ...".into(),
+        ));
+    }
     match matches.free[0].as_str() {
         "add" => {
-            if matches.free.len() < 2 { return Err(AdminError::InvalidArgument("Usage: target add <profile>".into())); }
+            if matches.free.len() < 2 {
+                return Err(AdminError::InvalidArgument(
+                    "Usage: target add <profile>".into(),
+                ));
+            }
             let n = &matches.free[1];
             let v = require_vault_mut(st)?;
-            let uuid = find_profile(&v, n)?.uuid;
-            let luks_uuid = ask("LUKS UUID: "); if luks_uuid.is_empty() { return Err(AdminError::InvalidArgument("uuid required".into())); }
+            let uuid = find_profile(v, n)?.uuid;
+            let luks_uuid = ask("LUKS UUID: ");
+            if luks_uuid.is_empty() {
+                return Err(AdminError::InvalidArgument("uuid required".into()));
+            }
             let fallback = ask("Fallback device path (optional): ");
             let mapped = ask_or("Mapper name", "cryptroot");
             let order: u8 = ask_or("Order", "0").parse().unwrap_or(0);
-            let meta = TargetMeta { luks_uuid, fallback_path: if fallback.is_empty() { None } else { Some(fallback) },
-                            mapped_name: mapped, order, keyslot: None, token_id: None };
+            let meta = TargetMeta {
+                luks_uuid,
+                fallback_path: if fallback.is_empty() {
+                    None
+                } else {
+                    Some(fallback)
+                },
+                mapped_name: mapped,
+                order,
+                keyslot: None,
+                token_id: None,
+            };
             v.add_target(&uuid, meta, None).map_err(AdminError::Vault)?;
             println!("  target added, 64-byte keyfile generated.");
         }
         "rm" => {
-            if matches.free.len() < 3 { return Err(AdminError::InvalidArgument("Usage: target rm <profile> <uuid>".into())); }
+            if matches.free.len() < 3 {
+                return Err(AdminError::InvalidArgument(
+                    "Usage: target rm <profile> <uuid>".into(),
+                ));
+            }
             let n = &matches.free[1];
             let uuid_str = &matches.free[2];
             let v = require_vault_mut(st)?;
-            let uuid = find_profile(&v, n)?.uuid;
-            v.remove_target(&uuid, uuid_str).map_err(AdminError::Vault)?;
+            let uuid = find_profile(v, n)?.uuid;
+            v.remove_target(&uuid, uuid_str)
+                .map_err(AdminError::Vault)?;
             println!("target removed");
         }
-        _ => return Err(AdminError::InvalidArgument("Usage: target add|rm <profile> ...".into())),
+        _ => {
+            return Err(AdminError::InvalidArgument(
+                "Usage: target add|rm <profile> ...".into(),
+            ))
+        }
     }
     Ok(())
 }
@@ -699,10 +978,14 @@ fn handle_pubkey(st: &State, parts: &[&str]) -> AdminResult<()> {
     let mut opts = Options::new();
     opts.optflag("h", "help", "show help");
     let matches = opts.parse(&parts[1..]).map_err(AdminError::from)?;
-    
-    if matches.free.is_empty() { return Err(AdminError::InvalidArgument("Usage: pubkey <profile>".into())); }
+
+    if matches.free.is_empty() {
+        return Err(AdminError::InvalidArgument(
+            "Usage: pubkey <profile>".into(),
+        ));
+    }
     let n = &matches.free[0];
-    let v = require_vault_ref(st)?; 
+    let v = require_vault_ref(st)?;
     println!("{}", v.authorized_keys_line(find_profile(v, n)?));
     Ok(())
 }
@@ -712,17 +995,27 @@ async fn handle_hostkey(st: &mut State, parts: &[&str]) -> AdminResult<()> {
     opts.optflag("", "os", "pin as OS host key instead of unlock SSH");
     opts.optflag("h", "help", "show help");
     let matches = opts.parse(&parts[1..]).map_err(AdminError::from)?;
-    
-    if matches.free.is_empty() { return Err(AdminError::InvalidArgument("Usage: hostkey <fetch|repin> <profile> [--os]".into())); }
+
+    if matches.free.is_empty() {
+        return Err(AdminError::InvalidArgument(
+            "Usage: hostkey <fetch|repin> <profile> [--os]".into(),
+        ));
+    }
     let subcmd = &matches.free[0];
-    let n = matches.free.get(1).ok_or_else(|| AdminError::InvalidArgument("Usage: hostkey <fetch|repin> <profile> [--os]".into()))?;
+    let n = matches.free.get(1).ok_or_else(|| {
+        AdminError::InvalidArgument("Usage: hostkey <fetch|repin> <profile> [--os]".into())
+    })?;
     let is_os = matches.opt_present("os");
     let v = require_vault_mut(st)?;
-    let p = find_profile(&v, n)?.clone();
+    let p = find_profile(v, n)?.clone();
 
     match subcmd.as_str() {
         "fetch" => {
-            let (host, port) = if is_os { os_ssh_addr(&p) } else { (p.unlock_host.clone(), p.unlock_port) };
+            let (host, port) = if is_os {
+                os_ssh_addr(&p)
+            } else {
+                (p.unlock_host.clone(), p.unlock_port)
+            };
             println!("Fetching host key from {}:{} ...", host, port);
             let hk = match fetch_host_key(&host, port, p.connect_timeout_s).await {
                 Ok(hk) => hk,
@@ -730,22 +1023,33 @@ async fn handle_hostkey(st: &mut State, parts: &[&str]) -> AdminResult<()> {
                     let msg = e.to_string();
                     if msg.contains("Connection refused") || msg.contains("Connection timed out") {
                         let svc = if is_os { "OS SSH" } else { "unlock SSH" };
-                        return Err(AdminError::InvalidArgument(format!("Failed to connect to {}:{}. Is {} running?", host, port, svc)));
+                        return Err(AdminError::InvalidArgument(format!(
+                            "Failed to connect to {}:{}. Is {} running?",
+                            host, port, svc
+                        )));
                     }
                     return Err(AdminError::InvalidArgument(msg));
                 }
             };
             println!("{} {}", hk.key_type, fingerprint_sha256(&hk.key_bytes));
             if ask(CONFIRM_PIN_HOST_KEY).to_lowercase() == "y" {
-                v.set_host_key(&p.uuid, hk, is_os).map_err(AdminError::Vault)?;
+                v.set_host_key(&p.uuid, hk, is_os)
+                    .map_err(AdminError::Vault)?;
             }
         }
         "repin" => {
             if is_os {
-                return Err(AdminError::InvalidArgument("--os flag not supported for repin (use 'hostkey fetch --os' for OS key)".into()));
+                return Err(AdminError::InvalidArgument(
+                    "--os flag not supported for repin (use 'hostkey fetch --os' for OS key)"
+                        .into(),
+                ));
             }
-            println!("Re-pinning unlock SSH host key from {}:{} ...", p.unlock_host, p.unlock_port);
-            let hk = match fetch_host_key(&p.unlock_host, p.unlock_port, p.connect_timeout_s).await {
+            println!(
+                "Re-pinning unlock SSH host key from {}:{} ...",
+                p.unlock_host, p.unlock_port
+            );
+            let hk = match fetch_host_key(&p.unlock_host, p.unlock_port, p.connect_timeout_s).await
+            {
                 Ok(hk) => hk,
                 Err(e) => {
                     let msg = e.to_string();
@@ -757,11 +1061,16 @@ async fn handle_hostkey(st: &mut State, parts: &[&str]) -> AdminResult<()> {
             };
             println!("{} {}", hk.key_type, fingerprint_sha256(&hk.key_bytes));
             if ask(CONFIRM_REPIN_UNLOCK_HOST_KEY).to_lowercase() == "y" {
-                v.set_host_key(&p.uuid, hk, false).map_err(AdminError::Vault)?;
+                v.set_host_key(&p.uuid, hk, false)
+                    .map_err(AdminError::Vault)?;
                 println!("Unlock SSH host key updated.");
             }
         }
-        _ => return Err(AdminError::InvalidArgument("Usage: hostkey <fetch|repin> <profile> [--os]".into())),
+        _ => {
+            return Err(AdminError::InvalidArgument(
+                "Usage: hostkey <fetch|repin> <profile> [--os]".into(),
+            ))
+        }
     }
     Ok(())
 }
@@ -771,7 +1080,9 @@ fn fmt_probe_result(r: &ProbeResult) -> String {
         ProbeResult::Unreachable(reason) => format!("unreachable ({})", reason),
         ProbeResult::WaitingInInitramfs => "waiting in initramfs (unlock SSH)".into(),
         ProbeResult::BootedOs => "booted OS".into(),
-        ProbeResult::UnknownHostKey(k) => format!("unknown host key ({})", fingerprint_sha256(&k.key_bytes)),
+        ProbeResult::UnknownHostKey(k) => {
+            format!("unknown host key ({})", fingerprint_sha256(&k.key_bytes))
+        }
     }
 }
 
@@ -780,14 +1091,26 @@ async fn handle_probe(st: &State, parts: &[&str]) -> AdminResult<()> {
     opts.optflag("", "verbose", "show SSH commands");
     opts.optflag("h", "help", "show help");
     let matches = opts.parse(&parts[1..]).map_err(AdminError::from)?;
-    
-    if matches.free.is_empty() { return Err(AdminError::InvalidArgument("Usage: probe <profile>|--all [--verbose]".into())); }
+
+    if matches.free.is_empty() {
+        return Err(AdminError::InvalidArgument(
+            "Usage: probe <profile>|--all [--verbose]".into(),
+        ));
+    }
     let n = &matches.free[0];
     let verbose = matches.opt_present("verbose") || st.verbose;
     let v = require_vault_ref(st)?;
-    let ps: Vec<Profile> = if n == "--all" { v.inventory.profiles.clone() } else { vec![find_profile(v, n)?.clone()] };
+    let ps: Vec<Profile> = if n == "--all" {
+        v.inventory.profiles.clone()
+    } else {
+        vec![find_profile(v, n)?.clone()]
+    };
     for p in ps {
-        let verbose_fn = if verbose { Some(Box::new(|msg: &str| println!("  [probe] {msg}")) as Box<dyn FnMut(&str) + Send>) } else { None };
+        let verbose_fn = if verbose {
+            Some(Box::new(|msg: &str| println!("  [probe] {msg}")) as Box<dyn FnMut(&str) + Send>)
+        } else {
+            None
+        };
         let result = probe(&p, verbose_fn).await;
         if !verbose {
             println!("{:<16} {}", p.name, fmt_probe_result(&result));
@@ -799,51 +1122,100 @@ async fn handle_probe(st: &State, parts: &[&str]) -> AdminResult<()> {
 async fn handle_unlock(st: &State, parts: &[&str]) -> AdminResult<()> {
     let mut opts = Options::new();
     opts.optflag("", "verbose", "show cryptsetup commands");
-    opts.optflag("", "sequential", "process targets sequentially (default: parallel)");
+    opts.optflag(
+        "",
+        "sequential",
+        "process targets sequentially (default: parallel)",
+    );
     opts.optflag("h", "help", "show help");
     let matches = opts.parse(&parts[1..]).map_err(AdminError::from)?;
-    
-    if matches.free.is_empty() { return Err(AdminError::InvalidArgument("Usage: unlock <profile> [--verbose] [--sequential]".into())); }
+
+    if matches.free.is_empty() {
+        return Err(AdminError::InvalidArgument(
+            "Usage: unlock <profile> [--verbose] [--sequential]".into(),
+        ));
+    }
     let n = &matches.free[0];
     let verbose = matches.opt_present("verbose") || st.verbose;
     let sequential = matches.opt_present("sequential");
-    let mode = if sequential { ExecutionMode::Sequential } else { ExecutionMode::Parallel };
+    let mode = if sequential {
+        ExecutionMode::Sequential
+    } else {
+        ExecutionMode::Parallel
+    };
     let v = require_vault_ref(st)?;
     let uuid = find_profile(v, n)?.uuid;
-    let verbose_fn = if verbose { Some(Box::new(|cmd: &str| println!("  [unlock] $ {cmd}")) as Box<dyn FnMut(&str) + Send>) } else { None };
-    unlock(v, &uuid, mode, |e| {
-        if !verbose {
-            println!(" ✓ {e}");
-        }
-    }, verbose_fn).await.map_err(AdminError::Unlock)?;
+    let verbose_fn = if verbose {
+        Some(Box::new(|cmd: &str| println!("  [unlock] $ {cmd}")) as Box<dyn FnMut(&str) + Send>)
+    } else {
+        None
+    };
+    unlock(
+        v,
+        &uuid,
+        mode,
+        |e| {
+            if !verbose {
+                println!(" ✓ {e}");
+            }
+        },
+        verbose_fn,
+    )
+    .await
+    .map_err(AdminError::Unlock)?;
     Ok(())
 }
 
 async fn handle_enroll(st: &mut State, parts: &[&str]) -> AdminResult<()> {
     let mut opts = Options::new();
-    opts.optopt("", "target", "filter by LUKS UUID or mapper name", "UUID|MAPPER");
+    opts.optopt(
+        "",
+        "target",
+        "filter by LUKS UUID or mapper name",
+        "UUID|MAPPER",
+    );
     opts.optflag("", "verbose", "show cryptsetup commands");
-    opts.optflag("", "sequential", "process targets sequentially (default: parallel)");
+    opts.optflag(
+        "",
+        "sequential",
+        "process targets sequentially (default: parallel)",
+    );
     opts.optflag("h", "help", "show help");
     let matches = opts.parse(&parts[1..]).map_err(AdminError::from)?;
-    
-    if matches.free.is_empty() { return Err(AdminError::InvalidArgument("Usage: enroll <profile> [--target <uuid|mapper>] [--verbose] [--sequential]".into())); }
+
+    if matches.free.is_empty() {
+        return Err(AdminError::InvalidArgument(
+            "Usage: enroll <profile> [--target <uuid|mapper>] [--verbose] [--sequential]".into(),
+        ));
+    }
     let n = &matches.free[0];
     let only = matches.opt_str("target");
     let verbose = matches.opt_present("verbose") || st.verbose;
     let sequential = matches.opt_present("sequential");
-    let mode = if sequential { ExecutionMode::Sequential } else { ExecutionMode::Parallel };
+    let mode = if sequential {
+        ExecutionMode::Sequential
+    } else {
+        ExecutionMode::Parallel
+    };
 
     let v = require_vault_mut(st)?;
-    let p = find_profile(&v, n)?.clone();
+    let p = find_profile(v, n)?.clone();
 
     if p.os_host_key.is_none() {
         let (os_host, os_port) = os_ssh_addr(&p);
-        println!("No OS host key pinned. Fetching from {}:{} ...", os_host, os_port);
-        let hk = fetch_host_key(&os_host, os_port, p.connect_timeout_s).await.map_err(AdminError::Net)?;
+        println!(
+            "No OS host key pinned. Fetching from {}:{} ...",
+            os_host, os_port
+        );
+        let hk = fetch_host_key(&os_host, os_port, p.connect_timeout_s)
+            .await
+            .map_err(AdminError::Net)?;
         println!("{} {}", hk.key_type, fingerprint_sha256(&hk.key_bytes));
-        if ask(CONFIRM_PIN_OS_HOST_KEY).to_lowercase() != "y" { return Err(AdminError::Aborted); }
-        v.set_host_key(&p.uuid, hk, true).map_err(AdminError::Vault)?;
+        if ask(CONFIRM_PIN_OS_HOST_KEY).to_lowercase() != "y" {
+            return Err(AdminError::Aborted);
+        }
+        v.set_host_key(&p.uuid, hk, true)
+            .map_err(AdminError::Vault)?;
     }
 
     let (username, auth, timeout) = setup_booted_access(&p)?;
@@ -851,7 +1223,7 @@ async fn handle_enroll(st: &mut State, parts: &[&str]) -> AdminResult<()> {
 
     // Filter targets based on --target
     let targets = filter_targets(&p, only.as_deref());
-    
+
     if targets.is_empty() {
         return Err(AdminError::NoTargetMatches(only.unwrap_or_default()));
     }
@@ -865,35 +1237,77 @@ async fn handle_enroll(st: &mut State, parts: &[&str]) -> AdminResult<()> {
     // Collect passphrases
     let passphrases = collect_luks_passphrases(&targets, same_passphrase)?;
 
-    let results = ltv_core::enroll(v, &p.uuid, &access, mode, |luks_uuid| {
-        passphrases.get(luks_uuid).cloned().ok_or_else(|| format!("no passphrase for {}", luks_uuid))
-    }, only.as_deref(), |e| {
-        match e {
-            EnrollEvent::Skipped(t, why) => println!(" ! {t}: skipped ({why})"),
-            other if !verbose => println!(" ✓ {other}"),
-            _ => {}
-        }
-    }, if verbose { Some(Box::new(|cmd: &str| println!("  [enroll] $ {cmd}")) as Box<dyn FnMut(&str) + Send>) } else { None }).await.map_err(AdminError::Unlock)?;
+    let results =
+        ltv_core::enroll(
+            v,
+            &p.uuid,
+            &access,
+            mode,
+            |luks_uuid| {
+                passphrases
+                    .get(luks_uuid)
+                    .cloned()
+                    .ok_or_else(|| format!("no passphrase for {}", luks_uuid))
+            },
+            only.as_deref(),
+            |e| match e {
+                EnrollEvent::Skipped(t, why) => println!(" ! {t}: skipped ({why})"),
+                other if !verbose => println!(" ✓ {other}"),
+                _ => {}
+            },
+            if verbose {
+                Some(Box::new(|cmd: &str| println!("  [enroll] $ {cmd}"))
+                    as Box<dyn FnMut(&str) + Send>)
+            } else {
+                None
+            },
+        )
+        .await
+        .map_err(AdminError::Unlock)?;
 
-    for r in &results { v.set_keyslot(&p.uuid, &r.luks_uuid, r.keyslot).map_err(AdminError::Vault)?; }
-    println!("enrolled {} target(s); keyslots recorded. Remember to 'save'.", results.len());
+    for r in &results {
+        v.set_keyslot(&p.uuid, &r.luks_uuid, r.keyslot)
+            .map_err(AdminError::Vault)?;
+    }
+    println!(
+        "enrolled {} target(s); keyslots recorded. Remember to 'save'.",
+        results.len()
+    );
     Ok(())
 }
 
 async fn handle_rotate(st: &mut State, parts: &[&str]) -> AdminResult<()> {
     let mut opts = Options::new();
-    opts.optopt("", "target", "filter by LUKS UUID or mapper name", "UUID|MAPPER");
+    opts.optopt(
+        "",
+        "target",
+        "filter by LUKS UUID or mapper name",
+        "UUID|MAPPER",
+    );
     opts.optflag("", "verbose", "show cryptsetup commands");
-    opts.optflag("", "sequential", "process targets sequentially (default: parallel)");
+    opts.optflag(
+        "",
+        "sequential",
+        "process targets sequentially (default: parallel)",
+    );
     opts.optflag("h", "help", "show help");
     let matches = opts.parse(&parts[1..]).map_err(AdminError::from)?;
-    
-    if matches.free.is_empty() { return Err(AdminError::InvalidArgument("Usage: rotate-key <profile> [--target <uuid|mapper>] [--verbose] [--sequential]".into())); }
+
+    if matches.free.is_empty() {
+        return Err(AdminError::InvalidArgument(
+            "Usage: rotate-key <profile> [--target <uuid|mapper>] [--verbose] [--sequential]"
+                .into(),
+        ));
+    }
     let n = &matches.free[0];
     let only = matches.opt_str("target");
     let verbose = matches.opt_present("verbose") || st.verbose;
     let sequential = matches.opt_present("sequential");
-    let mode = if sequential { ExecutionMode::Sequential } else { ExecutionMode::Parallel };
+    let mode = if sequential {
+        ExecutionMode::Sequential
+    } else {
+        ExecutionMode::Parallel
+    };
 
     // Pre-flight: get vault path early, check not dirty
     let vault_path = st.path.as_ref().ok_or(AdminError::NoVaultPath)?.clone();
@@ -914,15 +1328,23 @@ async fn handle_rotate(st: &mut State, parts: &[&str]) -> AdminResult<()> {
     }
 
     let v = require_vault_mut(st)?;
-    let p = find_profile(&v, n)?.clone();
+    let p = find_profile(v, n)?.clone();
 
     if p.os_host_key.is_none() {
         let (os_host, os_port) = os_ssh_addr(&p);
-        println!("No OS host key pinned. Fetching from {}:{} ...", os_host, os_port);
-        let hk = fetch_host_key(&os_host, os_port, p.connect_timeout_s).await.map_err(AdminError::Net)?;
+        println!(
+            "No OS host key pinned. Fetching from {}:{} ...",
+            os_host, os_port
+        );
+        let hk = fetch_host_key(&os_host, os_port, p.connect_timeout_s)
+            .await
+            .map_err(AdminError::Net)?;
         println!("{} {}", hk.key_type, fingerprint_sha256(&hk.key_bytes));
-        if ask(CONFIRM_PIN_OS_HOST_KEY).to_lowercase() != "y" { return Err(AdminError::Aborted); }
-        v.set_host_key(&p.uuid, hk, true).map_err(AdminError::Vault)?;
+        if ask(CONFIRM_PIN_OS_HOST_KEY).to_lowercase() != "y" {
+            return Err(AdminError::Aborted);
+        }
+        v.set_host_key(&p.uuid, hk, true)
+            .map_err(AdminError::Vault)?;
     }
 
     let (username, auth, timeout) = setup_booted_access(&p)?;
@@ -930,7 +1352,7 @@ async fn handle_rotate(st: &mut State, parts: &[&str]) -> AdminResult<()> {
 
     // Filter targets based on --target
     let targets = filter_targets(&p, only.as_deref());
-    
+
     if targets.is_empty() {
         return Err(AdminError::NoTargetMatches(only.unwrap_or_default()));
     }
@@ -945,8 +1367,12 @@ async fn handle_rotate(st: &mut State, parts: &[&str]) -> AdminResult<()> {
     let passphrases = collect_luks_passphrases(&targets, same_passphrase)?;
 
     // For paranoid mode, force sequential and save after each target
-    let use_paranoid = targets.len() > 0; // always use paranoid when we have targets
-    let effective_mode = if use_paranoid { ExecutionMode::Sequential } else { mode };
+    let use_paranoid = !targets.is_empty(); // always use paranoid when we have targets
+    let effective_mode = if use_paranoid {
+        ExecutionMode::Sequential
+    } else {
+        mode
+    };
     if !sequential && effective_mode == ExecutionMode::Sequential {
         println!("Note: using sequential mode for safe per-target vault persistence");
     }
@@ -956,61 +1382,117 @@ async fn handle_rotate(st: &mut State, parts: &[&str]) -> AdminResult<()> {
         save_vault_atomic(&vault_path_clone, vault)
     };
 
-    let results = ltv_core::rotate_key(v, &p.uuid, &access, effective_mode, |luks_uuid| {
-        passphrases.get(luks_uuid).cloned().ok_or_else(|| format!("no passphrase for {}", luks_uuid))
-    }, only.as_deref(), |e| {
-        match e {
-            RotateEvent::Skipped(t, why) => println!(" ! {t}: skipped ({why})"),
-            other if !verbose => println!(" ✓ {other}"),
-            _ => {}
-        }
-    }, if verbose { Some(Box::new(|cmd: &str| println!("  [rotate] $ {cmd}")) as Box<dyn FnMut(&str) + Send>) } else { None }, Some(&mut save_after_each)).await.map_err(AdminError::Unlock)?;
+    let results =
+        ltv_core::rotate_key(
+            v,
+            &p.uuid,
+            &access,
+            effective_mode,
+            |luks_uuid| {
+                passphrases
+                    .get(luks_uuid)
+                    .cloned()
+                    .ok_or_else(|| format!("no passphrase for {}", luks_uuid))
+            },
+            only.as_deref(),
+            |e| match e {
+                RotateEvent::Skipped(t, why) => println!(" ! {t}: skipped ({why})"),
+                other if !verbose => println!(" ✓ {other}"),
+                _ => {}
+            },
+            if verbose {
+                Some(Box::new(|cmd: &str| println!("  [rotate] $ {cmd}"))
+                    as Box<dyn FnMut(&str) + Send>)
+            } else {
+                None
+            },
+            Some(&mut save_after_each),
+        )
+        .await
+        .map_err(AdminError::Unlock)?;
 
     // Clean up backup on success
     let _ = fs::remove_file(&backup_path);
     println!("Backup removed: {}", backup_path);
 
-    println!("rotated {} target(s); vault saved after each target.", results.len());
+    println!(
+        "rotated {} target(s); vault saved after each target.",
+        results.len()
+    );
     Ok(())
 }
 
 async fn handle_copy_profile(st: &mut State, parts: &[&str]) -> AdminResult<()> {
     let mut opts = Options::new();
     opts.optopt("", "name", "new profile name", "NAME");
-    opts.optflag("k", "keep", "keep client keypair and host keys (identical copy)");
+    opts.optflag(
+        "k",
+        "keep",
+        "keep client keypair and host keys (identical copy)",
+    );
     opts.optflag("h", "help", "show help");
     let matches = opts.parse(&parts[1..]).map_err(AdminError::from)?;
-    
-    if matches.free.is_empty() { return Err(AdminError::InvalidArgument("Usage: copy-profile <source-vault> <source-profile> [--name <new-name>] [--keep]".into())); }
-    if matches.free.len() < 2 { return Err(AdminError::InvalidArgument("Usage: copy-profile <source-vault> <source-profile> [--name <new-name>] [--keep]".into())); }
-    
+
+    if matches.free.is_empty() {
+        return Err(AdminError::InvalidArgument(
+            "Usage: copy-profile <source-vault> <source-profile> [--name <new-name>] [--keep]"
+                .into(),
+        ));
+    }
+    if matches.free.len() < 2 {
+        return Err(AdminError::InvalidArgument(
+            "Usage: copy-profile <source-vault> <source-profile> [--name <new-name>] [--keep]"
+                .into(),
+        ));
+    }
+
     let src_vault_path = &matches.free[0];
     let src_profile_name = &matches.free[1];
     let new_name = matches.opt_str("name");
     let keep = matches.opt_present("keep");
-    
+
     // Open source vault
     let src_pass = prompt_passphrase(PROMPT_SRC_VAULT_PASSPHRASE)?;
     let src_bytes = fs::read(src_vault_path).map_err(AdminError::Io)?;
-    let src_vault = Vault::open(&src_bytes, &src_pass).map_err(|_| AdminError::IncorrectPassphrase)?;
-    
-    let src_profile = src_vault.find_by_name(src_profile_name).ok_or_else(|| AdminError::ProfileNotFound(src_profile_name.into()))?.clone();
-    let src_secrets = src_vault.open_secrets(&src_profile).map_err(AdminError::Vault)?;
-    
+    let src_vault =
+        Vault::open(&src_bytes, &src_pass).map_err(|_| AdminError::IncorrectPassphrase)?;
+
+    let src_profile = src_vault
+        .find_by_name(src_profile_name)
+        .ok_or_else(|| AdminError::ProfileNotFound(src_profile_name.into()))?
+        .clone();
+    let src_secrets = src_vault
+        .open_secrets(&src_profile)
+        .map_err(AdminError::Vault)?;
+
     // Determine destination vault (current open vault or new)
     let dest_name = new_name.unwrap_or_else(|| ask("New profile name: "));
-    if dest_name.is_empty() { return Err(AdminError::InvalidArgument("profile name required".into())); }
-    
+    if dest_name.is_empty() {
+        return Err(AdminError::InvalidArgument("profile name required".into()));
+    }
+
     let v = require_vault_mut(st)?;
-    
+
     // Check if name already exists in destination
     if v.find_by_name(&dest_name).is_some() {
-        return Err(AdminError::InvalidArgument(format!("profile '{}' already exists in destination vault", dest_name)));
+        return Err(AdminError::InvalidArgument(format!(
+            "profile '{}' already exists in destination vault",
+            dest_name
+        )));
     }
-    
+
     // Add profile to destination vault (with same OS address as source)
-    let new_uuid = v.add_profile(&dest_name, &src_profile.unlock_host, src_profile.unlock_port, &src_profile.username, src_profile.os_host.clone(), src_profile.os_port).map_err(AdminError::Vault)?;
-    
+    let new_uuid = v
+        .add_profile(
+            &dest_name,
+            &src_profile.unlock_host,
+            src_profile.unlock_port,
+            &src_profile.username,
+            src_profile.os_host.clone(),
+            src_profile.os_port,
+        )
+        .map_err(AdminError::Vault)?;
+
     if keep {
         // Keep client keypair and host keys - identical copy
         v.update_profile(&new_uuid, |p| {
@@ -1021,23 +1503,31 @@ async fn handle_copy_profile(st: &mut State, parts: &[&str]) -> AdminResult<()> 
             p.unlock_host_key = src_profile.unlock_host_key.clone();
             p.os_host_key = src_profile.os_host_key.clone();
             p.host_key_pinned_at = src_profile.host_key_pinned_at;
-            p.notes = format!("Copied from {} ({}) [kept]", src_profile_name, src_profile.unlock_host);
-        }).map_err(AdminError::Vault)?;
-        
+            p.notes = format!(
+                "Copied from {} ({}) [kept]",
+                src_profile_name, src_profile.unlock_host
+            );
+        })
+        .map_err(AdminError::Vault)?;
+
         // Use source secrets (same client key + keyfiles)
         let dest_secrets = SecretPayload {
             client_private_seed: src_secrets.client_private_seed,
             keyfiles: src_secrets.keyfiles.clone(),
         };
-        v.set_secrets(&new_uuid, &dest_secrets).map_err(AdminError::Vault)?;
-        
-        println!("Profile '{}' copied to '{}' in current vault (kept client key + host keys).", src_profile_name, dest_name);
+        v.set_secrets(&new_uuid, &dest_secrets)
+            .map_err(AdminError::Vault)?;
+
+        println!(
+            "Profile '{}' copied to '{}' in current vault (kept client key + host keys).",
+            src_profile_name, dest_name
+        );
         println!("Same authorized_keys applies. Remember to 'save'.");
     } else {
         // Generate new client keypair for destination
         let signing = SigningKey::generate(&mut rand::rngs::OsRng);
         let pubblob = ssh_ed25519_blob(signing.verifying_key().as_bytes());
-        
+
         v.update_profile(&new_uuid, |p| {
             p.client_public_key = pubblob;
             p.targets_meta = src_profile.targets_meta.clone();
@@ -1046,18 +1536,28 @@ async fn handle_copy_profile(st: &mut State, parts: &[&str]) -> AdminResult<()> 
             p.unlock_host_key = None; // Don't copy host keys
             p.os_host_key = None;
             p.host_key_pinned_at = 0;
-            p.notes = format!("Copied from {} ({})", src_profile_name, src_profile.unlock_host);
-        }).map_err(AdminError::Vault)?;
-        
+            p.notes = format!(
+                "Copied from {} ({})",
+                src_profile_name, src_profile.unlock_host
+            );
+        })
+        .map_err(AdminError::Vault)?;
+
         // Replace secrets with new client key + copied keyfiles
         let dest_secrets = SecretPayload {
             client_private_seed: signing.to_bytes(),
             keyfiles: src_secrets.keyfiles.clone(),
         };
-        v.set_secrets(&new_uuid, &dest_secrets).map_err(AdminError::Vault)?;
-        
-        println!("Profile '{}' copied to '{}' in current vault.", src_profile_name, dest_name);
-        println!("New client keypair generated. Remember to 'save' and deploy new authorized_keys.");
+        v.set_secrets(&new_uuid, &dest_secrets)
+            .map_err(AdminError::Vault)?;
+
+        println!(
+            "Profile '{}' copied to '{}' in current vault.",
+            src_profile_name, dest_name
+        );
+        println!(
+            "New client keypair generated. Remember to 'save' and deploy new authorized_keys."
+        );
     }
     Ok(())
 }
@@ -1067,37 +1567,62 @@ async fn handle_fetch(st: &mut State, parts: &[&str]) -> AdminResult<()> {
     opts.optflag("", "verbose", "show cryptsetup commands");
     opts.optflag("h", "help", "show help");
     let matches = opts.parse(&parts[1..]).map_err(AdminError::from)?;
-    
-    if matches.free.is_empty() { return Err(AdminError::InvalidArgument("Usage: fetch <profile> [--verbose]".into())); }
+
+    if matches.free.is_empty() {
+        return Err(AdminError::InvalidArgument(
+            "Usage: fetch <profile> [--verbose]".into(),
+        ));
+    }
     let n = &matches.free[0];
     let verbose = matches.opt_present("verbose") || st.verbose;
 
     let v = require_vault_mut(st)?;
-    let p = find_profile(&v, n)?.clone();
+    let p = find_profile(v, n)?.clone();
 
     // Fetch OS host key (for enroll/rotate against booted OS)
     if p.os_host_key.is_none() {
         let (os_host, os_port) = os_ssh_addr(&p);
-        println!("No OS host key pinned. Fetching from {}:{} ...", os_host, os_port);
+        println!(
+            "No OS host key pinned. Fetching from {}:{} ...",
+            os_host, os_port
+        );
         let hk = match fetch_host_key(&os_host, os_port, p.connect_timeout_s).await {
             Ok(hk) => hk,
             Err(e) => {
                 let msg = e.to_string();
                 if msg.contains("Connection refused") || msg.contains("Connection timed out") {
-                    return Err(AdminError::InvalidArgument(format!("Failed to connect to {}:{}. Is the OS booted and SSH running?", os_host, os_port)));
+                    return Err(AdminError::InvalidArgument(format!(
+                        "Failed to connect to {}:{}. Is the OS booted and SSH running?",
+                        os_host, os_port
+                    )));
                 }
                 return Err(AdminError::InvalidArgument(msg));
             }
         };
         println!("{} {}", hk.key_type, fingerprint_sha256(&hk.key_bytes));
-        if ask(CONFIRM_PIN_OS_HOST_KEY).to_lowercase() != "y" { return Err(AdminError::Aborted); }
-        v.set_host_key(&p.uuid, hk, true).map_err(AdminError::Vault)?;
+        if ask(CONFIRM_PIN_OS_HOST_KEY).to_lowercase() != "y" {
+            return Err(AdminError::Aborted);
+        }
+        v.set_host_key(&p.uuid, hk, true)
+            .map_err(AdminError::Vault)?;
     }
 
     let (username, auth, timeout) = setup_booted_access(&p)?;
     let access = make_booted_access(username, auth, timeout);
 
-    let results = fetch_luks_info(v, &p.uuid, &access, None, if verbose { Some(Box::new(|cmd: &str| println!("  [fetch] $ {cmd}")) as Box<dyn FnMut(&str) + Send>) } else { None }).await.map_err(AdminError::Unlock)?;
+    let results = fetch_luks_info(
+        v,
+        &p.uuid,
+        &access,
+        None,
+        if verbose {
+            Some(Box::new(|cmd: &str| println!("  [fetch] $ {cmd}")) as Box<dyn FnMut(&str) + Send>)
+        } else {
+            None
+        },
+    )
+    .await
+    .map_err(AdminError::Unlock)?;
 
     if results.is_empty() {
         println!("{}", MSG_NO_LUKS_VOLUMES);
@@ -1118,8 +1643,10 @@ async fn handle_fetch(st: &mut State, parts: &[&str]) -> AdminResult<()> {
             println!("       Key size: {} bits", info.key_size);
             println!("       Version: {}", info.header_version);
         } else {
-            println!("       Device: {} | Cipher: {} | Key size: {} bits | Version: {}", 
-                info.device_path, info.cipher, info.key_size, info.header_version);
+            println!(
+                "       Device: {} | Cipher: {} | Key size: {} bits | Version: {}",
+                info.device_path, info.cipher, info.key_size, info.header_version
+            );
         }
     }
 
@@ -1135,11 +1662,21 @@ async fn handle_fetch(st: &mut State, parts: &[&str]) -> AdminResult<()> {
     let mut diffs: Vec<TargetDiff> = Vec::new();
     for i in selection {
         let info = &results[i];
-        let Some(existing) = p.targets_meta.iter().find(|t| t.luks_uuid == info.luks_uuid) else {
+        let Some(existing) = p
+            .targets_meta
+            .iter()
+            .find(|t| t.luks_uuid == info.luks_uuid)
+        else {
             new_indices.push(i);
             continue;
         };
-        match target_diff(i, &info.luks_uuid, existing, info.mapper_name.as_deref(), &info.device_path) {
+        match target_diff(
+            i,
+            &info.luks_uuid,
+            existing,
+            info.mapper_name.as_deref(),
+            &info.device_path,
+        ) {
             Some(d) => diffs.push(d),
             None => println!("  already configured, unchanged: {}", existing.mapped_name),
         }
@@ -1147,7 +1684,11 @@ async fn handle_fetch(st: &mut State, parts: &[&str]) -> AdminResult<()> {
 
     // Resolve mapper names for new targets and validate all names before
     // mutating the vault, so a late collision cannot leave a partial update.
-    let mut used_mappers: Vec<String> = p.targets_meta.iter().map(|t| t.mapped_name.clone()).collect();
+    let mut used_mappers: Vec<String> = p
+        .targets_meta
+        .iter()
+        .map(|t| t.mapped_name.clone())
+        .collect();
     let mut new_targets: Vec<(usize, String)> = Vec::new();
     for i in new_indices {
         let info = &results[i];
@@ -1170,7 +1711,9 @@ async fn handle_fetch(st: &mut State, parts: &[&str]) -> AdminResult<()> {
     for d in &diffs {
         if let Some((_, new)) = &d.mapper {
             if used_mappers.iter().any(|m| m == new) {
-                return Err(AdminError::InvalidArgument(format!("mapper name '{new}' is already used by another target")));
+                return Err(AdminError::InvalidArgument(format!(
+                    "mapper name '{new}' is already used by another target"
+                )));
             }
         }
     }
@@ -1184,10 +1727,15 @@ async fn handle_fetch(st: &mut State, parts: &[&str]) -> AdminResult<()> {
                 println!("       mapper: {} -> {}", old, new);
             }
             if let Some((old, new)) = &d.device {
-                println!("       device: {} -> {}", old.as_deref().unwrap_or("(none)"), new);
+                println!(
+                    "       device: {} -> {}",
+                    old.as_deref().unwrap_or("(none)"),
+                    new
+                );
             }
         }
-        do_update = ask(&format!("Update these {} target(s)? [y/N]: ", diffs.len())).to_lowercase() == "y";
+        do_update =
+            ask(&format!("Update these {} target(s)? [y/N]: ", diffs.len())).to_lowercase() == "y";
     }
 
     let added = new_targets.len();
@@ -1201,7 +1749,8 @@ async fn handle_fetch(st: &mut State, parts: &[&str]) -> AdminResult<()> {
             keyslot: None,
             token_id: None,
         };
-        v.add_target(&p.uuid, meta, None).map_err(AdminError::Vault)?;
+        v.add_target(&p.uuid, meta, None)
+            .map_err(AdminError::Vault)?;
         println!("  added target {}", mapped);
     }
 
@@ -1209,7 +1758,11 @@ async fn handle_fetch(st: &mut State, parts: &[&str]) -> AdminResult<()> {
     if do_update {
         for d in &diffs {
             v.update_profile(&p.uuid, |prof| {
-                if let Some(t) = prof.targets_meta.iter_mut().find(|t| t.luks_uuid == d.luks_uuid) {
+                if let Some(t) = prof
+                    .targets_meta
+                    .iter_mut()
+                    .find(|t| t.luks_uuid == d.luks_uuid)
+                {
                     if let Some((_, new)) = &d.mapper {
                         t.mapped_name = new.clone();
                     }
@@ -1217,7 +1770,8 @@ async fn handle_fetch(st: &mut State, parts: &[&str]) -> AdminResult<()> {
                         t.fallback_path = Some(new.clone());
                     }
                 }
-            }).map_err(AdminError::Vault)?;
+            })
+            .map_err(AdminError::Vault)?;
             mapper_changed |= d.mapper.is_some();
             println!("  updated {}", d.luks_uuid);
         }
@@ -1242,10 +1796,14 @@ async fn handle_server_setup(st: &mut State, parts: &[&str]) -> AdminResult<()> 
     opts.optopt("o", "out", "output directory", "DIR");
     opts.optflag("h", "help", "show help");
     let matches = opts.parse(&parts[1..]).map_err(AdminError::from)?;
-    
-    if matches.free.is_empty() { return Err(AdminError::InvalidArgument("Usage: server-setup <profile> [--out <dir>]".into())); }
+
+    if matches.free.is_empty() {
+        return Err(AdminError::InvalidArgument(
+            "Usage: server-setup <profile> [--out <dir>]".into(),
+        ));
+    }
     let n = &matches.free[0];
-    let args: Vec<&str> = parts.iter().skip(2).map(|s| *s).collect();
+    let args: Vec<&str> = parts.iter().skip(2).copied().collect();
     cmd_server_setup(st, n, &args).await
 }
 
@@ -1253,20 +1811,23 @@ fn handle_passwd(st: &mut State, parts: &[&str]) -> AdminResult<()> {
     let mut opts = Options::new();
     opts.optflag("h", "help", "show help");
     let _matches = opts.parse(&parts[1..]).map_err(AdminError::from)?;
-    
+
     let path = require_vault_path(st)?.clone();
     let v = require_vault_mut(st)?;
-    
+
     // Ask for old passphrase and verify
     let old_pass = prompt_passphrase(PROMPT_OLD_PASSPHRASE)?;
     let bytes = fs::read(&path).map_err(AdminError::Io)?;
     Vault::open(&bytes, &old_pass).map_err(|_| AdminError::OldPassphraseIncorrect)?;
-    
+
     // Ask for new passphrase twice
-    let p1 = prompt_passphrase(PROMPT_NEW_PASSPHRASE)?; 
+    let p1 = prompt_passphrase(PROMPT_NEW_PASSPHRASE)?;
     let p2 = prompt_passphrase(PROMPT_REPEAT_PASSPHRASE)?;
-    if p1.expose_secret() != p2.expose_secret() { return Err(AdminError::PassphrasesDiffer); }
-    v.change_passphrase(0, &p1, Argon2Params::default()).map_err(AdminError::Vault)?;
+    if p1.expose_secret() != p2.expose_secret() {
+        return Err(AdminError::PassphrasesDiffer);
+    }
+    v.change_passphrase(0, &p1, Argon2Params::default())
+        .map_err(AdminError::Vault)?;
     println!("Passphrase changed successfully.");
     Ok(())
 }
@@ -1275,12 +1836,17 @@ fn handle_backup(st: &mut State, parts: &[&str]) -> AdminResult<()> {
     let mut opts = Options::new();
     opts.optflag("h", "help", "show help");
     let matches = opts.parse(&parts[1..]).map_err(AdminError::from)?;
-    
-    if matches.free.is_empty() { return Err(AdminError::InvalidArgument("Usage: backup <path>".into())); }
+
+    if matches.free.is_empty() {
+        return Err(AdminError::InvalidArgument("Usage: backup <path>".into()));
+    }
     let path = &matches.free[0];
     let v = require_vault_mut(st)?;
     let bytes = v.save().map_err(AdminError::Vault)?;
-    let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
     let backup_path = format!("{}.{}.bak", path, ts);
     fs::write(&backup_path, bytes).map_err(AdminError::Io)?;
     println!("backup saved to {}", backup_path);
@@ -1289,8 +1855,18 @@ fn handle_backup(st: &mut State, parts: &[&str]) -> AdminResult<()> {
 
 fn handle_dump_keys(st: &State, parts: &[&str]) -> AdminResult<()> {
     let mut opts = Options::new();
-    opts.optopt("o", "out", "output directory (default: <profile>-keys)", "DIR");
-    opts.optopt("t", "target", "only this target (UUID or mapper name)", "TARGET");
+    opts.optopt(
+        "o",
+        "out",
+        "output directory (default: <profile>-keys)",
+        "DIR",
+    );
+    opts.optopt(
+        "t",
+        "target",
+        "only this target (UUID or mapper name)",
+        "TARGET",
+    );
     opts.optflag("h", "help", "show help");
     let matches = opts.parse(&parts[1..]).map_err(AdminError::from)?;
 
@@ -1298,14 +1874,20 @@ fn handle_dump_keys(st: &State, parts: &[&str]) -> AdminResult<()> {
         println!("Usage: dump-keys <profile> [--out <dir>] [--target <uuid|mapper>]");
         println!();
         println!("Writes each target's raw LUKS keyfile to '<dir>/<mapper>.key' with mode 0600.");
-        println!("These files are direct unlock material: anyone holding them can open the volume.");
+        println!(
+            "These files are direct unlock material: anyone holding them can open the volume."
+        );
         println!("Scope: per-target LUKS keyfiles only (not the client SSH identity).");
         return Ok(());
     }
 
     let n = &matches.free[0];
     let only = matches.opt_str("target");
-    let out = PathBuf::from(matches.opt_str("out").unwrap_or_else(|| format!("{}-keys", safe_filename(n))));
+    let out = PathBuf::from(
+        matches
+            .opt_str("out")
+            .unwrap_or_else(|| format!("{}-keys", safe_filename(n))),
+    );
     let (v, p) = st.vault_and_profile_ref(n)?;
 
     // Re-verify vault master passphrase before dumping key material.
@@ -1323,9 +1905,18 @@ fn dump_keyfiles(v: &Vault, p: &Profile, only: Option<&str>, out: &Path) -> Admi
 
     // Borrow the key bytes straight from the zeroizing SecretPayload; no copies.
     let mut selected: Vec<(&TargetMeta, &[u8])> = Vec::new();
-    for t in p.targets_meta.iter().filter(|t| only.map_or(true, |f| f == t.luks_uuid || f == t.mapped_name)) {
-        let key = secrets.keyfiles.iter().find(|k| k.luks_uuid == t.luks_uuid)
-            .ok_or_else(|| AdminError::InvalidArgument(format!("missing keyfile for target {}", t.mapped_name)))?;
+    for t in p
+        .targets_meta
+        .iter()
+        .filter(|t| only.is_none_or(|f| f == t.luks_uuid || f == t.mapped_name))
+    {
+        let key = secrets
+            .keyfiles
+            .iter()
+            .find(|k| k.luks_uuid == t.luks_uuid)
+            .ok_or_else(|| {
+                AdminError::InvalidArgument(format!("missing keyfile for target {}", t.mapped_name))
+            })?;
         selected.push((t, &key.keyfile));
     }
     if selected.is_empty() {
@@ -1337,15 +1928,28 @@ fn dump_keyfiles(v: &Vault, p: &Profile, only: Option<&str>, out: &Path) -> Admi
 
     println!("This writes raw LUKS keyfiles in plaintext to the local filesystem.");
     println!("Anyone with these files can unlock the volume(s) without this vault.");
-    if require_exact(&format!("Dump {} keyfile(s) to '{}'? type YES: ", selected.len(), out.display()), "YES").is_err() {
+    if require_exact(
+        &format!(
+            "Dump {} keyfile(s) to '{}'? type YES: ",
+            selected.len(),
+            out.display()
+        ),
+        "YES",
+    )
+    .is_err()
+    {
         return Err(AdminError::Aborted);
     }
 
     let existed = out.exists();
-    fs::create_dir_all(out).map_err(|e| AdminError::InvalidArgument(format!("create {}: {e}", out.display())))?;
-    if !existed { secure_dir(&out)?; }
+    fs::create_dir_all(out)
+        .map_err(|e| AdminError::InvalidArgument(format!("create {}: {e}", out.display())))?;
+    if !existed {
+        secure_dir(out)?;
+    }
 
-    let paths: Vec<PathBuf> = selected.iter()
+    let paths: Vec<PathBuf> = selected
+        .iter()
         .map(|(t, _)| out.join(format!("{}.key", safe_filename(&t.mapped_name))))
         .collect();
     for (i, path) in paths.iter().enumerate() {
@@ -1354,18 +1958,31 @@ fn dump_keyfiles(v: &Vault, p: &Profile, only: Option<&str>, out: &Path) -> Admi
         }
     }
     let existing = paths.iter().filter(|p| p.exists()).count();
-    if existing > 0 && ask(&format!("{existing} key file(s) already exist there. Overwrite? [y/N]: ")).to_lowercase() != "y" {
+    if existing > 0
+        && ask(&format!(
+            "{existing} key file(s) already exist there. Overwrite? [y/N]: "
+        ))
+        .to_lowercase()
+            != "y"
+    {
         return Err(AdminError::Aborted);
     }
 
     for ((t, bytes), path) in selected.iter().zip(paths.iter()) {
-        write_secret_file(path, bytes).map_err(|e| AdminError::InvalidArgument(format!("write {}: {e}", path.display())))?;
-        println!("  {} ({} bytes)  mapper={} uuid={}", path.display(), bytes.len(), t.mapped_name, t.luks_uuid);
+        write_secret_file(path, bytes)
+            .map_err(|e| AdminError::InvalidArgument(format!("write {}: {e}", path.display())))?;
+        println!(
+            "  {} ({} bytes)  mapper={} uuid={}",
+            path.display(),
+            bytes.len(),
+            t.mapped_name,
+            t.luks_uuid
+        );
     }
     println!("done. Keep these files offline; delete them when no longer needed.");
     Ok(())
 }
- 
+
 #[cfg(test)]
 mod tests {
     use super::{fs, parse_selection, target_diff, TargetMeta};
@@ -1421,7 +2038,10 @@ mod tests {
     fn device_change_is_reported() {
         let d = target_diff(0, "uuid-1", &meta(), Some("cryptroot"), "/dev/nvme0n1p4").unwrap();
         assert!(d.mapper.is_none());
-        assert_eq!(d.device, Some((Some("/dev/vda4".into()), "/dev/nvme0n1p4".into())));
+        assert_eq!(
+            d.device,
+            Some((Some("/dev/vda4".into()), "/dev/nvme0n1p4".into()))
+        );
     }
 
     #[test]
@@ -1456,7 +2076,10 @@ mod tests {
         let path = dir.join("key");
         write_secret_file(&path, b"\x00secret\xff").unwrap();
         assert_eq!(fs::read(&path).unwrap(), b"\x00secret\xff");
-        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 }

@@ -15,6 +15,7 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 //! Centralized constants for the admin tool.
+#![allow(dead_code)]
 
 /// Prompt for OS SSH username
 pub const PROMPT_OS_SSH_USER: &str = "OS SSH user";
@@ -38,7 +39,8 @@ pub const PROMPT_KEY_FILE: &str = "Key file";
 pub const PROMPT_KEY_PASSPHRASE: &str = "Key passphrase: ";
 
 /// Prompt: Do all targets use the same LUKS passphrase?
-pub const PROMPT_SAME_LUKS_PASSPHRASE: &str = "Do all targets use the same LUKS passphrase? [Y/n]: ";
+pub const PROMPT_SAME_LUKS_PASSPHRASE: &str =
+    "Do all targets use the same LUKS passphrase? [Y/n]: ";
 
 /// Prompt for shared LUKS passphrase
 pub const PROMPT_LUKS_PASSPHRASE_ALL: &str = "Existing LUKS passphrase (for all targets): ";
@@ -47,7 +49,8 @@ pub const PROMPT_LUKS_PASSPHRASE_ALL: &str = "Existing LUKS passphrase (for all 
 pub const PROMPT_LUKS_PASSPHRASE_TARGET: &str = "Existing LUKS passphrase for {} ({}): ";
 
 /// Warning for target without keyslot
-pub const WARN_TARGET_NO_KEYSLOT: &str = "Warning: target {} ({}) has no keyslot recorded. Run 'enroll' first.";
+pub const WARN_TARGET_NO_KEYSLOT: &str =
+    "Warning: target {} ({}) has no keyslot recorded. Run 'enroll' first.";
 
 /// Error: vault has unsaved changes
 pub const ERR_VAULT_DIRTY: &str = "vault has unsaved changes; run 'save' first";
@@ -164,7 +167,8 @@ pub const MSG_VERBOSE: &str = "Verbose: {}";
 pub const CONFIRM_DISCARD: &str = "d";
 
 /// Target selection prompt
-pub const PROMPT_TARGET_SELECTION: &str = "\nTargets to add or refresh? [all/none/numbers, e.g. 0,2]: ";
+pub const PROMPT_TARGET_SELECTION: &str =
+    "\nTargets to add or refresh? [all/none/numbers, e.g. 0,2]: ";
 
 /// Confirmation for updating changed targets
 pub const CONFIRM_UPDATE_TARGETS: &str = "Update these {} target(s)? [y/N]: ";
@@ -185,7 +189,8 @@ pub const MSG_REMEMBER_SAVE: &str = "Remember to 'save'.";
 pub const MSG_NO_LUKS_VOLUMES: &str = "No LUKS volumes found.";
 
 /// Message: profile copied (kept)
-pub const MSG_PROFILE_COPIED_KEPT: &str = "Profile '{}' copied to '{}' in current vault (kept client key + host keys).";
+pub const MSG_PROFILE_COPIED_KEPT: &str =
+    "Profile '{}' copied to '{}' in current vault (kept client key + host keys).";
 
 /// Message: profile copied (new key)
 pub const MSG_PROFILE_COPIED_NEW: &str = "Profile '{}' copied to '{}' in current vault.";
@@ -194,13 +199,15 @@ pub const MSG_PROFILE_COPIED_NEW: &str = "Profile '{}' copied to '{}' in current
 pub const NOTE_SAME_AUTH_KEYS: &str = "Same authorized_keys applies. Remember to 'save'.";
 
 /// Note: new keypair generated
-pub const NOTE_NEW_KEYPAIR: &str = "New client keypair generated. Remember to 'save' and deploy new authorized_keys.";
+pub const NOTE_NEW_KEYPAIR: &str =
+    "New client keypair generated. Remember to 'save' and deploy new authorized_keys.";
 
 /// Error: profile already exists
 pub const ERR_PROFILE_EXISTS: &str = "profile '{}' already exists in destination vault";
 
 /// Error: mapper name already used
-pub const ERR_MAPPER_EXISTS: &str = "mapper name '{}' is already used by another target; rename that target first";
+pub const ERR_MAPPER_EXISTS: &str =
+    "mapper name '{}' is already used by another target; rename that target first";
 
 /// Error: invalid port
 pub const ERR_INVALID_PORT: &str = "bad port";

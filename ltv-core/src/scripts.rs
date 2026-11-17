@@ -41,47 +41,50 @@ pub fn render_deploy_nopatch_sh(kernel_version: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{constants::*, model::{Profile, TargetMeta}};
+    use crate::{
+        constants::*,
+        model::{Profile, TargetMeta},
+    };
     use uuid::Uuid;
 
     fn test_profile() -> Profile {
-    Profile {
-        uuid: Uuid::nil().into_bytes(),
-        name: "test".into(),
-        notes: "".into(),
-        unlock_host: "1.2.3.4".into(),
-        unlock_port: DEFAULT_SSH_PORT,
-        os_host: None,
-        os_port: None,
-        username: "root".into(),
-        unlock_host_key: None,
-        os_host_key: None,
-        host_key_pinned_at: 0,
-        client_public_key: vec![],
-        targets_meta: vec![
-            TargetMeta {
-                luks_uuid: "111832b4-5029-4439-8713-d5b928f44412".into(),
-                fallback_path: Some("/dev/vda4".into()),
-                mapped_name: "cryptroot".into(),
-                order: 0,
-                keyslot: Some(0),
-                token_id: None,
-            },
-            TargetMeta {
-                luks_uuid: "ac302374-1b08-4511-944b-ef1658dd909b".into(),
-                fallback_path: Some("/dev/vda5".into()),
-                mapped_name: "cryptdata".into(),
-                order: 1,
-                keyslot: Some(1),
-                token_id: None,
-            },
-        ],
-        connect_timeout_s: 10,
-        exec_timeout_s: 30,
-        envelope_nonce: [0u8; NONCE_LEN],
-        envelope_ciphertext: vec![],
+        Profile {
+            uuid: Uuid::nil().into_bytes(),
+            name: "test".into(),
+            notes: "".into(),
+            unlock_host: "1.2.3.4".into(),
+            unlock_port: DEFAULT_SSH_PORT,
+            os_host: None,
+            os_port: None,
+            username: "root".into(),
+            unlock_host_key: None,
+            os_host_key: None,
+            host_key_pinned_at: 0,
+            client_public_key: vec![],
+            targets_meta: vec![
+                TargetMeta {
+                    luks_uuid: "111832b4-5029-4439-8713-d5b928f44412".into(),
+                    fallback_path: Some("/dev/vda4".into()),
+                    mapped_name: "cryptroot".into(),
+                    order: 0,
+                    keyslot: Some(0),
+                    token_id: None,
+                },
+                TargetMeta {
+                    luks_uuid: "ac302374-1b08-4511-944b-ef1658dd909b".into(),
+                    fallback_path: Some("/dev/vda5".into()),
+                    mapped_name: "cryptdata".into(),
+                    order: 1,
+                    keyslot: Some(1),
+                    token_id: None,
+                },
+            ],
+            connect_timeout_s: 10,
+            exec_timeout_s: 30,
+            envelope_nonce: [0u8; NONCE_LEN],
+            envelope_ciphertext: vec![],
+        }
     }
-}
 
     #[test]
     fn test_render_deploy_sh() {

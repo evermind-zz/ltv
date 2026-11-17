@@ -17,8 +17,8 @@
 //! Shared LUKS utilities for enroll, rotate, and unlock operations.
 
 use crate::constants::*;
-use crate::model::TargetMeta;
 use crate::error::UnlockError;
+use crate::model::TargetMeta;
 use crate::net::exec;
 use russh::client::Handle;
 use secrecy::SecretString;
@@ -32,16 +32,30 @@ pub fn parse_used_slots(dump: &str) -> Vec<u8> {
     let mut in_keyslots = false;
     for line in dump.lines() {
         let l = line.trim();
-        if l.starts_with(LUKS2_KEYSLOTS_HEADER) { in_keyslots = true; continue; }
+        if l.starts_with(LUKS2_KEYSLOTS_HEADER) {
+            in_keyslots = true;
+            continue;
+        }
         if in_keyslots {
-            if l.ends_with(':') && !l.chars().next().map_or(false, |c| c.is_ascii_digit()) { in_keyslots = false; continue; }
+            if l.ends_with(':') && !l.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+                in_keyslots = false;
+                continue;
+            }
             if let Some((n, rest)) = l.split_once(':') {
-                if rest.trim().starts_with(LUKS2_KEYSLOT_TYPE) { if let Ok(x) = n.trim().parse() { v.push(x); } }
+                if rest.trim().starts_with(LUKS2_KEYSLOT_TYPE) {
+                    if let Ok(x) = n.trim().parse() {
+                        v.push(x);
+                    }
+                }
             }
         }
         if let Some(rest) = l.strip_prefix(LUKS1_KEY_SLOT_PREFIX) {
             if let Some((n, st)) = rest.split_once(':') {
-                if st.trim() == SLOT_ENABLED { if let Ok(x) = n.trim().parse() { v.push(x); } }
+                if st.trim() == SLOT_ENABLED {
+                    if let Ok(x) = n.trim().parse() {
+                        v.push(x);
+                    }
+                }
             }
         }
     }
@@ -191,6 +205,12 @@ Key Slot 2: DISABLED"#;
     fn test_first_free() {
         assert_eq!(first_free(&[0, 1, 2]), Some(3));
         assert_eq!(first_free(&[0, 2]), Some(1));
-        assert_eq!(first_free(&[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31]), None);
+        assert_eq!(
+            first_free(&[
+                0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22,
+                23, 24, 25, 26, 27, 28, 29, 30, 31
+            ]),
+            None
+        );
     }
 }

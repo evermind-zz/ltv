@@ -14,7 +14,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-use ltv_core::{Vault, format::Argon2Params, TargetMeta};
+use ltv_core::{format::Argon2Params, TargetMeta, Vault};
 use secrecy::SecretVec;
 use tempfile::tempdir;
 
@@ -22,9 +22,11 @@ use tempfile::tempdir;
 fn test_create_vault() {
     let pass = SecretVec::new("abc".as_bytes().to_vec());
     let mut vault = Vault::create(&pass, Argon2Params::default()).unwrap();
-    
-    let uuid = vault.add_profile("test", "192.0.2.100", 22, "root", None, None).unwrap();
-    
+
+    let uuid = vault
+        .add_profile("test", "192.0.2.100", 22, "root", None, None)
+        .unwrap();
+
     let meta = TargetMeta {
         luks_uuid: "40b886d1-3f5c-4527-913f-b6ff3d1b2fca".to_string(),
         fallback_path: Some("/dev/vda2".to_string()),
@@ -34,7 +36,7 @@ fn test_create_vault() {
         token_id: None,
     };
     vault.add_target(&uuid, meta, None).unwrap();
-    
+
     let bytes = vault.save().unwrap();
     let dir = tempdir().unwrap();
     let path = dir.path().join("test.ltv");

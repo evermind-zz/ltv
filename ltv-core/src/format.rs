@@ -27,9 +27,19 @@ pub const MIN_MEM_KIB: u32 = 16 * 1024;
 pub const MIN_TIME: u32 = 2;
 
 #[derive(Clone, Copy, Debug)]
-pub struct Argon2Params { pub mem_kib: u32, pub time: u32, pub par: u8 }
+pub struct Argon2Params {
+    pub mem_kib: u32,
+    pub time: u32,
+    pub par: u8,
+}
 impl Default for Argon2Params {
-    fn default() -> Self { Self { mem_kib: DEFAULT_ARGON2_MEM_MIB * 1024, time: DEFAULT_ARGON2_TIME, par: DEFAULT_ARGON2_PAR } }
+    fn default() -> Self {
+        Self {
+            mem_kib: DEFAULT_ARGON2_MEM_MIB * 1024,
+            time: DEFAULT_ARGON2_TIME,
+            par: DEFAULT_ARGON2_PAR,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -68,14 +78,26 @@ impl Header {
 
     /// Returns (header, header_len)
     pub fn decode(buf: &[u8]) -> Result<(Header, usize), VaultError> {
-        if buf.len() < FIXED_LEN { return Err(VaultError::Truncated); }
-        if &buf[0..4] != MAGIC { return Err(VaultError::BadMagic); }
-        if buf[4] != VERSION { return Err(VaultError::Version(buf[4])); }
-        if buf[5] != SUITE { return Err(VaultError::Suite(buf[5])); }
+        if buf.len() < FIXED_LEN {
+            return Err(VaultError::Truncated);
+        }
+        if &buf[0..4] != MAGIC {
+            return Err(VaultError::BadMagic);
+        }
+        if buf[4] != VERSION {
+            return Err(VaultError::Version(buf[4]));
+        }
+        if buf[5] != SUITE {
+            return Err(VaultError::Suite(buf[5]));
+        }
         let n = buf[6] as usize;
-        if n == 0 || n > MAX_SLOTS { return Err(VaultError::Truncated); }
+        if n == 0 || n > MAX_SLOTS {
+            return Err(VaultError::Truncated);
+        }
         let total = FIXED_LEN + SLOT_LEN * n;
-        if buf.len() < total + 16 { return Err(VaultError::Truncated); }
+        if buf.len() < total + 16 {
+            return Err(VaultError::Truncated);
+        }
         let mut payload_nonce = [0u8; 24];
         payload_nonce.copy_from_slice(&buf[8..32]);
         let mut slots = Vec::with_capacity(n);
@@ -90,12 +112,27 @@ impl Header {
             if params.mem_kib < MIN_MEM_KIB || params.time < MIN_TIME || params.par == 0 {
                 return Err(VaultError::WeakParams);
             }
-            let mut salt = [0u8; 16]; salt.copy_from_slice(&s[9..25]);
-            let mut wrap_nonce = [0u8; 24]; wrap_nonce.copy_from_slice(&s[25..49]);
-            let mut wrapped = [0u8; 48]; wrapped.copy_from_slice(&s[49..97]);
-            slots.push(Slot { params, salt, wrap_nonce, wrapped });
+            let mut salt = [0u8; 16];
+            salt.copy_from_slice(&s[9..25]);
+            let mut wrap_nonce = [0u8; 24];
+            wrap_nonce.copy_from_slice(&s[25..49]);
+            let mut wrapped = [0u8; 48];
+            wrapped.copy_from_slice(&s[49..97]);
+            slots.push(Slot {
+                params,
+                salt,
+                wrap_nonce,
+                wrapped,
+            });
         }
-        Ok((Header { flags: buf[7], payload_nonce, slots }, total))
+        Ok((
+            Header {
+                flags: buf[7],
+                payload_nonce,
+                slots,
+            },
+            total,
+        ))
     }
 
     /// AAD for slot i = static header fields || i

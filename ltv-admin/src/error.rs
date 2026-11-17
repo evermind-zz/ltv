@@ -15,11 +15,12 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 //! Admin tool error types.
+use ltv_core::error::{NetError, UnlockError, VaultError};
 use std::path::PathBuf;
 use thiserror::Error;
-use ltv_core::error::{VaultError, NetError, UnlockError};
 
 #[derive(Debug, Error)]
+#[allow(dead_code)]
 pub enum AdminError {
     #[error("no vault open")]
     NoVaultOpen,
@@ -103,6 +104,7 @@ impl From<&str> for AdminError {
 pub type AdminResult<T> = Result<T, AdminError>;
 
 /// Extension trait for converting common errors to AdminError with context.
+#[allow(dead_code)]
 pub(crate) trait ToAdminResult<T, E> {
     fn admin_ctx(self, msg: &str) -> AdminResult<T>
     where
