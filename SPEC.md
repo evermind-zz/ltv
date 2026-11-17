@@ -128,8 +128,6 @@ pub struct TargetMeta {
 
 #[derive(Serialize, Deserialize, Clone)]
 pub enum ResumePolicy {
-    /// initramfs hook polls /dev/mapper/<name>; nothing to send.
-    DeviceMapperPoll,
     /// run explicit command after all targets succeeded
     Command(String),                   // default: "touch /run/ltv/resume"
 }
@@ -164,32 +162,49 @@ Invariant: `targets_meta[i].luks_uuid` has exactly one matching `TargetKey`. Val
 
 LTV does **not** use `cryptsetup-ssh`. The server needs:
 
-1. **Dropbear in initramfs** with its own persistent Ed25519 host key (generated once, stored in `/etc/dropbear/` and copied into the initramfs by a custom `mkinitfs` feature `ltv`).
-2. `authorized_keys` for `root` inside the initramfs containing the LTV client public key (restricted: `no-port-forwarding,no-agent-forwarding,no-X11-forwarding`).
+1. **Dropbear in initramfs** with its own persistent Ed25519 host key (generated once by `server-setup`, stored in `/etc/mkinitfs/ltv-stuff/etc/dropbear/` and copied into the initramfs by the `ltv` mkinitfs feature).
+2. `authorized_keys` for `root` inside the initramfs containing the LTV client public key (restricted: `no-port-forwarding,no-agent-forwarding,no-X11-forwarding,no-pty`).
 3. `cryptsetup` binary in initramfs (already provided by the `cryptsetup` mkinitfs feature).
-4. **`ltv-hook`**, a tiny ash script run by `init` before the normal root-unlock step:
+4. **`ltv-luks-wrapper.sh`**, an ash script that replaces the `nlplug-findfs` call in `initramfs-init` (patched by `ltv-patch-init.sh`):
 
 ```sh
 #!/bin/sh
-# /usr/share/mkinitfs/features.d/ltv  → installs this hook
-mkdir -p /run/ltv
-dropbear -R -s -j -k -p 22 -r /etc/dropbear/dropbear_ed25519_host_key
-# wait until all configured mappers exist OR explicit resume flag
-while :; do
-    ready=1
-    for n in $LTV_MAPPERS; do [ -e /dev/mapper/$n ] || ready=0; done
-    [ $ready = 1 ] && break
-    [ -e /run/ltv/resume ] && break
-    sleep 1
-done
-killall dropbear 2>/dev/null
+# ltv-luks-wrapper: controlled nlplug-findfs with dual unlock path
+# Replaces direct nlplug-findfs cryptroot call in initramfs-init
+
+# 1. Filter crypto arguments from nlplug-findfs call
+# ... argument filtering ...
+
+# 2. Start dropbear SSH server so ltv-admin can connect
+dropbear -E -p ${LTV_PORT:-22} -r /etc/mkinitfs/ltv-stuff/etc/dropbear/dropbear_ed25519_host_key -D /etc/mkinitfs/ltv-stuff/root/.ssh/ &
+
+# 3. Background monitor for SSH Unlock
+(
+    while true; do
+        if [ -e /run/ltv/resume ]; then
+            # Kill the first nlplug-findfs process
+            NLPID=$(pidof nlplug-findfs)
+            [ -n "$NLPID" ] && kill -9 $NLPID 2>/dev/null || true
+            break
+        fi
+        sleep 1
+    done
+) &
+MONITOR_PID=$!
+
+# 4. First run in foreground (for TTY password prompt)
+nlplug-findfs "$@" || true
+
+# 5. If unlocked via SSH: Second run without crypto options
+if [ -e /run/ltv/resume ]; then
+    # Run with non-crypto arguments only (triggers mdev/LVM for open mapper)
+    nlplug-findfs "$@"
+fi
 ```
 
-`LTV_MAPPERS` comes from a kernel cmdline parameter (`ltv_mappers=cryptroot,cryptdata`) written by the admin's `server-setup` output.
+5. The LUKS keyfile (64 B) must be **enrolled** into a dedicated keyslot per volume (`cryptsetup luksAddKey <dev> --new-keyfile=-`), performed by `ltv-admin enroll` over the normal booted OS SSH, or manually.
 
-5. The LUKS keyfile (64 B) must be **enrolled** into a dedicated keyslot per volume (`cryptsetup luksAddKey <dev> -`), performed by `ltv-admin enroll` over the normal booted OS SSH, or manually.
-
-The admin tool generates all of the above (feature file, hook, `authorized_keys` line, kernel cmdline snippet) via `server-setup`; the admin deploys them manually (as decided).
+The admin tool generates all of the above (feature files, wrapper, patch script, `authorized_keys` line, kernel cmdline snippet) via `server-setup`; the admin deploys them manually (as decided).
 
 ---
 
@@ -260,7 +275,7 @@ pub mod ltv_core {
         pub fn remove_profile(&mut self, uuid: Uuid) -> Result<(), VaultError>;
         pub fn add_target(&mut self, uuid: Uuid, meta: TargetMeta, key: KeySource) -> Result<(), VaultError>;
         pub fn remove_target(&mut self, uuid: Uuid, luks_uuid: &str) -> Result<(), VaultError>;
-        pub fn rotate_client_key(&mut self, uuid: Uuid) -> Result<Vec<u8>, VaultError>; // returns new pubkey
+        pub fn rotate_keyfile(&mut self, uuid: Uuid, luks_uuid: &str, new_keyfile: Vec<u8>, new_slot: u8) -> Result<(), VaultError>;
         pub fn export_public_key(&self, uuid: Uuid) -> String;      // "ssh-ed25519 AAAA... ltv:<name>"
         pub fn export_keyfile(&self, uuid: Uuid, luks_uuid: &str, passphrase_confirm: &SecretVec<u8>)
             -> Result<SecretVec<u8>, VaultError>;                   // explicit, re-auth required
@@ -287,8 +302,8 @@ pub mod ltv_core {
         pub async fn fetch_host_key(host: &str, port: u16) -> Result<HostKey, NetError>; // TOFU helper
         pub async fn unlock(vault: &Vault, uuid: Uuid, progress: impl FnMut(UnlockEvent))
             -> Result<UnlockReport, UnlockError>;
-        pub async fn enroll(vault: &Vault, uuid: Uuid, booted: &BootedAccess, progress: impl FnMut(UnlockEvent))
-            -> Result<(), UnlockError>;     // luksAddKey over normal OS SSH
+        pub async fn enroll(vault: &Vault, uuid: Uuid, booted: &BootedAccess, progress: impl FnMut(EnrollEvent))
+            -> Result<Vec<EnrollResult>, UnlockError>;     // luksAddKey over normal OS SSH
         pub async fn fetch_luks_info(vault: &Vault, uuid: &[u8; 16], booted: &BootedAccess, only_mapped: Option<&str>)
             -> Result<Vec<FetchedLuksInfo>, UnlockError>; // discover LUKS volumes on booted OS
     }
@@ -303,6 +318,9 @@ pub mod ltv_core {
 
     pub enum UnlockEvent { Connecting, HostKeyVerified, Authenticated,
                            TargetStart(String), TargetDone(String), ResumeSent, Disconnected }
+    pub enum EnrollEvent { Connected, Authenticated,
+                           TargetStart(String), SlotChosen(String, u8), SlotAdded(String, u8),
+                           SlotUpdated(String, u8), Verified(String), Skipped(String, String), Done }
 
     // ---- ffi ----
     // uniffi scaffolding exposes: open/save/profiles/probe/unlock (read-only subset) for Android.
@@ -329,7 +347,6 @@ Feature flags: `write` (vault mutation, enroll — enabled for admin, disabled f
 | `create <file> [--argon-mem --argon-time]` | New vault, prompts passphrase twice |
 | `open <file>` / `close` / `save` / `status` | Vault lifecycle; `status` shows file, dirty flag, profile count |
 | `passwd` | Change master passphrase (re-derive, new salt) |
-| `params` | Show/adjust Argon2 params (re-encrypt) |
 | `ls` | List profiles: name, host, #targets, last probe state |
 | `show <profile>` | Full profile details (public parts only) |
 | `add` | **Wizard**: name → host/port/user → host key (fetch & confirm fingerprint / paste / skip) → targets loop (UUID, fallback path, mapper name, generate/import key) → resume policy → summary → confirm |
@@ -337,17 +354,17 @@ Feature flags: `write` (vault mutation, enroll — enabled for admin, disabled f
 | `rm <profile>` | Remove (confirm) |
 | `target add/rm <profile>` | Manage targets |
 | `pubkey <profile> [--authorized-keys]` | Print Ed25519 pubkey, optionally as restricted `authorized_keys` line |
-| `rotate-key <profile>` | New Ed25519 pair; prints new pubkey, reminds to redeploy |
+| `rotate-key <profile> [--target <uuid\|mapper>] [--verbose] [--sequential]` | **LUKS keyfile rotation**: generate new keyfile, add to free slot, verify, save vault, remove old slot; per-target persistence |
 | `hostkey fetch <profile> [--os]` | TOFU-fetch Dropbear (or OS) host key, show fingerprint, confirm, store |
-| `probe [<profile>|--all]` | State detection |
+| `probe [<profile>\|--all]` | State detection |
 | `unlock <profile>` | Perform full push-unlock with live progress |
-| `enroll <profile> [--target <uuid>]` | Connect to **booted OS** (asks for OS SSH credentials/key + existing LUKS passphrase), runs `luksAddKey` per target, verifies with `luksDump`, optionally detects LUKS UUIDs from `blkid` to fill targets |
+| `enroll <profile> [--target <uuid>]` | Connect to **booted OS** (asks for OS SSH credentials/key + existing LUKS passphrase), runs `luksAddKey` per target, verifies with `luksDump`, records keyslot |
 | `fetch <profile>` | Connect to **booted OS** (asks for OS SSH credentials/key), runs `blkid` + `cryptsetup luksDump` to discover LUKS volumes, displays cipher/key size/version, offers to add all as targets with generated keyfiles |
-| `server-setup <profile>` | Generates mkinitfs feature file, `ltv-hook`, `authorized_keys` line, kernel cmdline snippet, step-by-step deployment checklist; writes to `./ltv-server-<name>/` |
+| `server-setup <profile> [--out <dir>]` | Generates mkinitfs feature files, `ltv-luks-wrapper.sh`, `ltv-patch-init.sh`, `ltv-commit-hook.sh`, `authorized_keys`, Dropbear keys, deploy scripts, README; writes to `./ltv-deploy-<name>/` |
 | `export-keyfile <profile> <uuid> <path>` | Emergency plaintext export; requires passphrase re-entry and typed `YES` |
 | `backup <path>` | Copy vault (already encrypted) with timestamp |
-| `import-profile` / `export-profile` | Move single profile between vaults (re-encrypted under target vault) |
-| `lock-timeout <sec>` | Auto-close vault on idle |
+| `copy-profile <src> <dst>` | Copy profile to another vault (re-encrypted under target vault) |
+| `dump-keys <profile> [--out <dir>] [--target <uuid\|mapper>]` | Dump raw LUKS keyfiles to files (requires passphrase re-entry) |
 | `help`, `quit` | — |
 
 ### 7.3 Shell Session Example
@@ -397,7 +414,7 @@ Kotlin/Compose UI over `ltv-core` via UniFFI (`write` feature off). No profile e
 
 ## 9. Open Points / Unclear Items
 
-1. **Alpine integration depth.** Alpine's stock `init` uses `nlplug-findfs` to prompt for the root passphrase. The `ltv-hook` must run *before* that step and either satisfy it (mapper already exists → `nlplug-findfs` skips the prompt — to be verified) or replace it. Needs a test on a real mkinitfs version.
+1. **Alpine integration depth.** Alpine's stock `init` uses `nlplug-findfs` to prompt for the root passphrase. The `ltv-luks-wrapper.sh` must run *before* that step and either satisfy it (mapper already exists → `nlplug-findfs` skips the prompt — to be verified) or replace it. Needs a test on a real mkinitfs version.
 2. **Dropbear in Alpine initramfs** is not a stock mkinitfs feature; the `ltv` feature file must list the Dropbear binary + libs correctly (musl static build preferred to avoid lib-path issues).
 3. **`UUID=` device syntax** is documented for cryptsetup but relies on `blkid`-style scanning inside initramfs; confirm it works without udev under `mdev`. Fallback path is specified for this reason.
 4. **Exit code mapping** of `cryptsetup` (2 = no key, 5 = device busy) must be verified against the Alpine-shipped version.
@@ -405,7 +422,7 @@ Kotlin/Compose UI over `ltv-core` via UniFFI (`write` feature off). No profile e
 6. **Host key change on reinstall.** Decided: strict mismatch aborts. Workflow for intentional changes = `hostkey fetch` on admin, re-export vault to phone. Acceptable? Consider an admin-side "expected change" flag.
 7. **Multiple admins / shared vault.** Not addressed; single-passphrase model. Could be extended later via per-user key slots in the header (format version 2).
 8. **Android `mlock`** is unreliable; residual risk documented, not solved.
-9. **Keyslot hygiene.** `enroll` should record which keyslot it used (returned by `luksAddKey` output) so `rotate-key`/revocation can `luksKillSlot` precisely. Field `keyslot: Option<u8>` in `TargetMeta` — add in schema v1 or defer?
+9. **Keyslot hygiene.** `enroll` records which keyslot it used (returned by `luksAddKey` output) so `rotate-key`/revocation can `luksKillSlot` precisely. Field `keyslot: Option<u8>` in `TargetMeta` is in schema v1.
 10. **Naming.** Extension `.ltv`, magic `LTCV`, crate names `ltv-core` / `ltv-admin`.
 
 ---
@@ -426,7 +443,7 @@ Two options, both kept in the spec:
 | Attack surface | Generic SSH server, root login | Minimal, no exec of arbitrary commands, pubkey-only, single client key compiled from config |
 | Risk | mkinitfs packaging (libs) | We maintain a pre-boot network daemon |
 
-Decision: Phase 1 ships Dropbear + hook. `ltv-core` abstracts the remote side as a `Transport` trait so `ltv-agent` can be dropped in later without changing vault format or UI. The agent is explicitly out of scope for the first code drop.
+Decision: Phase 1 ships Dropbear + wrapper. `ltv-core` abstracts the remote side as a `Transport` trait so `ltv-agent` can be dropped in later without changing vault format or UI. The agent is explicitly out of scope for the first code drop.
 
 ### 6) Host key changes → admin-only, mobile read-only
 - `hostkey fetch` exists only with the `write` feature.
@@ -486,7 +503,7 @@ Slot (97 B):
 - `TargetMeta.token_id: Option<u32>` (only if option C used)
 
 ### §4 Server contract
-- Phase 1: Dropbear + `ltv-hook` (unchanged).
+- Phase 1: Dropbear + `ltv-luks-wrapper.sh` + `ltv-patch-init.sh`.
 - Phase 2: `ltv-agent` (russh server, verbs `probe|unlock|resume`), same host key file, same `authorized_keys`.
 - `ltv-core` talks to both via `trait RemoteBoot { probe; open_target; resume }`; Dropbear implementation = `exec` channels.
 
