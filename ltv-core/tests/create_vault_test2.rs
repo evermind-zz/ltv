@@ -1,5 +1,6 @@
 use ltv_core::{Vault, format::Argon2Params, TargetMeta};
 use secrecy::SecretVec;
+use tempfile::tempdir;
 
 #[test]
 fn test_create_vault2() {
@@ -19,6 +20,8 @@ fn test_create_vault2() {
     vault.add_target(&uuid, meta, None).unwrap();
     
     let bytes = vault.save().unwrap();
-    std::fs::write("../test2.ltv", bytes).unwrap();
-    println!("Vault created successfully");
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("test2.ltv");
+    std::fs::write(&path, bytes).unwrap();
+    println!("Vault created successfully at {}", path.display());
 }

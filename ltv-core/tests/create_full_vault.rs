@@ -1,5 +1,6 @@
 use ltv_core::{Vault, format::Argon2Params, TargetMeta};
 use secrecy::SecretVec;
+use tempfile::tempdir;
 
 #[test]
 fn test_create_full_vault() {
@@ -29,6 +30,8 @@ fn test_create_full_vault() {
     vault.add_target(&uuid, meta2, Some("xyz".as_bytes().to_vec())).unwrap();
 
     let bytes = vault.save().unwrap();
-    std::fs::write("../test_full.ltv", bytes).unwrap();
-    println!("Full vault created successfully");
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("test_full.ltv");
+    std::fs::write(&path, bytes).unwrap();
+    println!("Full vault created successfully at {}", path.display());
 }
