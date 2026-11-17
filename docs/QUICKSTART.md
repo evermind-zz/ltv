@@ -48,11 +48,7 @@ scp -r ./deploy-myserver root@192.0.2.10:/root/
 # On target (as root):
 cd /root/deploy-myserver
 ./deploy.sh
-# Follow printed manual steps:
-# 1. Add 'ltv' to FEATURES in /etc/mkinitfs/mkinitfs.conf
-# 2. Add kernel cmdline: ltv=yes ip=dhcp modules=virtio_net
-# 3. Run mkinitfs manually
-# 4. Update bootloader (INTEGRATE params, don't replace) and reboot
+# Follow printed manual steps (see [DEPLOYMENT.md](DEPLOYMENT.md#manual-completion-printed-by-deploysh))
 reboot
 ```
 
@@ -90,6 +86,8 @@ ltv-admin> save
 ltv-admin> quit
 ```
 
+*Details: [WORKFLOWS.md §4 Enrollment](WORKFLOWS.md#4-enrollment-add-ltv-keyfile-to-luks-header)*
+
 ## 6. Test Unlock
 
 Reboot target -> initramfs -> from admin:
@@ -105,6 +103,8 @@ ltv-admin> unlock myserver
 ```
 
 Server boots to login prompt. Done!
+
+*Details: [WORKFLOWS.md §5 Remote Unlock](WORKFLOWS.md#5-remote-unlock-boot-time)*
 
 ## One-Line Cheat Sheet
 

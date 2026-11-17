@@ -107,71 +107,26 @@ Interactive shell (sqlite-style) and non-interactive subcommands:
 
 The `server-setup` command generates all files needed to deploy LTV remote unlock to an Alpine Linux server. It creates an `mkinitfs` feature that installs Dropbear and the LTV luks-wrapper into the initramfs.
 
-### Prerequisites on Target Server
+**For the complete deployment guide, see [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).**
 
-- Alpine Linux with `mkinitfs` (standard on Alpine)
-- Target server must boot with the generated initramfs
-
-### Deployment Workflow
+### Quick Overview
 
 ```bash
-# 1. On admin workstation: generate deployment artifacts
+# 1. Generate deployment artifacts
 ltv-admin> server-setup web01 --out ./deploy-web01
 
-# This creates ./deploy-web01/ with:
-#   ltv.files, ltv.modules, ltv.packages      - mkinitfs feature definition
-#   ltv-luks-wrapper.sh                        - wrapper script (replaces nlplug-findfs)
-#   ltv-patch-init.sh                          - idempotent patcher for initramfs-init
-#   ltv-commit-hook.sh                         - apk commit hook for persistence
-#   authorized_keys                            - restricted client pubkey for initramfs SSH
-#   dropbear_ed25519_host_key                  - Dropbear host private key (pre-generated)
-#   dropbear_ed25519_host_key.pub              - Dropbear host public key
-#   deploy.sh                                  - run this on target server (patches initramfs-init)
-#   deploy_nopatch.sh                          - alternative without patching
-#   README.md                                  - deployment instructions
-```
-
-```bash
 # 2. Copy to target Alpine server
 scp -r ./deploy-web01 root@target:/root/
 
 # 3. On target server (as root):
 cd /root/deploy-web01
 ./deploy.sh
-```
-
-The `deploy.sh` script:
-1. Copies feature files to `/etc/mkinitfs/features.d/`
-2. Copies wrapper to `/usr/share/mkinitfs/ltv-luks-wrapper.sh`
-3. Creates Dropbear host key and authorized_keys overlay in `/etc/mkinitfs/ltv-stuff/`
-4. Installs patch script and apk commit hook
-5. Patches `/usr/share/mkinitfs/initramfs-init` (idempotent)
-6. **Prints manual steps** (does NOT run mkinitfs automatically)
-
-```bash
-# 4. Manual steps (printed by deploy.sh):
-#    a) Add 'ltv' to FEATURES in /etc/mkinitfs/mkinitfs.conf:
-#       FEATURES="virtio base cryptsetup ltv network keymap ata ide scsi usb phy ext4"
-#    b) Add kernel cmdline: ltv=yes ip=dhcp modules=virtio_net
-#    c) Regenerate initramfs:
-#       mkinitfs -F "virtio base cryptsetup ltv network keymap ata ide scsi usb phy ext4" -k "$KERNEL" \
-#         -o "/boot/initramfs-ltv-$KERNEL" "$KERNEL"
-#    d) Update bootloader and reboot
-reboot
+# Follow the printed manual steps, then reboot
 ```
 
 ### What Happens at Boot
 
-1. Kernel loads initramfs with LTV feature
-2. Patched `initramfs-init` runs `configure_ip` when `ltv=yes` is set
-3. `nlplug-findfs` call replaced with `ltv-luks-wrapper.sh`
-4. Wrapper starts Dropbear on port 22 (Ed25519 host key, pubkey-only auth)
-5. Wrapper runs `nlplug-findfs` (foreground, TTY password prompt available)
-6. Background monitor waits for `/run/ltv/resume` (created by unlock client)
-7. Admin runs `ltv-admin unlock web01` from workstation
-8. Client pushes keyfiles over SSH to `cryptsetup --key-file=-`
-9. On success, client writes `/run/ltv/resume`, wrapper kills first nlplug-findfs, runs second
-10. Boot continues
+See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md#boot-process) for the detailed boot sequence.
 
 ### Generated Kernel Cmdline
 
@@ -179,16 +134,11 @@ reboot
 ltv=yes ip=dhcp modules=virtio_net
 ```
 
-- `ltv=yes` - enables LTV remote unlock (required)
-- `ip=dhcp` - configures network in initramfs via DHCP (required for remote unlock)
-- `modules=virtio_net` - loads network driver early (use your NIC driver: e1000, vmxnet3, etc.)
+See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md#kernel-cmdline-parameters) for full parameter reference.
 
 ### Security Notes
 
-- Initramfs host key is pre-generated and deployed (not generated on target)
-- Fingerprint is shown in `README.md` - verify on first connection
-- Client public key in `authorized_keys` has restrictions: no port forwarding, no agent, no X11, no pty
-- Wrapper has no hardcoded timeout - waits for `/run/ltv/resume` or TTY unlock
+See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md#security-notes) for security considerations.
 
 ## Dependencies
 

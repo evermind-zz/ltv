@@ -27,26 +27,11 @@ LUKS UUID (blank = done):
 
 ## 2. Server Preparation (Target Server)
 
-See [DEPLOYMENT.md](DEPLOYMENT.md) for full deployment guide.
-
-**Quick summary:**
-
-```bash
-# On admin: generate deployment artifacts
-ltv-admin> server-setup web01 --out ./deploy-web01
-
-# Copy to target
-scp -r ./deploy-web01 root@192.0.2.10:/root/
-
-# On target server (as root):
-cd /root/deploy-web01
-./deploy.sh
-# Follow printed manual steps:
-# 1. Add 'ltv' to FEATURES in /etc/mkinitfs/mkinitfs.conf
-# 2. Add kernel cmdline: ltv=yes ip=dhcp modules=virtio_net
-# 3. Run mkinitfs manually
-# 4. Update bootloader (integrate params, don't replace) and reboot
-```
+See [DEPLOYMENT.md](DEPLOYMENT.md#deployment-workflow) for the full deployment guide including:
+- Generating artifacts with `server-setup`
+- Copying and running `deploy.sh` on target
+- Manual completion steps (FEATURES, kernel cmdline, mkinitfs, bootloader)
+- Verification checklist and testing
 
 ## 3. Host Key Pinning (TOFU)
 
@@ -238,20 +223,34 @@ keyfile written to /tmp/keyfile.bin
 ltv-admin> rotate-key web01
 ```
 
-This performs a paranoid rotation: backup vault -> for each target: add new key -> verify -> save vault -> remove old slot -> cleanup backup.
+This performs a paranoid LUKS keyfile rotation per target:
+
+1. Creates a timestamped backup of the vault
+2. For each target (sequentially for safety):
+   - Generates a new 64-byte keyfile
+   - Adds it to a free LUKS keyslot (`cryptsetup luksAddKey`)
+   - Verifies the new key works (`cryptsetup open --test-passphrase`)
+   - **Saves the vault atomically** (persists new keyfile + slot)
+   - Removes the old keyslot (`cryptsetup luksKillSlot`)
+3. Cleans up the backup on success
+
+Options:
+- `--target <uuid|mapper>` — rotate only one target
+- `--verbose` — show cryptsetup commands
+- `--sequential` — force sequential (default when >0 targets for paranoid mode)
+
+The vault is saved **after each target's verification** but **before old slot removal**, enabling recovery if something fails mid-rotation.
 
 ## Summary: Complete Onboarding Flow
 
-```
-1. create vault.ltv
-2. add profile (name, host, targets)
-3. server-setup profile -> deploy.sh
-4. Copy deploy to target, run deploy.sh, update bootloader (integrate ltv=yes ip=dhcp modules=virtio_net), reboot
-5. hostkey fetch profile (pin initramfs key)
-6. enroll profile (add keyfile to LUKS header via booted OS)
-7. save
-8. Reboot target -> unlock profile -> boot complete
-```
+See [QUICKSTART.md](QUICKSTART.md) for the 5-minute version, or follow the detailed steps:
+
+1. **Create vault & profile** → [§1 Initial Setup](#1-initial-setup-admin-workstation)
+2. **Deploy to target** → [DEPLOYMENT.md](DEPLOYMENT.md#deployment-workflow)
+3. **Pin initramfs host key** → [§3 Host Key Pinning (TOFU)](#3-host-key-pinning-tofu)
+4. **Enroll LUKS keyfiles** → [§4 Enrollment](#4-enrollment-add-ltv-keyfile-to-luks-header)
+5. **Save vault** → `ltv-admin> save`
+6. **Test unlock** → [§5 Remote Unlock](#5-remote-unlock-boot-time)
 
 ## Multi-Drive Setup
 
