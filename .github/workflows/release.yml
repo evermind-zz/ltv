@@ -28,6 +28,7 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-latest
             artifact: ltv-admin-x86_64-unknown-linux-gnu
+            cross: false
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-latest
             artifact: ltv-admin-aarch64-unknown-linux-gnu
@@ -41,21 +42,25 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Install cross-compilation dependencies (aarch64)
-        if: matrix.cross == 'true'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu libc6-dev-arm64-cross
-
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
 
+      - name: Install Zig (for cargo-zigbuild)
+        if: matrix.cross
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y zig
+
+      - name: Install cargo-zigbuild (for cross-compilation)
+        if: matrix.cross
+        run: cargo install --locked cargo-zigbuild
+
       - name: Build release
         run: |
           if [ "${{ matrix.cross }}" = "true" ]; then
-            cargo build --release --target ${{ matrix.target }} --locked
+            cargo zigbuild --release --target ${{ matrix.target }} --locked
           else
             cargo build --release --locked
           fi
