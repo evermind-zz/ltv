@@ -135,7 +135,6 @@ Vault file corrupted or modified. Restore from backup.
 | Error | Fix |
 |-------|-----|
 | `mkinitfs: command not found` | Install `mkinitfs` package (Alpine base) |
-| `dropbearkey: not found` | Install `dropbear` package |
 | `cp: cannot stat 'ltv-luks-wrapper.sh'` | Run from deploy directory |
 | Permission denied | Run as root |
 
